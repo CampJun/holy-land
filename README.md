@@ -2,7 +2,7 @@
 
 Low-fantasy biblical sim/roguelike. CP437 rendering, gamepad-first, cross-platform from desktop to retro handhelds.
 
-See `/root/.claude/plans/yes-but-before-deciding-keen-stonebraker.md` for the full design plan.
+See `holyland-PLAN.md` for the full design plan and `holyland-ROADMAP.md` for the session-by-session forward plan.
 
 ## Status
 
