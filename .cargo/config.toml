@@ -1,0 +1,8 @@
+# Cross-compile config for Session 1 / Half 2 (Miyoo Mini Plus) and beyond.
+# Uncomment + edit when tackling handheld builds — see README for setup.
+#
+# [target.armv7-unknown-linux-musleabihf]
+# linker = "armv7-linux-musleabihf-gcc"
+#
+# [target.aarch64-linux-android]
+# # cargo-ndk handles linker setup; nothing needed here unless overriding.

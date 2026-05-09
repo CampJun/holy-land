@@ -1,0 +1,21 @@
+[package]
+name = "holyland"
+version = "0.0.1"
+edition = "2021"
+description = "Low-fantasy biblical Holy Land sim/roguelike, CP437 rendering."
+
+[dependencies]
+sdl2 = { version = "0.37", features = ["bundled", "static-link"] }
+gilrs = "0.10"
+image = { version = "0.25", default-features = false, features = ["png"] }
+hecs = "0.10"
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
+opt-level = 3
