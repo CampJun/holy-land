@@ -92,6 +92,12 @@ pub struct RunSave {
     pub harvested_reeds: Vec<[i32; 2]>,
     #[serde(default)]
     pub inventory: BTreeMap<String, u32>,
+    #[serde(default = "default_region")]
+    pub region: String,
+}
+
+fn default_region() -> String {
+    "oasis".to_string()
 }
 
 impl RunSave {
@@ -103,6 +109,7 @@ impl RunSave {
             reeds_harvested: 0,
             harvested_reeds: Vec::new(),
             inventory: BTreeMap::new(),
+            region: default_region(),
         }
     }
 }
@@ -212,6 +219,7 @@ mod tests {
             reeds_harvested: 0,
             harvested_reeds: vec![[8, 5], [9, 5]],
             inventory,
+            region: "wilderness".to_string(),
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
@@ -219,6 +227,7 @@ mod tests {
         assert_eq!(loaded.player_y, 7);
         assert_eq!(loaded.harvested_reeds, vec![[8, 5], [9, 5]]);
         assert_eq!(loaded.inventory.get("reed"), Some(&2));
+        assert_eq!(loaded.region, "wilderness");
 
         fs::remove_dir_all(&dir).ok();
     }

@@ -15,7 +15,7 @@ use sdl2::surface::Surface;
 use input::{Action, Input};
 use render::{draw_glyph, load_atlas, CELL_SIZE};
 use save::{MetaSave, RunSave, SaveHeader};
-use world::{Inventory, Item, Position, Tile, World};
+use world::{Inventory, Item, Position, Region, Tile, World};
 
 const WORLD_W: u32 = 40;
 const WORLD_H: u32 = 30;
@@ -103,10 +103,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Ok(run) = save::load_run(&save_dir.join(RUN_FILE)) {
         eprintln!(
-            "loaded run save (player at {},{})",
-            run.player_x, run.player_y
+            "loaded run save (player at {},{}, region={})",
+            run.player_x, run.player_y, run.region
         );
         loaded_run_header = Some(run.header.clone());
+        let restored_region = Region::from_save_key(&run.region).unwrap_or(Region::Oasis);
+        world.region = restored_region;
         world.set_player_pos(Position {
             x: run.player_x,
             y: run.player_y,
@@ -135,7 +137,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut fps_count: u32 = 0;
     let mut fps_window = Instant::now();
     let mut timing_accum = FrameTiming::default();
-    let mut dialogue: Option<Dialogue> = if world.oasis_intro_complete {
+    let mut dialogue: Option<Dialogue> = if world.oasis_intro_complete || world.region != Region::Oasis {
         None
     } else {
         Some(Dialogue::new(
@@ -144,9 +146,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))
     };
     let mut inventory_open = false;
+    let mut prev_frame: Option<Instant> = None;
 
     'main: loop {
         let frame_start = Instant::now();
+        let dt = prev_frame
+            .map(|p| frame_start.saturating_duration_since(p))
+            .unwrap_or_default();
+        prev_frame = Some(frame_start);
+        if world.region == Region::Oasis {
+            world.tick_oasis(dt);
+        }
 
         for event in events.poll_iter() {
             match event {
@@ -189,22 +199,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
 
+            let pre_region = world.region;
+            let mut world_action = true;
             match action {
                 Action::Up => world.try_move_player(0, -1),
                 Action::Down => world.try_move_player(0, 1),
                 Action::Left => world.try_move_player(-1, 0),
                 Action::Right => world.try_move_player(1, 0),
                 Action::A => handle_interaction(&mut world, &mut meta, &mut dialogue),
-                Action::Y => inventory_open = true,
+                Action::Y => {
+                    inventory_open = true;
+                    world_action = false;
+                }
                 Action::Start => break 'main,
-                Action::Select => save_game(
-                    &save_dir,
-                    &mut meta,
-                    &world,
-                    &mut prev_meta_header,
-                    &mut prev_run_header,
-                ),
-                _ => {}
+                Action::Select => {
+                    save_game(
+                        &save_dir,
+                        &mut meta,
+                        &world,
+                        &mut prev_meta_header,
+                        &mut prev_run_header,
+                    );
+                    world_action = false;
+                }
+                _ => {
+                    world_action = false;
+                }
+            }
+            // Only tick the wilderness when the player took a world-affecting
+            // action *from inside* the wilderness. A portal step transitions
+            // them in but doesn't burn a tick on the destination.
+            if world_action
+                && pre_region == Region::Wilderness
+                && world.region == Region::Wilderness
+            {
+                world.tick_wilderness();
             }
         }
 
@@ -218,6 +247,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let player = world.player_pos();
         let pwx = player.x as i64;
         let pwy = player.y as i64;
+        let in_oasis = world.region == Region::Oasis;
         let keeper = world.keeper_pos();
         let ui_cells = build_ui_cells(&world, dialogue.as_ref(), inventory_open, &palette);
 
@@ -231,17 +261,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for vx in 0..WORLD_W as i32 {
                 let wx = cam_x + vx as i64;
                 let wy = cam_y + vy as i64;
+                let portal_glyph = if in_oasis { b'>' } else { b'<' };
                 let (mut glyph, mut fg, bg) = match world.tile_at(wx, wy) {
                     Tile::Floor => (b'.', palette.floor_fg, palette.floor_bg),
                     Tile::Wall => (b'#', palette.wall_fg, palette.wall_bg),
+                    Tile::Portal => (portal_glyph, palette.portal_fg, palette.floor_bg),
                 };
                 if wx == pwx && wy == pwy {
                     glyph = b'@';
                     fg = palette.player_fg;
-                } else if wx == keeper.x as i64 && wy == keeper.y as i64 {
+                } else if in_oasis && wx == keeper.x as i64 && wy == keeper.y as i64 {
                     glyph = b'&';
                     fg = palette.keeper_fg;
-                } else if world.is_unharvested_reed_at(wx as i32, wy as i32) {
+                } else if in_oasis && world.is_unharvested_reed_at(wx as i32, wy as i32) {
                     glyph = b'"';
                     fg = palette.reed_fg;
                 }
@@ -390,6 +422,7 @@ fn save_game(
     run.reeds_harvested = 0;
     run.harvested_reeds = world.harvested_reeds();
     run.inventory = world.inventory.to_save();
+    run.region = world.region.save_key().to_string();
     if let Err(e) = save::save_atomic(&save_dir.join(RUN_FILE), &run) {
         eprintln!("run save failed: {}", e);
     } else {
@@ -411,6 +444,11 @@ fn build_ui_cells(
         format!("Reeds {}/{}", world.reed_count(), REEDS_REQUIRED)
     };
     put_text(&mut cells, 25, 1, &hud, palette.hud_fg, palette.hud_bg);
+    let region_label = match world.region {
+        Region::Oasis => "Oasis",
+        Region::Wilderness => "Wilderness",
+    };
+    put_text(&mut cells, 1, 1, region_label, palette.hud_fg, palette.hud_bg);
 
     if inventory_open {
         draw_inventory_panel(&mut cells, world, palette);
@@ -633,6 +671,7 @@ struct Palette {
     floor_bg: Color,
     wall_fg: Color,
     wall_bg: Color,
+    portal_fg: Color,
     hud_fg: Color,
     hud_bg: Color,
     panel_fg: Color,
@@ -650,6 +689,7 @@ impl Default for Palette {
             floor_bg: Color::RGB(20, 17, 13),
             wall_fg: Color::RGB(140, 110, 75),
             wall_bg: Color::RGB(35, 28, 20),
+            portal_fg: Color::RGB(230, 200, 120),
             hud_fg: Color::RGB(190, 205, 160),
             hud_bg: Color::RGB(20, 17, 13),
             panel_fg: Color::RGB(218, 205, 170),
