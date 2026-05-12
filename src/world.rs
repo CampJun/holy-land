@@ -166,6 +166,45 @@ pub struct Player;
 #[derive(Clone, Copy, Serialize, Deserialize)]
 pub struct Keeper;
 
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub struct Demon;
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Health {
+    pub current: u16,
+    pub max: u16,
+}
+
+impl Health {
+    pub fn new(max: u16) -> Self {
+        Self { current: max, max }
+    }
+
+    pub fn damage(&mut self, amount: u16) {
+        self.current = self.current.saturating_sub(amount);
+    }
+
+    pub fn is_dead(&self) -> bool {
+        self.current == 0
+    }
+
+    pub fn heal_full(&mut self) {
+        self.current = self.max;
+    }
+}
+
+pub const PLAYER_HP_BASELINE: u16 = 6;
+pub const IMP_HP: u16 = 2;
+pub const IMP_DAMAGE: u16 = 1;
+pub const PLAYER_DAMAGE: u16 = 1;
+const OASIS_SPAWN: Position = Position { x: 2, y: 2 };
+const IMP_SPAWNS: &[Position] = &[
+    Position { x: 10, y: 10 },
+    Position { x: 22, y: 8 },
+    Position { x: 30, y: 18 },
+    Position { x: 15, y: 22 },
+];
+
 pub struct World {
     pub region: Region,
     pub oasis: RegionMap,
@@ -194,12 +233,13 @@ impl World {
         let mut ecs = Ecs::new();
         let player = ecs.spawn((
             Player,
-            Position { x: 2, y: 2 },
+            OASIS_SPAWN,
             Renderable {
                 glyph: b'@',
                 fg: [240, 232, 200, 255],
                 bg: [20, 17, 13, 255],
             },
+            Health::new(PLAYER_HP_BASELINE),
         ));
         let keeper = ecs.spawn((
             Keeper,
@@ -243,9 +283,21 @@ impl World {
         self.current_map().tile_at(wx, wy)
     }
 
-    pub fn set_region(&mut self, region: Region, player_pos: Position) {
+    pub fn enter_region(&mut self, region: Region, player_pos: Position) {
+        // Wilderness entities are run-scoped; clear them on every transition
+        // and respawn a fresh roster on wilderness entry. Entering the oasis
+        // is also where the player heals between runs.
+        self.despawn_wilderness_entities();
         self.region = region;
         self.set_player_pos(player_pos);
+        match region {
+            Region::Wilderness => self.spawn_wilderness_imps(),
+            Region::Oasis => self.heal_player_full(),
+        }
+    }
+
+    pub fn respawn_to_oasis(&mut self) {
+        self.enter_region(Region::Oasis, OASIS_SPAWN);
     }
 
     pub fn tick_oasis(&mut self, _dt: std::time::Duration) {
@@ -254,8 +306,47 @@ impl World {
     }
 
     pub fn tick_wilderness(&mut self) {
-        // Discrete world step after each player action. Demon AI / blessing
-        // tick / run-scoped timers land here in later steps.
+        let player_pos = self.player_pos();
+        // Snapshot demons first so we can mutate ECS during the loop.
+        let demons: Vec<(Entity, Position)> = self
+            .ecs
+            .query::<(&Demon, &Position)>()
+            .iter()
+            .map(|(e, (_, p))| (e, *p))
+            .collect();
+
+        for (entity, pos) in demons {
+            let dx = (player_pos.x - pos.x).signum();
+            let dy = (player_pos.y - pos.y).signum();
+            let abs_dx = (player_pos.x - pos.x).abs();
+            let abs_dy = (player_pos.y - pos.y).abs();
+            // Greedy chase: step on the axis with the greater delta. Ties
+            // favor horizontal so behavior is deterministic.
+            let (step_x, step_y) = if abs_dx >= abs_dy { (dx, 0) } else { (0, dy) };
+            if step_x == 0 && step_y == 0 {
+                continue;
+            }
+            let target = Position {
+                x: pos.x + step_x,
+                y: pos.y + step_y,
+            };
+            if target == player_pos {
+                self.damage_player(IMP_DAMAGE);
+                continue;
+            }
+            if !matches!(
+                self.tile_at(target.x as i64, target.y as i64),
+                Tile::Floor
+            ) {
+                continue;
+            }
+            if self.find_demon_at(target.x, target.y).is_some() {
+                continue;
+            }
+            if let Ok(mut p) = self.ecs.get::<&mut Position>(entity) {
+                *p = target;
+            }
+        }
     }
 
     pub fn try_move_player(&mut self, dx: i32, dy: i32) {
@@ -265,13 +356,21 @@ impl World {
             .expect("player has Position");
         let nx = pos.x + dx;
         let ny = pos.y + dy;
+
+        // Bump-attack: walking into a demon resolves as melee instead of move.
+        if self.region == Region::Wilderness {
+            if let Some(demon) = self.find_demon_at(nx, ny) {
+                self.attack_demon(demon, PLAYER_DAMAGE);
+                return;
+            }
+        }
+
         let target = self.tile_at(nx as i64, ny as i64);
         let passable = matches!(target, Tile::Floor | Tile::Portal);
         if !passable {
             return;
         }
-        let blocked_by_keeper =
-            self.region == Region::Oasis && self.is_keeper_at(nx, ny);
+        let blocked_by_keeper = self.region == Region::Oasis && self.is_keeper_at(nx, ny);
         if blocked_by_keeper {
             return;
         }
@@ -292,7 +391,7 @@ impl World {
                     },
                 ),
             };
-            self.set_region(dest_region, dest_pos);
+            self.enter_region(dest_region, dest_pos);
             return;
         }
         *self
@@ -376,6 +475,88 @@ impl World {
 
     pub fn player_is_adjacent_to_keeper(&self) -> bool {
         self.region == Region::Oasis && is_adjacent(self.player_pos(), self.keeper_pos())
+    }
+
+    pub fn player_hp(&self) -> Health {
+        *self
+            .ecs
+            .get::<&Health>(self.player)
+            .expect("player has Health")
+    }
+
+    pub fn player_is_dead(&self) -> bool {
+        self.player_hp().is_dead()
+    }
+
+    pub fn demon_positions(&self) -> Vec<Position> {
+        self.ecs
+            .query::<(&Demon, &Position)>()
+            .iter()
+            .map(|(_, (_, p))| *p)
+            .collect()
+    }
+
+    fn heal_player_full(&mut self) {
+        self.ecs
+            .get::<&mut Health>(self.player)
+            .expect("player has Health")
+            .heal_full();
+    }
+
+    fn damage_player(&mut self, amount: u16) {
+        self.ecs
+            .get::<&mut Health>(self.player)
+            .expect("player has Health")
+            .damage(amount);
+    }
+
+    fn attack_demon(&mut self, demon: Entity, amount: u16) {
+        let killed = {
+            let mut h = self
+                .ecs
+                .get::<&mut Health>(demon)
+                .expect("demon has Health");
+            h.damage(amount);
+            h.is_dead()
+        };
+        if killed {
+            let _ = self.ecs.despawn(demon);
+        }
+    }
+
+    fn spawn_wilderness_imps(&mut self) {
+        for spawn in IMP_SPAWNS.iter().copied() {
+            self.ecs.spawn((
+                Demon,
+                spawn,
+                Renderable {
+                    glyph: b'd',
+                    fg: [220, 80, 90, 255],
+                    bg: [20, 17, 13, 255],
+                },
+                Health::new(IMP_HP),
+            ));
+        }
+    }
+
+    fn despawn_wilderness_entities(&mut self) {
+        let demons: Vec<Entity> = self
+            .ecs
+            .query::<&Demon>()
+            .iter()
+            .map(|(e, _)| e)
+            .collect();
+        for e in demons {
+            let _ = self.ecs.despawn(e);
+        }
+    }
+
+    fn find_demon_at(&self, x: i32, y: i32) -> Option<Entity> {
+        self.ecs
+            .query::<(&Demon, &Position)>()
+            .iter()
+            .find(|(_, (_, p))| p.x == x && p.y == y)
+            .map(|(e, _)| e)
     }
 
     fn is_keeper_at(&self, x: i32, y: i32) -> bool {
@@ -500,6 +681,80 @@ mod tests {
 
         assert_eq!(world.player_pos(), Position { x: 4, y: 3 });
         assert!(world.player_is_adjacent_to_keeper());
+    }
+
+    #[test]
+    fn bump_attack_kills_imp_and_returns_oasis_safe() {
+        let mut world = World::new(40, 30);
+        world.enter_region(
+            Region::Wilderness,
+            Position {
+                x: IMP_SPAWNS[0].x - 1,
+                y: IMP_SPAWNS[0].y,
+            },
+        );
+        let imp_pos = IMP_SPAWNS[0];
+
+        // First bump reduces imp HP but doesn't kill (imp has 2 HP).
+        world.try_move_player(1, 0);
+        assert!(world.find_demon_at(imp_pos.x, imp_pos.y).is_some());
+        // Player did not move onto the imp's tile.
+        assert_eq!(
+            world.player_pos(),
+            Position {
+                x: imp_pos.x - 1,
+                y: imp_pos.y
+            }
+        );
+
+        // Second bump kills the imp.
+        world.try_move_player(1, 0);
+        assert!(world.find_demon_at(imp_pos.x, imp_pos.y).is_none());
+
+        // Now the player can walk onto that tile.
+        world.try_move_player(1, 0);
+        assert_eq!(world.player_pos(), imp_pos);
+    }
+
+    #[test]
+    fn player_dies_and_respawns_full_hp() {
+        let mut world = World::new(40, 30);
+        world.enter_region(Region::Wilderness, Position { x: 5, y: 5 });
+        // Drain the player's health below the imp's first hit so the next
+        // wilderness tick is lethal.
+        world.damage_player(PLAYER_HP_BASELINE - 1);
+        assert_eq!(world.player_hp().current, 1);
+
+        // Drop an imp right next to the player so the next tick is a hit.
+        world.ecs.spawn((
+            Demon,
+            Position { x: 6, y: 5 },
+            Renderable {
+                glyph: b'd',
+                fg: [0; 4],
+                bg: [0; 4],
+            },
+            Health::new(IMP_HP),
+        ));
+        world.tick_wilderness();
+        assert!(world.player_is_dead());
+
+        world.respawn_to_oasis();
+        assert_eq!(world.region, Region::Oasis);
+        assert_eq!(world.player_pos(), OASIS_SPAWN);
+        assert_eq!(world.player_hp().current, PLAYER_HP_BASELINE);
+        // Wilderness imps cleared on respawn.
+        assert!(world.demon_positions().is_empty());
+    }
+
+    #[test]
+    fn entering_wilderness_spawns_imps() {
+        let mut world = World::new(40, 30);
+        assert!(world.demon_positions().is_empty());
+        world.enter_region(Region::Wilderness, Position { x: 1, y: PORTAL_Y });
+        assert_eq!(world.demon_positions().len(), IMP_SPAWNS.len());
+        world.enter_region(Region::Oasis, OASIS_SPAWN);
+        assert!(world.demon_positions().is_empty());
     }
 
     #[test]

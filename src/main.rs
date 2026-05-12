@@ -108,11 +108,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         loaded_run_header = Some(run.header.clone());
         let restored_region = Region::from_save_key(&run.region).unwrap_or(Region::Oasis);
-        world.region = restored_region;
-        world.set_player_pos(Position {
+        let restored_pos = Position {
             x: run.player_x,
             y: run.player_y,
-        });
+        };
+        world.enter_region(restored_region, restored_pos);
         // Build the inventory from the new field. If a pre-inventory save is
         // mid-quest (no inventory data yet, intro not finished), seed from the
         // legacy `reeds_harvested` counter so the player keeps their progress.
@@ -235,6 +235,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 world.tick_wilderness();
             }
+            if world.player_is_dead() {
+                world.respawn_to_oasis();
+                dialogue = Some(Dialogue::new(
+                    "Defeat",
+                    vec!["You fell. You wake at the oasis."],
+                ));
+            }
         }
 
         // Camera in world coords. While the world fits the viewport we anchor
@@ -249,6 +256,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let pwy = player.y as i64;
         let in_oasis = world.region == Region::Oasis;
         let keeper = world.keeper_pos();
+        let demon_positions: Vec<Position> = if in_oasis {
+            Vec::new()
+        } else {
+            world.demon_positions()
+        };
         let ui_cells = build_ui_cells(&world, dialogue.as_ref(), inventory_open, &palette);
 
         let draw_start = Instant::now();
@@ -273,6 +285,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else if in_oasis && wx == keeper.x as i64 && wy == keeper.y as i64 {
                     glyph = b'&';
                     fg = palette.keeper_fg;
+                } else if !in_oasis
+                    && demon_positions
+                        .iter()
+                        .any(|p| p.x as i64 == wx && p.y as i64 == wy)
+                {
+                    glyph = b'd';
+                    fg = palette.demon_fg;
                 } else if in_oasis && world.is_unharvested_reed_at(wx as i32, wy as i32) {
                     glyph = b'"';
                     fg = palette.reed_fg;
@@ -449,6 +468,9 @@ fn build_ui_cells(
         Region::Wilderness => "Wilderness",
     };
     put_text(&mut cells, 1, 1, region_label, palette.hud_fg, palette.hud_bg);
+    let hp = world.player_hp();
+    let hp_text = format!("HP {}/{}", hp.current, hp.max);
+    put_text(&mut cells, 13, 1, &hp_text, palette.player_fg, palette.hud_bg);
 
     if inventory_open {
         draw_inventory_panel(&mut cells, world, palette);
@@ -672,6 +694,7 @@ struct Palette {
     wall_fg: Color,
     wall_bg: Color,
     portal_fg: Color,
+    demon_fg: Color,
     hud_fg: Color,
     hud_bg: Color,
     panel_fg: Color,
@@ -690,6 +713,7 @@ impl Default for Palette {
             wall_fg: Color::RGB(140, 110, 75),
             wall_bg: Color::RGB(35, 28, 20),
             portal_fg: Color::RGB(230, 200, 120),
+            demon_fg: Color::RGB(220, 80, 90),
             hud_fg: Color::RGB(190, 205, 160),
             hud_bg: Color::RGB(20, 17, 13),
             panel_fg: Color::RGB(218, 205, 170),
