@@ -4,14 +4,24 @@ version = "0.0.1"
 edition = "2021"
 description = "Low-fantasy biblical Holy Land sim/roguelike, CP437 rendering."
 
+[features]
+default = ["gilrs"]
+gilrs = ["dep:gilrs"]
+
 [dependencies]
-sdl2 = { version = "0.37", features = ["bundled", "static-link"] }
-gilrs = "0.10"
+sdl2 = "0.37"
+gilrs = { version = "0.10", optional = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
 hecs = "0.10"
 serde = { version = "1", features = ["derive"] }
 ciborium = "0.2"
 uuid = { version = "1", features = ["v4", "serde"] }
+
+# Desktop builds the bundled SDL2 statically (no system SDL2-devel required).
+# Cross builds for ARM rely on Onion's libSDL2-2.0.so.0 at runtime via
+# LD_LIBRARY_PATH and link against the headers/.so under cross/onion-libs/.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+sdl2 = { version = "0.37", features = ["bundled", "static-link"] }
 
 [profile.release]
 strip = true

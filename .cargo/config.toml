@@ -1,3 +1,11 @@
+# Force C17 for bundled C deps. Vendored SDL2 2.x (sdl2-sys) declares an
+# untyped `enum { false, true } bool;` that collides with the C23 reserved
+# keywords `bool`/`false`/`true`. GCC 15+ defaults to C23, so without this
+# the bundled+static SDL2 build fails on `SDL_hidapi_steam.c`.
+[env]
+CFLAGS = "-std=gnu17"
+CXXFLAGS = "-std=gnu++17"
+
 # Cross-compile config for Session 1 / Half 2 (Miyoo Mini Plus) and beyond.
 # Uncomment + edit when tackling handheld builds — see README for setup.
 #

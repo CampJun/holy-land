@@ -1,3 +1,4 @@
+#[cfg(feature = "gilrs")]
 use gilrs::{Button, EventType as GilrsEvent, Gilrs};
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
@@ -24,6 +25,7 @@ const INITIAL_DELAY: Duration = Duration::from_millis(250);
 const REPEAT_PERIOD: Duration = Duration::from_millis(100);
 
 pub struct Input {
+    #[cfg(feature = "gilrs")]
     gilrs: Option<Gilrs>,
     held: HashSet<Action>,
     next_repeat: Option<Instant>,
@@ -32,9 +34,9 @@ pub struct Input {
 
 impl Input {
     pub fn new() -> Self {
-        let gilrs = Gilrs::new().ok();
         Self {
-            gilrs,
+            #[cfg(feature = "gilrs")]
+            gilrs: Gilrs::new().ok(),
             held: HashSet::new(),
             next_repeat: None,
             queued: Vec::new(),
@@ -44,8 +46,9 @@ impl Input {
     pub fn handle_sdl_event(&mut self, event: &Event) {
         match event {
             Event::KeyDown { keycode: Some(kc), repeat: false, .. } => {
-                if let Some(action) = keycode_to_action(*kc) {
-                    self.press(action);
+                match keycode_to_action(*kc) {
+                    Some(action) => self.press(action),
+                    None => eprintln!("input: unmapped keycode {:?}", kc),
                 }
             }
             Event::KeyUp { keycode: Some(kc), .. } => {
@@ -57,6 +60,7 @@ impl Input {
         }
     }
 
+    #[cfg(feature = "gilrs")]
     pub fn poll_gamepad(&mut self) {
         let mut transitions: Vec<(Action, bool)> = Vec::new();
         if let Some(gilrs) = self.gilrs.as_mut() {
@@ -84,6 +88,9 @@ impl Input {
             }
         }
     }
+
+    #[cfg(not(feature = "gilrs"))]
+    pub fn poll_gamepad(&mut self) {}
 
     fn press(&mut self, a: Action) {
         if self.held.insert(a) {
@@ -123,24 +130,31 @@ fn is_movement(a: Action) -> bool {
 }
 
 fn keycode_to_action(kc: Keycode) -> Option<Action> {
+    // Two layers per row: desktop convention, then Miyoo Mini Plus / Onion
+    // kernel-keymap convention (A=Space, B=LCtrl, X=LShift, Y=LAlt, L=Tab,
+    // R=Backspace, Start=Enter, Select=RCtrl, Menu=Esc). On the Miyoo ARM
+    // build, the shutdown/menu path has also been observed as raw keycode 116
+    // (SDL's T), so treat it as a clean quit there.
     Some(match kc {
         Keycode::Up | Keycode::W | Keycode::K => Action::Up,
         Keycode::Down | Keycode::S | Keycode::J => Action::Down,
         Keycode::Left | Keycode::A | Keycode::H => Action::Left,
         Keycode::Right | Keycode::D | Keycode::L => Action::Right,
-        Keycode::Z => Action::A,
-        Keycode::X => Action::B,
-        Keycode::C => Action::X,
-        Keycode::V => Action::Y,
-        Keycode::Q => Action::L,
-        Keycode::E => Action::R,
-        Keycode::Return => Action::Start,
-        Keycode::Escape => Action::Start,
-        Keycode::Backspace | Keycode::RShift => Action::Select,
+        Keycode::Z | Keycode::Space => Action::A,
+        Keycode::X | Keycode::LCtrl => Action::B,
+        Keycode::C | Keycode::LShift => Action::X,
+        Keycode::V | Keycode::LAlt => Action::Y,
+        Keycode::Q | Keycode::Tab => Action::L,
+        Keycode::E | Keycode::Backspace => Action::R,
+        Keycode::Return | Keycode::Escape => Action::Start,
+        #[cfg(target_arch = "arm")]
+        Keycode::T => Action::Start,
+        Keycode::RShift | Keycode::RCtrl => Action::Select,
         _ => return None,
     })
 }
 
+#[cfg(feature = "gilrs")]
 fn button_to_action(b: Button) -> Option<Action> {
     Some(match b {
         Button::DPadUp => Action::Up,

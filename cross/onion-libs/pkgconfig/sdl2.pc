@@ -1,0 +1,10 @@
+prefix=/
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: sdl2
+Description: Simple DirectMedia Layer (Onion-shipped, Miyoo Mini Plus)
+Version: 2.0.18
+Libs: -L${libdir} -lSDL2
+Cflags: -I${includedir}/SDL2 -D_REENTRANT

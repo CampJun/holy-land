@@ -59,6 +59,8 @@ pub struct MetaSave {
     pub deity_affinity: BTreeMap<String, i32>,
     #[serde(default)]
     pub unlocks: Vec<String>,
+    #[serde(default)]
+    pub oasis_intro_complete: bool,
 }
 
 impl MetaSave {
@@ -69,6 +71,7 @@ impl MetaSave {
             demon_currency: 0,
             deity_affinity: BTreeMap::new(),
             unlocks: Vec::new(),
+            oasis_intro_complete: false,
         }
     }
 }
@@ -80,6 +83,15 @@ pub struct RunSave {
     pub player_x: i32,
     #[serde(default)]
     pub player_y: i32,
+    // Legacy: pre-inventory builds tracked this counter directly. Newer
+    // builds write the authoritative state in `inventory` and only read this
+    // field as a fallback when `inventory` is absent (saves from old builds).
+    #[serde(default)]
+    pub reeds_harvested: u8,
+    #[serde(default)]
+    pub harvested_reeds: Vec<[i32; 2]>,
+    #[serde(default)]
+    pub inventory: BTreeMap<String, u32>,
 }
 
 impl RunSave {
@@ -88,6 +100,9 @@ impl RunSave {
             header,
             player_x: 0,
             player_y: 0,
+            reeds_harvested: 0,
+            harvested_reeds: Vec::new(),
+            inventory: BTreeMap::new(),
         }
     }
 }
@@ -167,11 +182,13 @@ mod tests {
 
         let mut meta = MetaSave::empty(SaveHeader::fresh(None));
         meta.xp = 42;
+        meta.oasis_intro_complete = true;
         meta.unlocks.push("starter_oasis".to_string());
         save_atomic(&path, &meta).unwrap();
 
         let loaded = load_meta(&path).unwrap();
         assert_eq!(loaded.xp, 42);
+        assert!(loaded.oasis_intro_complete);
         assert_eq!(loaded.unlocks, vec!["starter_oasis"]);
         assert_eq!(loaded.header.schema_version, SCHEMA_VERSION);
         assert_eq!(loaded.header.device_id, meta.header.device_id);
@@ -186,15 +203,22 @@ mod tests {
         let path = dir.join("run.cbor");
 
         let header = SaveHeader::fresh(None);
+        let mut inventory = BTreeMap::new();
+        inventory.insert("reed".to_string(), 2);
         let run = RunSave {
             header,
             player_x: 5,
             player_y: 7,
+            reeds_harvested: 0,
+            harvested_reeds: vec![[8, 5], [9, 5]],
+            inventory,
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
         assert_eq!(loaded.player_x, 5);
         assert_eq!(loaded.player_y, 7);
+        assert_eq!(loaded.harvested_reeds, vec![[8, 5], [9, 5]]);
+        assert_eq!(loaded.inventory.get("reed"), Some(&2));
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -226,5 +250,26 @@ mod tests {
         assert_eq!(h3.save_counter, 3);
         assert_eq!(h1.device_id, h2.device_id);
         assert_eq!(h2.device_id, h3.device_id);
+    }
+
+    #[test]
+    fn starter_oasis_unlock_is_not_duplicated() {
+        let mut meta = MetaSave::empty(SaveHeader::fresh(None));
+        complete_starter_oasis(&mut meta);
+        complete_starter_oasis(&mut meta);
+
+        assert!(meta.oasis_intro_complete);
+        assert_eq!(meta.unlocks, vec!["starter_oasis"]);
+        assert_eq!(meta.xp, 1);
+    }
+
+    fn complete_starter_oasis(meta: &mut MetaSave) {
+        if !meta.oasis_intro_complete {
+            meta.oasis_intro_complete = true;
+            meta.xp += 1;
+        }
+        if !meta.unlocks.iter().any(|u| u == "starter_oasis") {
+            meta.unlocks.push("starter_oasis".to_string());
+        }
     }
 }

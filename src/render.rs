@@ -1,15 +1,12 @@
 use sdl2::pixels::{Color, PixelFormatEnum};
 use sdl2::rect::Rect;
-use sdl2::render::{BlendMode, Canvas, Texture, TextureCreator};
-use sdl2::video::{Window, WindowContext};
+use sdl2::render::BlendMode;
+use sdl2::surface::Surface;
 
 pub const CELL_SIZE: u32 = 16;
 const ATLAS_COLS: u32 = 16;
 
-pub fn load_atlas<'a>(
-    creator: &'a TextureCreator<WindowContext>,
-    png_bytes: &[u8],
-) -> Result<Texture<'a>, String> {
+pub fn load_atlas(png_bytes: &[u8]) -> Result<Surface<'static>, String> {
     let img = image::load_from_memory(png_bytes)
         .map_err(|e| e.to_string())?
         .to_rgba8();
@@ -30,19 +27,18 @@ pub fn load_atlas<'a>(
         }
     }
 
-    let mut texture = creator
-        .create_texture_static(PixelFormatEnum::RGBA32, w, h)
-        .map_err(|e| e.to_string())?;
-    texture
-        .update(None, &data, (w * 4) as usize)
-        .map_err(|e| e.to_string())?;
-    texture.set_blend_mode(BlendMode::Blend);
-    Ok(texture)
+    // image::to_rgba8 = byte order R,G,B,A = pixel ABGR8888 on LE.
+    // Convert once to ARGB8888 to match the framebuffer/texture format
+    // (mmiyoo's CreateTexture only accepts ARGB8888 / RGB565).
+    let temp = Surface::from_data(&mut data, w, h, w * 4, PixelFormatEnum::ABGR8888)?;
+    let mut atlas = temp.convert_format(PixelFormatEnum::ARGB8888)?;
+    atlas.set_blend_mode(BlendMode::Blend)?;
+    Ok(atlas)
 }
 
 pub fn draw_glyph(
-    canvas: &mut Canvas<Window>,
-    atlas: &mut Texture,
+    framebuf: &mut Surface,
+    atlas: &mut Surface,
     cx: i32,
     cy: i32,
     glyph: u8,
@@ -53,14 +49,13 @@ pub fn draw_glyph(
     let py = cy * CELL_SIZE as i32;
     let dst = Rect::new(px, py, CELL_SIZE, CELL_SIZE);
 
-    canvas.set_draw_color(bg);
-    let _ = canvas.fill_rect(dst);
+    let _ = framebuf.fill_rect(dst, bg);
 
-    atlas.set_color_mod(fg.r, fg.g, fg.b);
+    atlas.set_color_mod(Color::RGB(fg.r, fg.g, fg.b));
     atlas.set_alpha_mod(fg.a);
 
     let src_x = (glyph as u32 % ATLAS_COLS) * CELL_SIZE;
     let src_y = (glyph as u32 / ATLAS_COLS) * CELL_SIZE;
     let src = Rect::new(src_x as i32, src_y as i32, CELL_SIZE, CELL_SIZE);
-    let _ = canvas.copy(atlas, src, dst);
+    let _ = atlas.blit(src, framebuf, dst);
 }

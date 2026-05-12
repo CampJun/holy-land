@@ -1,0 +1,25 @@
+FROM miyoomini-toolchain
+
+# Add rustup + the Miyoo Mini Plus target (armv7 hard-float, glibc).
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo \
+    PATH=/opt/cargo/bin:/opt/miyoomini-toolchain/usr/bin:${PATH}
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl ca-certificates pkg-config \
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p /opt/rustup /opt/cargo \
+ && curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal \
+        --target armv7-unknown-linux-gnueabihf
+
+# Cross-compile env: route cargo at the Miyoo gcc, point pkg-config at the
+# Onion-shipped SDL2/EGL/GLES headers + libs that we mount at /onion-libs.
+ENV CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=/opt/miyoomini-toolchain/usr/bin/arm-linux-gnueabihf-gcc \
+    CC_armv7_unknown_linux_gnueabihf=/opt/miyoomini-toolchain/usr/bin/arm-linux-gnueabihf-gcc \
+    CXX_armv7_unknown_linux_gnueabihf=/opt/miyoomini-toolchain/usr/bin/arm-linux-gnueabihf-g++ \
+    AR_armv7_unknown_linux_gnueabihf=/opt/miyoomini-toolchain/usr/bin/arm-linux-gnueabihf-ar \
+    PKG_CONFIG_ALLOW_CROSS=1 \
+    PKG_CONFIG_SYSROOT_DIR=/onion-libs \
+    PKG_CONFIG_LIBDIR=/onion-libs/pkgconfig
+
+WORKDIR /src
+CMD ["/bin/bash"]

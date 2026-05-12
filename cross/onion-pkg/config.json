@@ -1,0 +1,6 @@
+{
+	"label":	"Holy Land",
+	"icon":	"/mnt/SDCARD/Icons/Default/app/dice.png",
+	"launch":	"launch.sh",
+	"description":	"Low-fantasy biblical sim/roguelike (CP437)."
+}
