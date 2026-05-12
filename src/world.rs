@@ -2,11 +2,12 @@ use hecs::{Entity, World as Ecs};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Tile {
     Floor,
     Wall,
     Portal,
+    Shrine,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,6 +167,61 @@ pub struct Player;
 #[derive(Clone, Copy, Serialize, Deserialize)]
 pub struct Keeper;
 
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub struct Demon;
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub struct GroundItem {
+    pub item: Item,
+    pub count: u32,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Health {
+    pub current: u16,
+    pub max: u16,
+}
+
+impl Health {
+    pub fn new(max: u16) -> Self {
+        Self { current: max, max }
+    }
+
+    pub fn damage(&mut self, amount: u16) {
+        self.current = self.current.saturating_sub(amount);
+    }
+
+    pub fn is_dead(&self) -> bool {
+        self.current == 0
+    }
+
+    pub fn heal_full(&mut self) {
+        self.current = self.max;
+    }
+}
+
+pub const PLAYER_HP_BASELINE: u16 = 6;
+pub const PLAYER_HP_SHRINE_BONUS: u16 = 1;
+pub const IMP_HP: u16 = 2;
+pub const IMP_DAMAGE: u16 = 1;
+pub const PLAYER_DAMAGE: u16 = 1;
+pub const ESSENCE_PER_IMP: u64 = 4;
+pub const SHRINE_PRICE: u64 = 15;
+pub const REED_REGROW: std::time::Duration = std::time::Duration::from_secs(60);
+const SHRINE_POS: Position = Position { x: 7, y: 3 };
+const OASIS_SPAWN: Position = Position { x: 2, y: 2 };
+const IMP_SPAWNS: &[Position] = &[
+    Position { x: 10, y: 10 },
+    Position { x: 22, y: 8 },
+    Position { x: 30, y: 18 },
+    Position { x: 15, y: 22 },
+];
+
+struct HarvestedReed {
+    pos: Position,
+    regrow_remaining: std::time::Duration,
+}
+
 pub struct World {
     pub region: Region,
     pub oasis: RegionMap,
@@ -174,9 +230,13 @@ pub struct World {
     pub player: Entity,
     pub keeper: Entity,
     reed_positions: Vec<Position>,
-    harvested_reeds: Vec<Position>,
+    harvested_reeds: Vec<HarvestedReed>,
     pub inventory: Inventory,
     pub oasis_intro_complete: bool,
+    // Essence credited to the player since main last drained it. main.rs is
+    // the owner of meta.demon_currency — keeping the World decoupled from the
+    // save layer means kill sites just push here and main pulls each frame.
+    essence_gained: u64,
 }
 
 // Where the player lands when stepping through a portal in either direction.
@@ -194,12 +254,13 @@ impl World {
         let mut ecs = Ecs::new();
         let player = ecs.spawn((
             Player,
-            Position { x: 2, y: 2 },
+            OASIS_SPAWN,
             Renderable {
                 glyph: b'@',
                 fg: [240, 232, 200, 255],
                 bg: [20, 17, 13, 255],
             },
+            Health::new(PLAYER_HP_BASELINE),
         ));
         let keeper = ecs.spawn((
             Keeper,
@@ -229,7 +290,12 @@ impl World {
             harvested_reeds: Vec::new(),
             inventory: Inventory::default(),
             oasis_intro_complete: false,
+            essence_gained: 0,
         }
+    }
+
+    pub fn take_essence_gained(&mut self) -> u64 {
+        std::mem::take(&mut self.essence_gained)
     }
 
     pub fn current_map(&self) -> &RegionMap {
@@ -243,19 +309,96 @@ impl World {
         self.current_map().tile_at(wx, wy)
     }
 
-    pub fn set_region(&mut self, region: Region, player_pos: Position) {
+    pub fn enter_region(&mut self, region: Region, player_pos: Position) {
+        // Wilderness entities are run-scoped; clear them on every transition
+        // and respawn a fresh roster on wilderness entry. Entering the oasis
+        // is also where the player heals between runs. Ground items survive
+        // both directions — they're how the player recovers post-death loot.
+        self.despawn_wilderness_entities();
         self.region = region;
         self.set_player_pos(player_pos);
+        match region {
+            Region::Wilderness => self.spawn_wilderness_imps(),
+            Region::Oasis => self.heal_player_full(),
+        }
+        self.try_pickup_ground_items();
     }
 
-    pub fn tick_oasis(&mut self, _dt: std::time::Duration) {
-        // Wall-clock NPC behavior lives here once schedules / reed-regrow land.
-        // Currently nothing in the oasis advances on its own.
+    pub fn apply_shrine_unlock(&mut self) {
+        let w = self.oasis.width;
+        self.oasis.tiles[idx(w, SHRINE_POS.x, SHRINE_POS.y)] = Tile::Shrine;
+        let new_max = PLAYER_HP_BASELINE + PLAYER_HP_SHRINE_BONUS;
+        let mut h = self
+            .ecs
+            .get::<&mut Health>(self.player)
+            .expect("player has Health");
+        h.max = new_max;
+        h.current = new_max;
+    }
+
+    pub fn respawn_to_oasis(&mut self) {
+        // Drop everything carried at the death spot before we relocate the
+        // player. The drop must happen while we're still in wilderness coords.
+        if self.region == Region::Wilderness {
+            let death_pos = self.player_pos();
+            self.drop_player_inventory_at(death_pos);
+        }
+        self.enter_region(Region::Oasis, OASIS_SPAWN);
+    }
+
+    pub fn tick_oasis(&mut self, dt: std::time::Duration) {
+        // Walk the regrow queue, age each entry, and let any that hit zero
+        // pop back to "unharvested." The renderer reads is_unharvested_reed_at
+        // each frame so a regrown reed becomes visible the same frame it
+        // expires.
+        self.harvested_reeds.retain_mut(|h| {
+            h.regrow_remaining = h.regrow_remaining.saturating_sub(dt);
+            !h.regrow_remaining.is_zero()
+        });
     }
 
     pub fn tick_wilderness(&mut self) {
-        // Discrete world step after each player action. Demon AI / blessing
-        // tick / run-scoped timers land here in later steps.
+        let player_pos = self.player_pos();
+        // Snapshot demons first so we can mutate ECS during the loop.
+        let demons: Vec<(Entity, Position)> = self
+            .ecs
+            .query::<(&Demon, &Position)>()
+            .iter()
+            .map(|(e, (_, p))| (e, *p))
+            .collect();
+
+        for (entity, pos) in demons {
+            let dx = (player_pos.x - pos.x).signum();
+            let dy = (player_pos.y - pos.y).signum();
+            let abs_dx = (player_pos.x - pos.x).abs();
+            let abs_dy = (player_pos.y - pos.y).abs();
+            // Greedy chase: step on the axis with the greater delta. Ties
+            // favor horizontal so behavior is deterministic.
+            let (step_x, step_y) = if abs_dx >= abs_dy { (dx, 0) } else { (0, dy) };
+            if step_x == 0 && step_y == 0 {
+                continue;
+            }
+            let target = Position {
+                x: pos.x + step_x,
+                y: pos.y + step_y,
+            };
+            if target == player_pos {
+                self.damage_player(IMP_DAMAGE);
+                continue;
+            }
+            if !matches!(
+                self.tile_at(target.x as i64, target.y as i64),
+                Tile::Floor
+            ) {
+                continue;
+            }
+            if self.find_demon_at(target.x, target.y).is_some() {
+                continue;
+            }
+            if let Ok(mut p) = self.ecs.get::<&mut Position>(entity) {
+                *p = target;
+            }
+        }
     }
 
     pub fn try_move_player(&mut self, dx: i32, dy: i32) {
@@ -265,13 +408,21 @@ impl World {
             .expect("player has Position");
         let nx = pos.x + dx;
         let ny = pos.y + dy;
+
+        // Bump-attack: walking into a demon resolves as melee instead of move.
+        if self.region == Region::Wilderness {
+            if let Some(demon) = self.find_demon_at(nx, ny) {
+                self.attack_demon(demon, PLAYER_DAMAGE);
+                return;
+            }
+        }
+
         let target = self.tile_at(nx as i64, ny as i64);
         let passable = matches!(target, Tile::Floor | Tile::Portal);
         if !passable {
             return;
         }
-        let blocked_by_keeper =
-            self.region == Region::Oasis && self.is_keeper_at(nx, ny);
+        let blocked_by_keeper = self.region == Region::Oasis && self.is_keeper_at(nx, ny);
         if blocked_by_keeper {
             return;
         }
@@ -292,13 +443,14 @@ impl World {
                     },
                 ),
             };
-            self.set_region(dest_region, dest_pos);
+            self.enter_region(dest_region, dest_pos);
             return;
         }
         *self
             .ecs
             .get::<&mut Position>(self.player)
             .expect("player has Position") = Position { x: nx, y: ny };
+        self.try_pickup_ground_items();
     }
 
     pub fn player_pos(&self) -> Position {
@@ -331,7 +483,7 @@ impl World {
     }
 
     pub fn harvested_reeds(&self) -> Vec<[i32; 2]> {
-        self.harvested_reeds.iter().map(|p| [p.x, p.y]).collect()
+        self.harvested_reeds.iter().map(|h| [h.pos.x, h.pos.y]).collect()
     }
 
     pub fn restore_oasis_state(
@@ -343,8 +495,16 @@ impl World {
         self.harvested_reeds.clear();
         for [x, y] in harvested_reeds.iter().copied() {
             let p = Position { x, y };
-            if self.reed_positions.contains(&p) && !self.harvested_reeds.contains(&p) {
-                self.harvested_reeds.push(p);
+            // Save format only carries positions; on load each harvested tile
+            // restarts its regrow clock from full. Players that quit mid-wait
+            // effectively reset the timer — acceptable for the slice.
+            if self.reed_positions.contains(&p)
+                && !self.harvested_reeds.iter().any(|h| h.pos == p)
+            {
+                self.harvested_reeds.push(HarvestedReed {
+                    pos: p,
+                    regrow_remaining: REED_REGROW,
+                });
             }
         }
         self.inventory = inventory;
@@ -353,7 +513,8 @@ impl World {
 
     pub fn is_unharvested_reed_at(&self, x: i32, y: i32) -> bool {
         let p = Position { x, y };
-        self.reed_positions.contains(&p) && !self.harvested_reeds.contains(&p)
+        self.reed_positions.contains(&p)
+            && !self.harvested_reeds.iter().any(|h| h.pos == p)
     }
 
     pub fn try_harvest_reed_near_player(&mut self) -> bool {
@@ -365,11 +526,16 @@ impl World {
             .reed_positions
             .iter()
             .copied()
-            .find(|p| !self.harvested_reeds.contains(p) && is_near(player, *p))
+            .find(|p| {
+                !self.harvested_reeds.iter().any(|h| h.pos == *p) && is_near(player, *p)
+            })
         else {
             return false;
         };
-        self.harvested_reeds.push(reed);
+        self.harvested_reeds.push(HarvestedReed {
+            pos: reed,
+            regrow_remaining: REED_REGROW,
+        });
         self.inventory.add(Item::Reed, 1);
         true
     }
@@ -378,8 +544,163 @@ impl World {
         self.region == Region::Oasis && is_adjacent(self.player_pos(), self.keeper_pos())
     }
 
+    pub fn player_hp(&self) -> Health {
+        *self
+            .ecs
+            .get::<&Health>(self.player)
+            .expect("player has Health")
+    }
+
+    pub fn player_is_dead(&self) -> bool {
+        self.player_hp().is_dead()
+    }
+
+    pub fn demon_positions(&self) -> Vec<Position> {
+        self.ecs
+            .query::<(&Demon, &Position)>()
+            .iter()
+            .map(|(_, (_, p))| *p)
+            .collect()
+    }
+
+    fn heal_player_full(&mut self) {
+        self.ecs
+            .get::<&mut Health>(self.player)
+            .expect("player has Health")
+            .heal_full();
+    }
+
+    fn damage_player(&mut self, amount: u16) {
+        self.ecs
+            .get::<&mut Health>(self.player)
+            .expect("player has Health")
+            .damage(amount);
+    }
+
+    fn attack_demon(&mut self, demon: Entity, amount: u16) {
+        let killed = {
+            let mut h = self
+                .ecs
+                .get::<&mut Health>(demon)
+                .expect("demon has Health");
+            h.damage(amount);
+            h.is_dead()
+        };
+        if killed {
+            let _ = self.ecs.despawn(demon);
+            self.essence_gained = self.essence_gained.saturating_add(ESSENCE_PER_IMP);
+        }
+    }
+
+    fn spawn_wilderness_imps(&mut self) {
+        for spawn in IMP_SPAWNS.iter().copied() {
+            self.ecs.spawn((
+                Demon,
+                spawn,
+                Renderable {
+                    glyph: b'd',
+                    fg: [220, 80, 90, 255],
+                    bg: [20, 17, 13, 255],
+                },
+                Health::new(IMP_HP),
+            ));
+        }
+    }
+
+    fn despawn_wilderness_entities(&mut self) {
+        let demons: Vec<Entity> = self
+            .ecs
+            .query::<&Demon>()
+            .iter()
+            .map(|(e, _)| e)
+            .collect();
+        for e in demons {
+            let _ = self.ecs.despawn(e);
+        }
+    }
+
+    fn find_demon_at(&self, x: i32, y: i32) -> Option<Entity> {
+        self.ecs
+            .query::<(&Demon, &Position)>()
+            .iter()
+            .find(|(_, (_, p))| p.x == x && p.y == y)
+            .map(|(e, _)| e)
+    }
+
     fn is_keeper_at(&self, x: i32, y: i32) -> bool {
         self.keeper_pos() == Position { x, y }
+    }
+
+    pub fn ground_items(&self) -> Vec<(Position, Item, u32)> {
+        self.ecs
+            .query::<(&GroundItem, &Position)>()
+            .iter()
+            .map(|(_, (gi, p))| (*p, gi.item, gi.count))
+            .collect()
+    }
+
+    fn drop_player_inventory_at(&mut self, pos: Position) {
+        let stacks: Vec<(Item, u32)> = self.inventory.iter().collect();
+        for (item, count) in stacks {
+            if count == 0 {
+                continue;
+            }
+            self.ecs.spawn((GroundItem { item, count }, pos));
+        }
+        self.inventory = Inventory::default();
+    }
+
+    fn try_pickup_ground_items(&mut self) {
+        if self.region != Region::Wilderness {
+            return;
+        }
+        let player_pos = self.player_pos();
+        let pickups: Vec<(Entity, Item, u32)> = self
+            .ecs
+            .query::<(&GroundItem, &Position)>()
+            .iter()
+            .filter(|(_, (_, p))| **p == player_pos)
+            .map(|(e, (gi, _))| (e, gi.item, gi.count))
+            .collect();
+        for (entity, item, count) in pickups {
+            self.inventory.add(item, count);
+            let _ = self.ecs.despawn(entity);
+        }
+    }
+
+    pub fn ground_items_save(&self) -> Vec<(String, u32, i32, i32)> {
+        self.ecs
+            .query::<(&GroundItem, &Position)>()
+            .iter()
+            .map(|(_, (gi, p))| (gi.item.save_key().to_string(), gi.count, p.x, p.y))
+            .collect()
+    }
+
+    pub fn restore_ground_items(&mut self, items: &[(String, u32, i32, i32)]) {
+        let existing: Vec<Entity> = self
+            .ecs
+            .query::<&GroundItem>()
+            .iter()
+            .map(|(e, _)| e)
+            .collect();
+        for e in existing {
+            let _ = self.ecs.despawn(e);
+        }
+        for (kind, count, x, y) in items {
+            let Some(item) = Item::from_save_key(kind) else {
+                continue;
+            };
+            if *count == 0 {
+                continue;
+            }
+            self.ecs.spawn((
+                GroundItem {
+                    item,
+                    count: *count,
+                },
+                Position { x: *x, y: *y },
+            ));
+        }
     }
 }
 
@@ -500,6 +821,211 @@ mod tests {
 
         assert_eq!(world.player_pos(), Position { x: 4, y: 3 });
         assert!(world.player_is_adjacent_to_keeper());
+    }
+
+    #[test]
+    fn bump_attack_kills_imp_and_returns_oasis_safe() {
+        let mut world = World::new(40, 30);
+        world.enter_region(
+            Region::Wilderness,
+            Position {
+                x: IMP_SPAWNS[0].x - 1,
+                y: IMP_SPAWNS[0].y,
+            },
+        );
+        let imp_pos = IMP_SPAWNS[0];
+
+        // First bump reduces imp HP but doesn't kill (imp has 2 HP).
+        world.try_move_player(1, 0);
+        assert!(world.find_demon_at(imp_pos.x, imp_pos.y).is_some());
+        // Player did not move onto the imp's tile.
+        assert_eq!(
+            world.player_pos(),
+            Position {
+                x: imp_pos.x - 1,
+                y: imp_pos.y
+            }
+        );
+
+        // Second bump kills the imp.
+        world.try_move_player(1, 0);
+        assert!(world.find_demon_at(imp_pos.x, imp_pos.y).is_none());
+
+        // Now the player can walk onto that tile.
+        world.try_move_player(1, 0);
+        assert_eq!(world.player_pos(), imp_pos);
+    }
+
+    #[test]
+    fn player_dies_and_respawns_full_hp() {
+        let mut world = World::new(40, 30);
+        world.enter_region(Region::Wilderness, Position { x: 5, y: 5 });
+        // Drain the player's health below the imp's first hit so the next
+        // wilderness tick is lethal.
+        world.damage_player(PLAYER_HP_BASELINE - 1);
+        assert_eq!(world.player_hp().current, 1);
+
+        // Drop an imp right next to the player so the next tick is a hit.
+        world.ecs.spawn((
+            Demon,
+            Position { x: 6, y: 5 },
+            Renderable {
+                glyph: b'd',
+                fg: [0; 4],
+                bg: [0; 4],
+            },
+            Health::new(IMP_HP),
+        ));
+        world.tick_wilderness();
+        assert!(world.player_is_dead());
+
+        world.respawn_to_oasis();
+        assert_eq!(world.region, Region::Oasis);
+        assert_eq!(world.player_pos(), OASIS_SPAWN);
+        assert_eq!(world.player_hp().current, PLAYER_HP_BASELINE);
+        // Wilderness imps cleared on respawn.
+        assert!(world.demon_positions().is_empty());
+    }
+
+    #[test]
+    fn reed_regrows_after_timer() {
+        let mut world = World::new(40, 30);
+        world.set_player_pos(Position { x: 8, y: 4 });
+        assert!(world.try_harvest_reed_near_player());
+        let reed_at = Position { x: 8, y: 5 };
+        assert!(!world.is_unharvested_reed_at(reed_at.x, reed_at.y));
+
+        // Halfway through the timer the tile is still harvested.
+        world.tick_oasis(REED_REGROW / 2);
+        assert!(!world.is_unharvested_reed_at(reed_at.x, reed_at.y));
+
+        // Past full duration -> regrown.
+        world.tick_oasis(REED_REGROW);
+        assert!(world.is_unharvested_reed_at(reed_at.x, reed_at.y));
+    }
+
+    #[test]
+    fn apply_shrine_unlock_places_tile_and_raises_max_hp() {
+        let mut world = World::new(40, 30);
+        assert_eq!(world.player_hp().max, PLAYER_HP_BASELINE);
+        world.apply_shrine_unlock();
+        assert_eq!(
+            world.tile_at(SHRINE_POS.x as i64, SHRINE_POS.y as i64),
+            Tile::Shrine
+        );
+        assert_eq!(
+            world.player_hp().max,
+            PLAYER_HP_BASELINE + PLAYER_HP_SHRINE_BONUS
+        );
+        // Shrine tile is impassable: stepping into it doesn't move the player.
+        world.set_player_pos(Position { x: SHRINE_POS.x - 1, y: SHRINE_POS.y });
+        let before = world.player_pos();
+        world.try_move_player(1, 0);
+        assert_eq!(world.player_pos(), before);
+    }
+
+    #[test]
+    fn death_drops_inventory_and_pickup_recovers() {
+        let mut world = World::new(40, 30);
+        world.enter_region(Region::Wilderness, Position { x: 5, y: 5 });
+        world.inventory.add(Item::Reed, 3);
+
+        // Force death.
+        world.damage_player(PLAYER_HP_BASELINE);
+        assert!(world.player_is_dead());
+        let death_pos = world.player_pos();
+
+        world.respawn_to_oasis();
+        // Inventory dropped, player at oasis spawn, ground item at death loc.
+        assert!(world.inventory.is_empty());
+        assert_eq!(world.region, Region::Oasis);
+        assert_eq!(world.player_pos(), OASIS_SPAWN);
+        let dropped = world.ground_items();
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].0, death_pos);
+        assert_eq!(dropped[0].1, Item::Reed);
+        assert_eq!(dropped[0].2, 3);
+
+        // Re-enter wilderness right on top of the dropped stack -> auto-pickup.
+        world.enter_region(Region::Wilderness, death_pos);
+        assert_eq!(world.inventory.count(Item::Reed), 3);
+        assert!(world.ground_items().is_empty());
+    }
+
+    #[test]
+    fn step_onto_ground_item_picks_it_up() {
+        let mut world = World::new(40, 30);
+        world.enter_region(Region::Wilderness, Position { x: 5, y: 5 });
+        // Drop a stack adjacent to the player.
+        world.ecs.spawn((
+            GroundItem {
+                item: Item::Reed,
+                count: 2,
+            },
+            Position { x: 6, y: 5 },
+        ));
+        assert_eq!(world.inventory.count(Item::Reed), 0);
+
+        world.try_move_player(1, 0);
+        assert_eq!(world.player_pos(), Position { x: 6, y: 5 });
+        assert_eq!(world.inventory.count(Item::Reed), 2);
+        assert!(world.ground_items().is_empty());
+    }
+
+    #[test]
+    fn ground_items_round_trip() {
+        let mut world = World::new(40, 30);
+        world.enter_region(Region::Wilderness, Position { x: 1, y: PORTAL_Y });
+        world.ecs.spawn((
+            GroundItem {
+                item: Item::Reed,
+                count: 4,
+            },
+            Position { x: 12, y: 14 },
+        ));
+        let snapshot = world.ground_items_save();
+        assert_eq!(snapshot.len(), 1);
+
+        let mut fresh = World::new(40, 30);
+        fresh.enter_region(Region::Wilderness, Position { x: 1, y: PORTAL_Y });
+        fresh.restore_ground_items(&snapshot);
+        let items = fresh.ground_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].0, Position { x: 12, y: 14 });
+        assert_eq!(items[0].1, Item::Reed);
+        assert_eq!(items[0].2, 4);
+    }
+
+    #[test]
+    fn imp_kill_credits_essence() {
+        let mut world = World::new(40, 30);
+        world.enter_region(
+            Region::Wilderness,
+            Position {
+                x: IMP_SPAWNS[0].x - 1,
+                y: IMP_SPAWNS[0].y,
+            },
+        );
+        assert_eq!(world.take_essence_gained(), 0);
+
+        // 2 bumps to kill (IMP_HP = 2). Only the killing bump should credit.
+        world.try_move_player(1, 0);
+        assert_eq!(world.take_essence_gained(), 0);
+        world.try_move_player(1, 0);
+        assert_eq!(world.take_essence_gained(), ESSENCE_PER_IMP);
+
+        // take_ drains.
+        assert_eq!(world.take_essence_gained(), 0);
+    }
+
+    #[test]
+    fn entering_wilderness_spawns_imps() {
+        let mut world = World::new(40, 30);
+        assert!(world.demon_positions().is_empty());
+        world.enter_region(Region::Wilderness, Position { x: 1, y: PORTAL_Y });
+        assert_eq!(world.demon_positions().len(), IMP_SPAWNS.len());
+        world.enter_region(Region::Oasis, OASIS_SPAWN);
+        assert!(world.demon_positions().is_empty());
     }
 
     #[test]
