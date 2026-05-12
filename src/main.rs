@@ -242,6 +242,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     vec!["You fell. You wake at the oasis."],
                 ));
             }
+            meta.demon_currency = meta
+                .demon_currency
+                .saturating_add(world.take_essence_gained());
+            // Any wilderness <-> oasis crossing — safe return, death respawn,
+            // or step-in portal — is a checkpoint. Auto-save so currency and
+            // run state don't evaporate on crash or quit-without-save.
+            if pre_region != world.region {
+                save_game(
+                    &save_dir,
+                    &mut meta,
+                    &world,
+                    &mut prev_meta_header,
+                    &mut prev_run_header,
+                );
+            }
         }
 
         // Camera in world coords. While the world fits the viewport we anchor
@@ -261,7 +276,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             world.demon_positions()
         };
-        let ui_cells = build_ui_cells(&world, dialogue.as_ref(), inventory_open, &palette);
+        let ui_cells = build_ui_cells(
+            &world,
+            dialogue.as_ref(),
+            inventory_open,
+            meta.demon_currency,
+            &palette,
+        );
 
         let draw_start = Instant::now();
         let mut changed_cells = 0;
@@ -454,6 +475,7 @@ fn build_ui_cells(
     world: &World,
     dialogue: Option<&Dialogue>,
     inventory_open: bool,
+    demon_currency: u64,
     palette: &Palette,
 ) -> Vec<Option<Cell>> {
     let mut cells = vec![None; (WORLD_W * WORLD_H) as usize];
@@ -471,6 +493,8 @@ fn build_ui_cells(
     let hp = world.player_hp();
     let hp_text = format!("HP {}/{}", hp.current, hp.max);
     put_text(&mut cells, 13, 1, &hp_text, palette.player_fg, palette.hud_bg);
+    let essence_text = format!("Essence {}", demon_currency);
+    put_text(&mut cells, 1, 2, &essence_text, palette.essence_fg, palette.hud_bg);
 
     if inventory_open {
         draw_inventory_panel(&mut cells, world, palette);
@@ -695,6 +719,7 @@ struct Palette {
     wall_bg: Color,
     portal_fg: Color,
     demon_fg: Color,
+    essence_fg: Color,
     hud_fg: Color,
     hud_bg: Color,
     panel_fg: Color,
@@ -714,6 +739,7 @@ impl Default for Palette {
             wall_bg: Color::RGB(35, 28, 20),
             portal_fg: Color::RGB(230, 200, 120),
             demon_fg: Color::RGB(220, 80, 90),
+            essence_fg: Color::RGB(210, 170, 95),
             hud_fg: Color::RGB(190, 205, 160),
             hud_bg: Color::RGB(20, 17, 13),
             panel_fg: Color::RGB(218, 205, 170),

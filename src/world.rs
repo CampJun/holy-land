@@ -197,6 +197,7 @@ pub const PLAYER_HP_BASELINE: u16 = 6;
 pub const IMP_HP: u16 = 2;
 pub const IMP_DAMAGE: u16 = 1;
 pub const PLAYER_DAMAGE: u16 = 1;
+pub const ESSENCE_PER_IMP: u64 = 4;
 const OASIS_SPAWN: Position = Position { x: 2, y: 2 };
 const IMP_SPAWNS: &[Position] = &[
     Position { x: 10, y: 10 },
@@ -216,6 +217,10 @@ pub struct World {
     harvested_reeds: Vec<Position>,
     pub inventory: Inventory,
     pub oasis_intro_complete: bool,
+    // Essence credited to the player since main last drained it. main.rs is
+    // the owner of meta.demon_currency — keeping the World decoupled from the
+    // save layer means kill sites just push here and main pulls each frame.
+    essence_gained: u64,
 }
 
 // Where the player lands when stepping through a portal in either direction.
@@ -269,7 +274,12 @@ impl World {
             harvested_reeds: Vec::new(),
             inventory: Inventory::default(),
             oasis_intro_complete: false,
+            essence_gained: 0,
         }
+    }
+
+    pub fn take_essence_gained(&mut self) -> u64 {
+        std::mem::take(&mut self.essence_gained)
     }
 
     pub fn current_map(&self) -> &RegionMap {
@@ -521,6 +531,7 @@ impl World {
         };
         if killed {
             let _ = self.ecs.despawn(demon);
+            self.essence_gained = self.essence_gained.saturating_add(ESSENCE_PER_IMP);
         }
     }
 
@@ -745,6 +756,28 @@ mod tests {
         assert_eq!(world.player_hp().current, PLAYER_HP_BASELINE);
         // Wilderness imps cleared on respawn.
         assert!(world.demon_positions().is_empty());
+    }
+
+    #[test]
+    fn imp_kill_credits_essence() {
+        let mut world = World::new(40, 30);
+        world.enter_region(
+            Region::Wilderness,
+            Position {
+                x: IMP_SPAWNS[0].x - 1,
+                y: IMP_SPAWNS[0].y,
+            },
+        );
+        assert_eq!(world.take_essence_gained(), 0);
+
+        // 2 bumps to kill (IMP_HP = 2). Only the killing bump should credit.
+        world.try_move_player(1, 0);
+        assert_eq!(world.take_essence_gained(), 0);
+        world.try_move_player(1, 0);
+        assert_eq!(world.take_essence_gained(), ESSENCE_PER_IMP);
+
+        // take_ drains.
+        assert_eq!(world.take_essence_gained(), 0);
     }
 
     #[test]
