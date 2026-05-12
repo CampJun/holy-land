@@ -169,6 +169,12 @@ pub struct Keeper;
 #[derive(Clone, Copy, Serialize, Deserialize)]
 pub struct Demon;
 
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub struct GroundItem {
+    pub item: Item,
+    pub count: u32,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Health {
     pub current: u16,
@@ -296,7 +302,8 @@ impl World {
     pub fn enter_region(&mut self, region: Region, player_pos: Position) {
         // Wilderness entities are run-scoped; clear them on every transition
         // and respawn a fresh roster on wilderness entry. Entering the oasis
-        // is also where the player heals between runs.
+        // is also where the player heals between runs. Ground items survive
+        // both directions — they're how the player recovers post-death loot.
         self.despawn_wilderness_entities();
         self.region = region;
         self.set_player_pos(player_pos);
@@ -304,9 +311,16 @@ impl World {
             Region::Wilderness => self.spawn_wilderness_imps(),
             Region::Oasis => self.heal_player_full(),
         }
+        self.try_pickup_ground_items();
     }
 
     pub fn respawn_to_oasis(&mut self) {
+        // Drop everything carried at the death spot before we relocate the
+        // player. The drop must happen while we're still in wilderness coords.
+        if self.region == Region::Wilderness {
+            let death_pos = self.player_pos();
+            self.drop_player_inventory_at(death_pos);
+        }
         self.enter_region(Region::Oasis, OASIS_SPAWN);
     }
 
@@ -408,6 +422,7 @@ impl World {
             .ecs
             .get::<&mut Position>(self.player)
             .expect("player has Position") = Position { x: nx, y: ny };
+        self.try_pickup_ground_items();
     }
 
     pub fn player_pos(&self) -> Position {
@@ -572,6 +587,78 @@ impl World {
 
     fn is_keeper_at(&self, x: i32, y: i32) -> bool {
         self.keeper_pos() == Position { x, y }
+    }
+
+    pub fn ground_items(&self) -> Vec<(Position, Item, u32)> {
+        self.ecs
+            .query::<(&GroundItem, &Position)>()
+            .iter()
+            .map(|(_, (gi, p))| (*p, gi.item, gi.count))
+            .collect()
+    }
+
+    fn drop_player_inventory_at(&mut self, pos: Position) {
+        let stacks: Vec<(Item, u32)> = self.inventory.iter().collect();
+        for (item, count) in stacks {
+            if count == 0 {
+                continue;
+            }
+            self.ecs.spawn((GroundItem { item, count }, pos));
+        }
+        self.inventory = Inventory::default();
+    }
+
+    fn try_pickup_ground_items(&mut self) {
+        if self.region != Region::Wilderness {
+            return;
+        }
+        let player_pos = self.player_pos();
+        let pickups: Vec<(Entity, Item, u32)> = self
+            .ecs
+            .query::<(&GroundItem, &Position)>()
+            .iter()
+            .filter(|(_, (_, p))| **p == player_pos)
+            .map(|(e, (gi, _))| (e, gi.item, gi.count))
+            .collect();
+        for (entity, item, count) in pickups {
+            self.inventory.add(item, count);
+            let _ = self.ecs.despawn(entity);
+        }
+    }
+
+    pub fn ground_items_save(&self) -> Vec<(String, u32, i32, i32)> {
+        self.ecs
+            .query::<(&GroundItem, &Position)>()
+            .iter()
+            .map(|(_, (gi, p))| (gi.item.save_key().to_string(), gi.count, p.x, p.y))
+            .collect()
+    }
+
+    pub fn restore_ground_items(&mut self, items: &[(String, u32, i32, i32)]) {
+        let existing: Vec<Entity> = self
+            .ecs
+            .query::<&GroundItem>()
+            .iter()
+            .map(|(e, _)| e)
+            .collect();
+        for e in existing {
+            let _ = self.ecs.despawn(e);
+        }
+        for (kind, count, x, y) in items {
+            let Some(item) = Item::from_save_key(kind) else {
+                continue;
+            };
+            if *count == 0 {
+                continue;
+            }
+            self.ecs.spawn((
+                GroundItem {
+                    item,
+                    count: *count,
+                },
+                Position { x: *x, y: *y },
+            ));
+        }
     }
 }
 
@@ -756,6 +843,78 @@ mod tests {
         assert_eq!(world.player_hp().current, PLAYER_HP_BASELINE);
         // Wilderness imps cleared on respawn.
         assert!(world.demon_positions().is_empty());
+    }
+
+    #[test]
+    fn death_drops_inventory_and_pickup_recovers() {
+        let mut world = World::new(40, 30);
+        world.enter_region(Region::Wilderness, Position { x: 5, y: 5 });
+        world.inventory.add(Item::Reed, 3);
+
+        // Force death.
+        world.damage_player(PLAYER_HP_BASELINE);
+        assert!(world.player_is_dead());
+        let death_pos = world.player_pos();
+
+        world.respawn_to_oasis();
+        // Inventory dropped, player at oasis spawn, ground item at death loc.
+        assert!(world.inventory.is_empty());
+        assert_eq!(world.region, Region::Oasis);
+        assert_eq!(world.player_pos(), OASIS_SPAWN);
+        let dropped = world.ground_items();
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].0, death_pos);
+        assert_eq!(dropped[0].1, Item::Reed);
+        assert_eq!(dropped[0].2, 3);
+
+        // Re-enter wilderness right on top of the dropped stack -> auto-pickup.
+        world.enter_region(Region::Wilderness, death_pos);
+        assert_eq!(world.inventory.count(Item::Reed), 3);
+        assert!(world.ground_items().is_empty());
+    }
+
+    #[test]
+    fn step_onto_ground_item_picks_it_up() {
+        let mut world = World::new(40, 30);
+        world.enter_region(Region::Wilderness, Position { x: 5, y: 5 });
+        // Drop a stack adjacent to the player.
+        world.ecs.spawn((
+            GroundItem {
+                item: Item::Reed,
+                count: 2,
+            },
+            Position { x: 6, y: 5 },
+        ));
+        assert_eq!(world.inventory.count(Item::Reed), 0);
+
+        world.try_move_player(1, 0);
+        assert_eq!(world.player_pos(), Position { x: 6, y: 5 });
+        assert_eq!(world.inventory.count(Item::Reed), 2);
+        assert!(world.ground_items().is_empty());
+    }
+
+    #[test]
+    fn ground_items_round_trip() {
+        let mut world = World::new(40, 30);
+        world.enter_region(Region::Wilderness, Position { x: 1, y: PORTAL_Y });
+        world.ecs.spawn((
+            GroundItem {
+                item: Item::Reed,
+                count: 4,
+            },
+            Position { x: 12, y: 14 },
+        ));
+        let snapshot = world.ground_items_save();
+        assert_eq!(snapshot.len(), 1);
+
+        let mut fresh = World::new(40, 30);
+        fresh.enter_region(Region::Wilderness, Position { x: 1, y: PORTAL_Y });
+        fresh.restore_ground_items(&snapshot);
+        let items = fresh.ground_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].0, Position { x: 12, y: 14 });
+        assert_eq!(items[0].1, Item::Reed);
+        assert_eq!(items[0].2, 4);
     }
 
     #[test]

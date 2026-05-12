@@ -112,7 +112,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             x: run.player_x,
             y: run.player_y,
         };
-        world.enter_region(restored_region, restored_pos);
         // Build the inventory from the new field. If a pre-inventory save is
         // mid-quest (no inventory data yet, intro not finished), seed from the
         // legacy `reeds_harvested` counter so the player keeps their progress.
@@ -120,7 +119,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if inventory.is_empty() && !meta.oasis_intro_complete && run.reeds_harvested > 0 {
             inventory.add(Item::Reed, run.reeds_harvested as u32);
         }
+        // Order matters: lay the oasis state and ground items down first, then
+        // enter_region performs the player move and runs auto-pickup at the
+        // landing tile against the restored ground items.
         world.restore_oasis_state(&run.harvested_reeds, meta.oasis_intro_complete, inventory);
+        let ground_items: Vec<(String, u32, i32, i32)> = run
+            .ground_items
+            .iter()
+            .map(|g| (g.kind.clone(), g.count, g.x, g.y))
+            .collect();
+        world.restore_ground_items(&ground_items);
+        world.enter_region(restored_region, restored_pos);
     }
 
     let palette = Palette::default();
@@ -276,6 +285,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             world.demon_positions()
         };
+        let ground_items: Vec<(Position, Item, u32)> = if in_oasis {
+            Vec::new()
+        } else {
+            world.ground_items()
+        };
         let ui_cells = build_ui_cells(
             &world,
             dialogue.as_ref(),
@@ -313,6 +327,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     glyph = b'd';
                     fg = palette.demon_fg;
+                } else if let Some((_, item, _)) = ground_items
+                    .iter()
+                    .find(|(p, _, _)| p.x as i64 == wx && p.y as i64 == wy)
+                {
+                    glyph = item.glyph();
+                    fg = item_fg(*item, &palette);
                 } else if in_oasis && world.is_unharvested_reed_at(wx as i32, wy as i32) {
                     glyph = b'"';
                     fg = palette.reed_fg;
@@ -463,6 +483,11 @@ fn save_game(
     run.harvested_reeds = world.harvested_reeds();
     run.inventory = world.inventory.to_save();
     run.region = world.region.save_key().to_string();
+    run.ground_items = world
+        .ground_items_save()
+        .into_iter()
+        .map(|(kind, count, x, y)| save::GroundItemSave { kind, count, x, y })
+        .collect();
     if let Err(e) = save::save_atomic(&save_dir.join(RUN_FILE), &run) {
         eprintln!("run save failed: {}", e);
     } else {
