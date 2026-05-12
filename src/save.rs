@@ -61,6 +61,8 @@ pub struct MetaSave {
     pub unlocks: Vec<String>,
     #[serde(default)]
     pub oasis_intro_complete: bool,
+    #[serde(default)]
+    pub shrine_unlocked: bool,
 }
 
 impl MetaSave {
@@ -72,6 +74,7 @@ impl MetaSave {
             deity_affinity: BTreeMap::new(),
             unlocks: Vec::new(),
             oasis_intro_complete: false,
+            shrine_unlocked: false,
         }
     }
 }

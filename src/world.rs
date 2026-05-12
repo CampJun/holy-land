@@ -2,11 +2,12 @@ use hecs::{Entity, World as Ecs};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Tile {
     Floor,
     Wall,
     Portal,
+    Shrine,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,10 +201,14 @@ impl Health {
 }
 
 pub const PLAYER_HP_BASELINE: u16 = 6;
+pub const PLAYER_HP_SHRINE_BONUS: u16 = 1;
 pub const IMP_HP: u16 = 2;
 pub const IMP_DAMAGE: u16 = 1;
 pub const PLAYER_DAMAGE: u16 = 1;
 pub const ESSENCE_PER_IMP: u64 = 4;
+pub const SHRINE_PRICE: u64 = 15;
+pub const REED_REGROW: std::time::Duration = std::time::Duration::from_secs(60);
+const SHRINE_POS: Position = Position { x: 7, y: 3 };
 const OASIS_SPAWN: Position = Position { x: 2, y: 2 };
 const IMP_SPAWNS: &[Position] = &[
     Position { x: 10, y: 10 },
@@ -211,6 +216,11 @@ const IMP_SPAWNS: &[Position] = &[
     Position { x: 30, y: 18 },
     Position { x: 15, y: 22 },
 ];
+
+struct HarvestedReed {
+    pos: Position,
+    regrow_remaining: std::time::Duration,
+}
 
 pub struct World {
     pub region: Region,
@@ -220,7 +230,7 @@ pub struct World {
     pub player: Entity,
     pub keeper: Entity,
     reed_positions: Vec<Position>,
-    harvested_reeds: Vec<Position>,
+    harvested_reeds: Vec<HarvestedReed>,
     pub inventory: Inventory,
     pub oasis_intro_complete: bool,
     // Essence credited to the player since main last drained it. main.rs is
@@ -314,6 +324,18 @@ impl World {
         self.try_pickup_ground_items();
     }
 
+    pub fn apply_shrine_unlock(&mut self) {
+        let w = self.oasis.width;
+        self.oasis.tiles[idx(w, SHRINE_POS.x, SHRINE_POS.y)] = Tile::Shrine;
+        let new_max = PLAYER_HP_BASELINE + PLAYER_HP_SHRINE_BONUS;
+        let mut h = self
+            .ecs
+            .get::<&mut Health>(self.player)
+            .expect("player has Health");
+        h.max = new_max;
+        h.current = new_max;
+    }
+
     pub fn respawn_to_oasis(&mut self) {
         // Drop everything carried at the death spot before we relocate the
         // player. The drop must happen while we're still in wilderness coords.
@@ -324,9 +346,15 @@ impl World {
         self.enter_region(Region::Oasis, OASIS_SPAWN);
     }
 
-    pub fn tick_oasis(&mut self, _dt: std::time::Duration) {
-        // Wall-clock NPC behavior lives here once schedules / reed-regrow land.
-        // Currently nothing in the oasis advances on its own.
+    pub fn tick_oasis(&mut self, dt: std::time::Duration) {
+        // Walk the regrow queue, age each entry, and let any that hit zero
+        // pop back to "unharvested." The renderer reads is_unharvested_reed_at
+        // each frame so a regrown reed becomes visible the same frame it
+        // expires.
+        self.harvested_reeds.retain_mut(|h| {
+            h.regrow_remaining = h.regrow_remaining.saturating_sub(dt);
+            !h.regrow_remaining.is_zero()
+        });
     }
 
     pub fn tick_wilderness(&mut self) {
@@ -455,7 +483,7 @@ impl World {
     }
 
     pub fn harvested_reeds(&self) -> Vec<[i32; 2]> {
-        self.harvested_reeds.iter().map(|p| [p.x, p.y]).collect()
+        self.harvested_reeds.iter().map(|h| [h.pos.x, h.pos.y]).collect()
     }
 
     pub fn restore_oasis_state(
@@ -467,8 +495,16 @@ impl World {
         self.harvested_reeds.clear();
         for [x, y] in harvested_reeds.iter().copied() {
             let p = Position { x, y };
-            if self.reed_positions.contains(&p) && !self.harvested_reeds.contains(&p) {
-                self.harvested_reeds.push(p);
+            // Save format only carries positions; on load each harvested tile
+            // restarts its regrow clock from full. Players that quit mid-wait
+            // effectively reset the timer — acceptable for the slice.
+            if self.reed_positions.contains(&p)
+                && !self.harvested_reeds.iter().any(|h| h.pos == p)
+            {
+                self.harvested_reeds.push(HarvestedReed {
+                    pos: p,
+                    regrow_remaining: REED_REGROW,
+                });
             }
         }
         self.inventory = inventory;
@@ -477,7 +513,8 @@ impl World {
 
     pub fn is_unharvested_reed_at(&self, x: i32, y: i32) -> bool {
         let p = Position { x, y };
-        self.reed_positions.contains(&p) && !self.harvested_reeds.contains(&p)
+        self.reed_positions.contains(&p)
+            && !self.harvested_reeds.iter().any(|h| h.pos == p)
     }
 
     pub fn try_harvest_reed_near_player(&mut self) -> bool {
@@ -489,11 +526,16 @@ impl World {
             .reed_positions
             .iter()
             .copied()
-            .find(|p| !self.harvested_reeds.contains(p) && is_near(player, *p))
+            .find(|p| {
+                !self.harvested_reeds.iter().any(|h| h.pos == *p) && is_near(player, *p)
+            })
         else {
             return false;
         };
-        self.harvested_reeds.push(reed);
+        self.harvested_reeds.push(HarvestedReed {
+            pos: reed,
+            regrow_remaining: REED_REGROW,
+        });
         self.inventory.add(Item::Reed, 1);
         true
     }
@@ -843,6 +885,43 @@ mod tests {
         assert_eq!(world.player_hp().current, PLAYER_HP_BASELINE);
         // Wilderness imps cleared on respawn.
         assert!(world.demon_positions().is_empty());
+    }
+
+    #[test]
+    fn reed_regrows_after_timer() {
+        let mut world = World::new(40, 30);
+        world.set_player_pos(Position { x: 8, y: 4 });
+        assert!(world.try_harvest_reed_near_player());
+        let reed_at = Position { x: 8, y: 5 };
+        assert!(!world.is_unharvested_reed_at(reed_at.x, reed_at.y));
+
+        // Halfway through the timer the tile is still harvested.
+        world.tick_oasis(REED_REGROW / 2);
+        assert!(!world.is_unharvested_reed_at(reed_at.x, reed_at.y));
+
+        // Past full duration -> regrown.
+        world.tick_oasis(REED_REGROW);
+        assert!(world.is_unharvested_reed_at(reed_at.x, reed_at.y));
+    }
+
+    #[test]
+    fn apply_shrine_unlock_places_tile_and_raises_max_hp() {
+        let mut world = World::new(40, 30);
+        assert_eq!(world.player_hp().max, PLAYER_HP_BASELINE);
+        world.apply_shrine_unlock();
+        assert_eq!(
+            world.tile_at(SHRINE_POS.x as i64, SHRINE_POS.y as i64),
+            Tile::Shrine
+        );
+        assert_eq!(
+            world.player_hp().max,
+            PLAYER_HP_BASELINE + PLAYER_HP_SHRINE_BONUS
+        );
+        // Shrine tile is impassable: stepping into it doesn't move the player.
+        world.set_player_pos(Position { x: SHRINE_POS.x - 1, y: SHRINE_POS.y });
+        let before = world.player_pos();
+        world.try_move_player(1, 0);
+        assert_eq!(world.player_pos(), before);
     }
 
     #[test]
