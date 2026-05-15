@@ -1,5 +1,8 @@
 # First Prototype Plan — Holy Land CP437 Sim
 
+> **2026-05-14 amendment — combat & skills system reworked.**
+> The blessing model described in this doc (passive stat buffs per deity, e.g. "Ishtar +25% damage") is **superseded**. Combat is now a 100-AP-per-turn economy with 5 WoW-style attributes (Stam/Str/Agi/Int/Spi), per-weapon AP swing costs, Might-based damage scaling, and **active deity-granted powers** modified by **multiplicatively-stacking blessings**. Each god grants one power + one blessing. Skills are Runescape-shaped: 15 total (1 combat + 2 crafting per attribute), feeding attributes via 10-level milestones — so a "Stardew day" of crafting in the oasis legitimately powers up the character. See kanban cards [[Combat math foundation]], [[Action point system]], [[Power system]], [[Blessing system]], [[Skill system]], [[Enemy tiered stat blocks]], [[Combat HUD]], [[Action enum overhaul]], [[16-god roster design]].
+
 ## Context
 
 Greenfield game project. Through conversation we landed on:
