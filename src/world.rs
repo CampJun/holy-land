@@ -863,11 +863,13 @@ fn seed_phase3_debris(world: &mut World) {
             ItemMetadata::None,
         ));
     }
-    // South of player: 2 sticks + 1 grass blade.
+    // South of player: 3 sticks + 1 grass blade. Three sticks matches
+    // the phase-10 Fire Making kindling minimum so a fresh game can
+    // gather enough kindling without leaving the 3x3 around spawn.
     if let Some(c) = world.cell_at_mut(spawn.x as i64, (spawn.y + 1) as i64) {
         c.items.push(ItemInstance::stack(
             ItemKind::Stick,
-            2,
+            3,
             50,
             None,
             ItemMetadata::None,
