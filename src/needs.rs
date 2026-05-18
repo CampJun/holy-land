@@ -16,7 +16,6 @@
 
 use serde::{Deserialize, Serialize};
 
-#[allow(dead_code)] // referenced by phase-12 cooking/drinking restore logic
 pub const NEED_MAX: u8 = 100;
 
 /// Flip on in phase 14 once the slice can punish the player. Wiring is in
@@ -160,6 +159,36 @@ pub struct NeedsEnv {
     pub in_bedroll: bool,
 }
 
+/// Selector for need-restoration verbs (eat/drink/sleep/...). Shared
+/// across modules so action.rs, debug_console.rs, and future verb code
+/// don't redefine it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NeedKind {
+    Thirst,
+    Hunger,
+    Sleep,
+    Warmth,
+}
+
+impl Needs {
+    /// Add `amount` points to a need, clamped at NEED_MAX, and reset the
+    /// matching sub-point accumulator so the next decay tick starts fresh
+    /// from the new value (otherwise stale fractional progress could
+    /// immediately knock the need back down).
+    pub fn restore(&mut self, kind: NeedKind, amount: u8) {
+        let (value, acc) = match kind {
+            NeedKind::Thirst => (&mut self.thirst, &mut self.thirst_acc_secs),
+            NeedKind::Hunger => (&mut self.hunger, &mut self.hunger_acc_secs),
+            NeedKind::Sleep => (&mut self.sleep, &mut self.sleep_acc_secs),
+            NeedKind::Warmth => (&mut self.warmth, &mut self.warmth_acc_secs),
+        };
+        *value = (*value as u16)
+            .saturating_add(amount as u16)
+            .min(NEED_MAX as u16) as u8;
+        *acc = 0;
+    }
+}
+
 /// Add `add_secs` to `acc`; for each whole `denom_secs` accumulated, lose 1
 /// point and roll the accumulator over. Saturates at 0.
 fn accumulate_loss(value: &mut u8, acc: &mut u32, add_secs: u32, denom_secs: u32) {
@@ -277,6 +306,28 @@ mod tests {
         n.tick(3600, NeedsEnv::default()); // an hour at 1/min would lose 60
         assert_eq!(n.thirst, 0);
         assert!(!n.is_dead(), "death gate must be disabled in phase 4");
+    }
+
+    #[test]
+    fn restore_clamps_at_need_max() {
+        let mut n = Needs {
+            thirst: 90,
+            ..Needs::starting()
+        };
+        n.restore(NeedKind::Thirst, 30);
+        assert_eq!(n.thirst, NEED_MAX);
+    }
+
+    #[test]
+    fn restore_resets_matching_accumulator() {
+        let mut n = Needs::starting();
+        n.tick(45, NeedsEnv::default()); // thirst_acc_secs == 45
+        assert_eq!(n.thirst_acc_secs, 45);
+        n.restore(NeedKind::Thirst, 5);
+        assert_eq!(n.thirst_acc_secs, 0);
+        // Hunger accumulator is independent — should still be 45 (from 45s
+        // of tick) since hunger denom is 180.
+        assert_eq!(n.hunger_acc_secs, 45);
     }
 
     #[test]

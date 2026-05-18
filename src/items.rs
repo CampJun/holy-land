@@ -144,7 +144,7 @@ impl ItemKind {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ItemMetadata {
     None,
     Waterskin { water_uses: u8 },
@@ -288,6 +288,62 @@ impl Pack {
         }
         self.contents.push(item);
         Ok(())
+    }
+
+    /// True if at least one `ItemInstance` of `kind` is present with
+    /// `count > 0`. Works for both fungible stacks and unique entries.
+    pub fn has_stack(&self, kind: ItemKind) -> bool {
+        self.contents
+            .iter()
+            .any(|i| i.kind == kind && i.count > 0)
+    }
+
+    /// Consume one unit of a stack of `kind`: decrement count by 1; if the
+    /// count hits 0, remove the entry. Returns true if a unit was taken.
+    /// For unique items (count always 1), this removes the entry entirely.
+    pub fn take_one_from_stack(&mut self, kind: ItemKind) -> bool {
+        let Some(idx) = self
+            .contents
+            .iter()
+            .position(|i| i.kind == kind && i.count > 0)
+        else {
+            return false;
+        };
+        self.contents[idx].count -= 1;
+        if self.contents[idx].count == 0 {
+            self.contents.remove(idx);
+        }
+        true
+    }
+
+    /// True if any waterskin in the pack still has at least one water use.
+    pub fn has_waterskin_with_water(&self) -> bool {
+        self.contents.iter().any(|i| {
+            i.kind == ItemKind::Waterskin
+                && matches!(i.metadata, ItemMetadata::Waterskin { water_uses } if water_uses > 0)
+        })
+    }
+
+    /// Consume one charge of water from the first waterskin that has any.
+    /// Decrements `water_uses` and reduces the waterskin's weight by the
+    /// per-use water mass (250 g). Returns true if a charge was consumed.
+    pub fn drink_one_water_use(&mut self) -> bool {
+        for item in self.contents.iter_mut() {
+            if item.kind != ItemKind::Waterskin {
+                continue;
+            }
+            if let ItemMetadata::Waterskin {
+                ref mut water_uses,
+            } = item.metadata
+            {
+                if *water_uses > 0 {
+                    *water_uses -= 1;
+                    item.weight_g_each = item.weight_g_each.saturating_sub(250);
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub fn to_save(&self) -> PackSave {
@@ -449,6 +505,105 @@ mod tests {
         assert!(pack.try_add(ws1).is_ok());
         assert!(pack.try_add(ws2).is_ok());
         assert_eq!(pack.contents.len(), 2);
+    }
+
+    #[test]
+    fn has_stack_finds_rations_in_starting_pack() {
+        let p = starting_pack();
+        assert!(p.has_stack(ItemKind::Ration));
+        assert!(p.has_stack(ItemKind::Axe));
+        assert!(!p.has_stack(ItemKind::Twig));
+    }
+
+    #[test]
+    fn take_one_from_stack_decrements_and_removes_on_zero() {
+        let mut p = Pack::empty(10_000);
+        p.contents
+            .push(ItemInstance::stack(ItemKind::Ration, 2, 500, None, ItemMetadata::None));
+        assert!(p.take_one_from_stack(ItemKind::Ration));
+        assert_eq!(p.contents[0].count, 1);
+        assert!(p.take_one_from_stack(ItemKind::Ration));
+        assert!(p.contents.is_empty());
+        assert!(!p.take_one_from_stack(ItemKind::Ration));
+    }
+
+    #[test]
+    fn take_one_from_stack_works_for_unique_items() {
+        // Unique kinds always have count 1; taking one removes the entry.
+        let mut p = Pack::empty(10_000);
+        p.contents
+            .push(ItemInstance::unique(ItemKind::Knife, 200, None, ItemMetadata::None));
+        assert!(p.take_one_from_stack(ItemKind::Knife));
+        assert!(p.contents.is_empty());
+    }
+
+    #[test]
+    fn has_waterskin_with_water_reflects_metadata() {
+        let mut p = Pack::empty(10_000);
+        p.contents.push(ItemInstance::unique(
+            ItemKind::Waterskin,
+            1_200,
+            Some(4),
+            ItemMetadata::Waterskin { water_uses: 4 },
+        ));
+        assert!(p.has_waterskin_with_water());
+
+        // Drained waterskin: still in pack but has no water.
+        p.contents[0].metadata = ItemMetadata::Waterskin { water_uses: 0 };
+        p.contents[0].weight_g_each = 200; // empty weight
+        assert!(!p.has_waterskin_with_water());
+    }
+
+    #[test]
+    fn drink_one_water_use_decrements_uses_and_weight() {
+        let mut p = Pack::empty(10_000);
+        p.contents.push(ItemInstance::unique(
+            ItemKind::Waterskin,
+            1_200,
+            Some(4),
+            ItemMetadata::Waterskin { water_uses: 4 },
+        ));
+        assert!(p.drink_one_water_use());
+        match p.contents[0].metadata {
+            ItemMetadata::Waterskin { water_uses } => assert_eq!(water_uses, 3),
+            other => panic!("expected Waterskin metadata, got {:?}", other),
+        }
+        assert_eq!(p.contents[0].weight_g_each, 950); // 1200 - 250
+    }
+
+    #[test]
+    fn drink_one_water_use_returns_false_when_no_water() {
+        let mut p = Pack::empty(10_000);
+        p.contents.push(ItemInstance::unique(
+            ItemKind::Waterskin,
+            200,
+            Some(0),
+            ItemMetadata::Waterskin { water_uses: 0 },
+        ));
+        assert!(!p.drink_one_water_use());
+    }
+
+    #[test]
+    fn drink_one_water_use_picks_first_with_water_then_second() {
+        let mut p = Pack::empty(10_000);
+        // First skin empty, second full. The second one should drain.
+        p.contents.push(ItemInstance::unique(
+            ItemKind::Waterskin,
+            200,
+            Some(0),
+            ItemMetadata::Waterskin { water_uses: 0 },
+        ));
+        p.contents.push(ItemInstance::unique(
+            ItemKind::Waterskin,
+            1_200,
+            Some(4),
+            ItemMetadata::Waterskin { water_uses: 4 },
+        ));
+        assert!(p.drink_one_water_use());
+        match p.contents[1].metadata {
+            ItemMetadata::Waterskin { water_uses } => assert_eq!(water_uses, 3),
+            other => panic!("got {:?}", other),
+        }
     }
 
     #[test]

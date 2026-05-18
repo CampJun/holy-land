@@ -35,10 +35,13 @@ pub const DAY_LENGTH_SECONDS: u64 = 24 * 3600;
 pub const DAWN_HOUR: u64 = 6;
 pub const DUSK_HOUR: u64 = 20;
 
-/// Action costs in game-seconds. Read by the move/pickup verbs in this
-/// module and exposed for phase-7's command-menu cost surfacing.
+/// Action costs in game-seconds. Read by the verb implementations in
+/// action.rs and exposed for the command menu's cost surfacing.
 pub const COST_MOVE_TILE: u32 = 5;
 pub const COST_PICKUP: u32 = 3;
+pub const COST_EAT_RATION: u32 = 10;
+pub const COST_EAT_HERB: u32 = 5;
+pub const COST_DRINK_WATERSKIN: u32 = 5;
 
 /// FOV radii. Phase-10 adds a fire-light-source bump for night cells
 /// within 5 of a lit fire.

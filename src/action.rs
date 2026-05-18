@@ -8,7 +8,11 @@
 // `reason` names the phase that unlocks it. Reading the menu in-game is
 // a live punch-list of remaining work.
 
-use crate::world::{World, COST_PICKUP};
+use crate::items::ItemKind;
+use crate::needs::NeedKind;
+use crate::world::{
+    World, COST_DRINK_WATERSKIN, COST_EAT_HERB, COST_EAT_RATION, COST_PICKUP,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActionId {
@@ -110,19 +114,44 @@ pub enum Availability {
     Unavailable { reason: &'static str },
 }
 
+impl Availability {
+    /// Helper for the common "available iff some pack/world predicate is
+    /// true" pattern. Use as:
+    ///   Availability::from_has(pack.has_stack(Ration), cost, "no rations")
+    pub fn from_has(has: bool, cost_game_seconds: u32, missing_reason: &'static str) -> Self {
+        if has {
+            Self::Available { cost_game_seconds }
+        } else {
+            Self::Unavailable {
+                reason: missing_reason,
+            }
+        }
+    }
+}
+
 pub fn evaluate(world: &World, id: ActionId) -> Availability {
+    let pack = world.player_pack();
     match id {
         ActionId::Pickup => eval_pickup(world),
+        ActionId::EatRation => Availability::from_has(
+            pack.has_stack(ItemKind::Ration),
+            COST_EAT_RATION,
+            "no rations in pack",
+        ),
+        ActionId::EatHerb => Availability::from_has(
+            pack.has_stack(ItemKind::Herb),
+            COST_EAT_HERB,
+            "no herbs in pack",
+        ),
+        ActionId::DrinkWaterskin => Availability::from_has(
+            pack.has_waterskin_with_water(),
+            COST_DRINK_WATERSKIN,
+            "no water in waterskins",
+        ),
         // Slice-1 stubs; each `reason` names the phase that lights this
         // action up. When you wire the real check, replace the arm.
         ActionId::DrinkFromStream | ActionId::FillWaterskin => Availability::Unavailable {
             reason: "phase 11: no water yet",
-        },
-        ActionId::DrinkWaterskin => Availability::Unavailable {
-            reason: "phase 8: drink from waterskin",
-        },
-        ActionId::EatRation | ActionId::EatHerb => Availability::Unavailable {
-            reason: "phase 8: eating",
         },
         ActionId::ChopTree => Availability::Unavailable {
             reason: "phase 11: no trees yet",
@@ -192,8 +221,66 @@ pub fn execute(world: &mut World, id: ActionId) -> ExecuteOutcome {
             let picked = world.try_pickup_all_at_player();
             ExecuteOutcome::Done(format!("picked up {} stack(s)", picked))
         }
+        ActionId::EatRation => consume_and_restore(
+            world,
+            ConsumeFrom::Stack(ItemKind::Ration),
+            NeedKind::Hunger,
+            25,
+            COST_EAT_RATION,
+            "ate a ration (+25 hunger)",
+            "no rations to eat",
+        ),
+        ActionId::EatHerb => consume_and_restore(
+            world,
+            ConsumeFrom::Stack(ItemKind::Herb),
+            NeedKind::Hunger,
+            5,
+            COST_EAT_HERB,
+            "ate a herb (+5 hunger)",
+            "no herbs to eat",
+        ),
+        ActionId::DrinkWaterskin => consume_and_restore(
+            world,
+            ConsumeFrom::WaterskinCharge,
+            NeedKind::Thirst,
+            20,
+            COST_DRINK_WATERSKIN,
+            "drank from waterskin (+20 thirst)",
+            "no water to drink",
+        ),
         _ => ExecuteOutcome::NotImplemented,
     }
+}
+
+/// Shape shared by every "consume one source unit, restore one need"
+/// verb. `WaterskinCharge` is its own variant because waterskins decrement
+/// `water_uses` (not `count`) and adjust weight.
+enum ConsumeFrom {
+    Stack(ItemKind),
+    WaterskinCharge,
+}
+
+fn consume_and_restore(
+    world: &mut World,
+    source: ConsumeFrom,
+    need: NeedKind,
+    amount: u8,
+    cost_game_seconds: u32,
+    success_msg: &'static str,
+    empty_msg: &'static str,
+) -> ExecuteOutcome {
+    let consumed = match source {
+        ConsumeFrom::Stack(kind) => world.player_pack_mut().take_one_from_stack(kind),
+        ConsumeFrom::WaterskinCharge => world.player_pack_mut().drink_one_water_use(),
+    };
+    if !consumed {
+        return ExecuteOutcome::Done(empty_msg.to_string());
+    }
+    let mut needs = world.player_needs();
+    needs.restore(need, amount);
+    world.set_player_needs(needs);
+    world.spend_action_time(cost_game_seconds);
+    ExecuteOutcome::Done(success_msg.to_string())
 }
 
 #[cfg(test)]
@@ -254,12 +341,19 @@ mod tests {
     }
 
     #[test]
-    fn stubs_report_phase_in_reason() {
+    fn unimplemented_verbs_report_phase_in_reason() {
         let world = World::new(CHUNK_W, CHUNK_H);
-        // Every non-Pickup verb is currently a stub; the reason should
-        // mention "phase" so the in-game menu reads as a punch list.
+        // Verbs that are LIVE in phase 8 should report a real reason, not
+        // a phase number; verbs that are still stubs should name their
+        // unlocking phase.
+        let live = [
+            ActionId::Pickup,
+            ActionId::EatRation,
+            ActionId::EatHerb,
+            ActionId::DrinkWaterskin,
+        ];
         for action in ALL_ACTIONS {
-            if action.id == ActionId::Pickup {
+            if live.contains(&action.id) {
                 continue;
             }
             match evaluate(&world, action.id) {
@@ -274,8 +368,92 @@ mod tests {
                 other => panic!("{:?} expected stub Unavailable, got {:?}", action.id, other),
             }
         }
-        // Tickle starting_pack and Position so they don't get pruned in
+        // Tickle starting_pack + Position so they don't get pruned in
         // tests-only-builds; the resolver depends on World state.
         let _ = (Position { x: 0, y: 0 }, starting_pack());
+    }
+
+    #[test]
+    fn eat_ration_available_at_spawn() {
+        let world = World::new(CHUNK_W, CHUNK_H);
+        match evaluate(&world, ActionId::EatRation) {
+            Availability::Available { cost_game_seconds } => {
+                assert_eq!(cost_game_seconds, COST_EAT_RATION);
+            }
+            other => panic!("expected Available, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn eat_ration_decrements_pack_and_restores_hunger() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Drop hunger first so the restore is observable.
+        let mut n = world.player_needs();
+        n.hunger = 50;
+        world.set_player_needs(n);
+
+        let rations_before = world
+            .player_pack()
+            .contents
+            .iter()
+            .find(|i| i.kind == ItemKind::Ration)
+            .map(|i| i.count)
+            .unwrap_or(0);
+
+        let outcome = execute(&mut world, ActionId::EatRation);
+        assert!(matches!(outcome, ExecuteOutcome::Done(_)));
+
+        let rations_after = world
+            .player_pack()
+            .contents
+            .iter()
+            .find(|i| i.kind == ItemKind::Ration)
+            .map(|i| i.count)
+            .unwrap_or(0);
+        assert_eq!(rations_after, rations_before - 1);
+        assert_eq!(world.player_needs().hunger, 75);
+    }
+
+    #[test]
+    fn drink_waterskin_uses_charge_and_restores_thirst() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Drop thirst so we can see the change.
+        let mut n = world.player_needs();
+        n.thirst = 50;
+        world.set_player_needs(n);
+
+        let outcome = execute(&mut world, ActionId::DrinkWaterskin);
+        assert!(matches!(outcome, ExecuteOutcome::Done(_)));
+        // After drinking, thirst is +20.
+        assert_eq!(world.player_needs().thirst, 70);
+
+        // First waterskin in starting_pack now has 3 water_uses and weighs
+        // 950g instead of 1200g.
+        let pack = world.player_pack();
+        let drained = pack
+            .contents
+            .iter()
+            .find(|i| i.kind == ItemKind::Waterskin)
+            .expect("waterskin in starting pack");
+        match drained.metadata {
+            ItemMetadata::Waterskin { water_uses } => assert_eq!(water_uses, 3),
+            other => panic!("expected Waterskin metadata, got {:?}", other),
+        }
+        assert_eq!(drained.weight_g_each, 950);
+    }
+
+    #[test]
+    fn eat_herb_unavailable_until_pickup_lands() {
+        // Phase 11 introduces herbs in the world (and PickHerb). Until
+        // then, EatHerb evaluates as "no herbs in pack" — the SAME message
+        // that'll show even after phase 11 if the player just hasn't
+        // picked any yet. So phase 11 doesn't need to revisit this verb.
+        let world = World::new(CHUNK_W, CHUNK_H);
+        match evaluate(&world, ActionId::EatHerb) {
+            Availability::Unavailable { reason } => {
+                assert_eq!(reason, "no herbs in pack");
+            }
+            other => panic!("got {:?}", other),
+        }
     }
 }

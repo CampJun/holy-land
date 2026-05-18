@@ -14,6 +14,7 @@ use std::io::{BufRead, BufReader};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
+use crate::needs::NeedKind;
 use crate::world::{Position, World, DAY_LENGTH_SECONDS};
 
 #[derive(Debug)]
@@ -24,14 +25,6 @@ pub enum DebugCommand {
     SetNeed(NeedKind, u8),
     Teleport(i32, i32),
     Unknown(String),
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum NeedKind {
-    Thirst,
-    Hunger,
-    Sleep,
-    Warmth,
 }
 
 pub struct DebugConsole {
