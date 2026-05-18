@@ -358,6 +358,26 @@ impl ItemInstance {
             .min(u32::MAX as u64) as u32
     }
 
+    /// One-line display label suitable for any list UI (here-line,
+    /// inventory menu, future drop dialog). Encapsulates the four
+    /// suffix cases — Pitched, Lit, Waterskin uses, plain stack count
+    /// — so callers don't reinvent them.
+    pub fn display_label(&self) -> String {
+        let name = self.kind.name();
+        match self.metadata {
+            ItemMetadata::Pitched => format!("{} (pitched)", name),
+            ItemMetadata::Lit { fuel_seconds } => {
+                format!("{} (lit, {}m)", name, fuel_seconds / 60)
+            }
+            ItemMetadata::Waterskin { water_uses } => match water_uses {
+                0 => format!("{} (empty)", name),
+                n => format!("{} ({}/4)", name, n),
+            },
+            ItemMetadata::None if self.count > 1 => format!("{} ({})", name, self.count),
+            ItemMetadata::None => name.to_string(),
+        }
+    }
+
     pub fn to_save(&self) -> ItemInstanceSave {
         ItemInstanceSave {
             kind: self.kind.save_key().to_string(),

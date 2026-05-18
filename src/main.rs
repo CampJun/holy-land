@@ -68,6 +68,40 @@ enum PauseAction {
     ResetSave,
 }
 
+/// Select-button info hub tabs. Display order = `INFO_TABS`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InfoTab {
+    Inventory,
+    Skills,
+}
+
+const INFO_TABS: &[InfoTab] = &[InfoTab::Inventory, InfoTab::Skills];
+
+impl InfoTab {
+    fn label(self) -> &'static str {
+        match self {
+            InfoTab::Inventory => "Inventory",
+            InfoTab::Skills => "Skills",
+        }
+    }
+    fn index(self) -> usize {
+        INFO_TABS.iter().position(|&t| t == self).unwrap_or(0)
+    }
+    fn next(self) -> Self {
+        INFO_TABS[(self.index() + 1) % INFO_TABS.len()]
+    }
+    fn prev(self) -> Self {
+        INFO_TABS[(self.index() + INFO_TABS.len() - 1) % INFO_TABS.len()]
+    }
+}
+
+struct InfoMenuState {
+    tab: InfoTab,
+    /// Cursor row within the currently-active tab. Reset to 0 when the
+    /// tab changes.
+    selected: usize,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let save_dir = platform::save_dir();
     logging::init(&save_dir);
@@ -262,6 +296,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // stop ticking. Replaces the previous "Start quits immediately".
     let mut pause_menu: Option<usize> = None;
 
+    // Select-button info hub: tabbed read-only overlay. L/R cycle
+    // between tabs (Inventory, Skills, ... extensible). View-only for
+    // now; drop / examine verbs hook off the selected row in future
+    // phases.
+    let mut info_menu: Option<InfoMenuState> = None;
+
     #[cfg(not(target_arch = "arm"))]
     let debug = debug_console::DebugConsole::spawn();
 
@@ -338,6 +378,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Action::B | Action::Start => {
                         pause_menu = None;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            // Info hub (Select). Tabbed, read-only for slice 1.
+            // L/R cycle tabs, dpad navigates within the current tab,
+            // B/Select closes. Sits between pause menu and command
+            // menu in priority.
+            if let Some(ref mut state) = info_menu {
+                let row_count = info_tab_row_count(&world, state.tab);
+                match input_action {
+                    Action::L => {
+                        state.tab = state.tab.prev();
+                        state.selected = 0;
+                    }
+                    Action::R => {
+                        state.tab = state.tab.next();
+                        state.selected = 0;
+                    }
+                    Action::Up => {
+                        if row_count > 0 {
+                            state.selected = state.selected.saturating_sub(1);
+                        }
+                    }
+                    Action::Down => {
+                        if row_count > 0 {
+                            state.selected = (state.selected + 1).min(row_count - 1);
+                        }
+                    }
+                    Action::B | Action::Select => {
+                        info_menu = None;
+                    }
+                    Action::Start => {
+                        pause_menu = Some(0);
                     }
                     _ => {}
                 }
@@ -444,13 +520,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Action::Start => {
                     pause_menu = Some(0);
                 }
-                Action::Select => save_game(
-                    &save_dir,
-                    &mut meta,
-                    &world,
-                    &mut prev_meta_header,
-                    &mut prev_run_header,
-                ),
+                Action::Select => {
+                    info_menu = Some(InfoMenuState {
+                        tab: InfoTab::Inventory,
+                        selected: 0,
+                    });
+                }
                 _ => {}
             }
         }
@@ -545,6 +620,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(selected) = command_menu {
             draw_command_menu(&mut ui_cells, &world, selected, &palette);
+        }
+        if let Some(state) = info_menu.as_ref() {
+            draw_info_menu(&mut ui_cells, &world, state, &palette);
         }
         if let Some(selected) = pause_menu {
             draw_pause_menu(&mut ui_cells, selected, &palette);
@@ -840,20 +918,7 @@ fn draw_here_line(cells: &mut [Option<Cell>], world: &World, palette: &Palette) 
     if cell.items.is_empty() {
         return;
     }
-    let mut parts: Vec<String> = Vec::with_capacity(cell.items.len());
-    for item in cell.items.iter() {
-        let name = item.kind.name();
-        let label = match item.metadata {
-            items::ItemMetadata::Pitched => format!("{} (pitched)", name),
-            items::ItemMetadata::Lit { fuel_seconds } => {
-                let m = fuel_seconds / 60;
-                format!("{} (lit, {}m)", name, m)
-            }
-            _ if item.count > 1 => format!("{} ({})", name, item.count),
-            _ => name.to_string(),
-        };
-        parts.push(label);
-    }
+    let parts: Vec<String> = cell.items.iter().map(|i| i.display_label()).collect();
     let mut joined = parts.join(", ");
     let max = (WORLD_W as usize).saturating_sub(2);
     if joined.len() > max {
@@ -992,6 +1057,157 @@ fn draw_menu_row(
         let truncated: String = status.chars().take(max_status_len).collect();
         let status_x = layout.inner_right() - truncated.len() as i32;
         put_text(cells, status_x, row_y, &truncated, status_fg, palette.panel_bg);
+    }
+}
+
+// ---- Info hub (Select-button tabbed overlay) -------------------------
+
+fn info_tab_row_count(world: &World, tab: InfoTab) -> usize {
+    match tab {
+        InfoTab::Inventory => world.player_pack().contents.len(),
+        InfoTab::Skills => 1, // Fire Making; slice-2 adds more skills
+    }
+}
+
+fn draw_info_menu(
+    cells: &mut [Option<Cell>],
+    world: &World,
+    state: &InfoMenuState,
+    palette: &Palette,
+) {
+    let layout = PanelLayout::centered(36, 22);
+    let footer = "L/R: tabs   B/Select: close";
+    // Title row is rendered manually below so we can highlight the
+    // current tab.
+    draw_panel_frame(cells, &layout, "", footer, palette);
+
+    // Tab strip on the title row: "Inventory | Skills" with the active
+    // tab in panel-fg + others dimmed.
+    let mut x = layout.inner_x();
+    for (i, &tab) in INFO_TABS.iter().enumerate() {
+        let active = tab == state.tab;
+        let fg = if active {
+            palette.panel_title_fg
+        } else {
+            palette.panel_dim_fg
+        };
+        let label = tab.label();
+        put_text(cells, x, layout.title_y(), label, fg, palette.panel_bg);
+        x += label.len() as i32;
+        if i + 1 < INFO_TABS.len() {
+            put_text(cells, x, layout.title_y(), " | ", palette.panel_dim_fg, palette.panel_bg);
+            x += 3;
+        }
+    }
+
+    // Body branches on the active tab.
+    match state.tab {
+        InfoTab::Inventory => draw_info_inventory(cells, &layout, world, state.selected, palette),
+        InfoTab::Skills => draw_info_skills(cells, &layout, world, state.selected, palette),
+    }
+}
+
+fn draw_info_inventory(
+    cells: &mut [Option<Cell>],
+    layout: &PanelLayout,
+    world: &World,
+    selected: usize,
+    palette: &Palette,
+) {
+    let pack = world.player_pack();
+    if pack.contents.is_empty() {
+        put_text(
+            cells,
+            layout.inner_x(),
+            layout.first_row_y(),
+            "(pack empty)",
+            palette.panel_dim_fg,
+            palette.panel_bg,
+        );
+        return;
+    }
+
+    let max_rows = (layout.footer_y() - layout.first_row_y() - 1).max(1) as usize;
+    let visible = pack.contents.iter().take(max_rows);
+    for (i, item) in visible.enumerate() {
+        let row_y = layout.first_row_y() + i as i32;
+        let is_selected = i == selected;
+        let label = item.display_label();
+        let weight = fmt_weight(item.total_weight_g());
+        draw_menu_row(
+            cells,
+            layout,
+            row_y,
+            is_selected,
+            &label,
+            palette.panel_fg,
+            Some((&weight, palette.panel_dim_fg)),
+            palette,
+        );
+    }
+
+    // Pack-total summary on the row just above the footer.
+    let total = fmt_weight(pack.total_weight_g());
+    let cap = fmt_weight(pack.capacity_g);
+    let summary = format!("Pack {} / {}", total, cap);
+    put_text(
+        cells,
+        layout.inner_x(),
+        layout.footer_y() - 1,
+        &summary,
+        palette.hud_fg,
+        palette.panel_bg,
+    );
+}
+
+fn draw_info_skills(
+    cells: &mut [Option<Cell>],
+    layout: &PanelLayout,
+    world: &World,
+    selected: usize,
+    palette: &Palette,
+) {
+    let skills = world.player_skills();
+    // Slice-1 has just Fire Making; slice-2 extends the iter() chain
+    // with Cookery/Foraging/Fishing/etc.
+    let rows: Vec<(SkillKind, &skill::Skill)> = vec![(
+        SkillKind::FireMaking,
+        skills.get(SkillKind::FireMaking),
+    )];
+
+    for (i, (kind, s)) in rows.into_iter().enumerate() {
+        let row_y = layout.first_row_y() + i as i32;
+        let is_selected = i == selected;
+        let label = kind.display_name();
+        let value = format!("{}%", s.value);
+        draw_menu_row(
+            cells,
+            layout,
+            row_y,
+            is_selected,
+            label,
+            palette.panel_fg,
+            Some((&value, palette.panel_dim_fg)),
+            palette,
+        );
+        // Sub-line: daily XP toward next level.
+        let xp_line = format!("  daily XP {}", s.daily_xp);
+        put_text(
+            cells,
+            layout.inner_x(),
+            row_y + 1,
+            &xp_line,
+            palette.panel_dim_fg,
+            palette.panel_bg,
+        );
+    }
+}
+
+fn fmt_weight(g: u32) -> String {
+    if g >= 1000 {
+        format!("{:.1} kg", g as f32 / 1000.0)
+    } else {
+        format!("{} g", g)
     }
 }
 
