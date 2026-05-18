@@ -1,3 +1,4 @@
+mod action;
 #[cfg(not(target_arch = "arm"))]
 mod debug_console;
 mod fov;
@@ -174,6 +175,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // loaded) clock so a loaded save mid-day doesn't immediately re-save.
     let mut last_dawn_idx = dawns_elapsed(world.clock_seconds);
 
+    // Tap-Y command menu state. None = closed; Some(i) = open, with row i
+    // selected. Phase 15 adds the hold-Y radial overlay alongside this.
+    let mut command_menu: Option<usize> = None;
+
     #[cfg(not(target_arch = "arm"))]
     let debug = debug_console::DebugConsole::spawn();
 
@@ -206,8 +211,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         input.poll_gamepad();
 
-        for action in input.drain() {
-            match action {
+        for input_action in input.drain() {
+            // Menu mode: dpad navigates, A confirms (if available), B/Y
+            // closes. Everything else is dropped so the world doesn't tick
+            // while the player is browsing the catalog.
+            if let Some(selected) = command_menu {
+                match input_action {
+                    Action::Up => {
+                        command_menu = Some(selected.saturating_sub(1));
+                    }
+                    Action::Down => {
+                        let max = action::ALL_ACTIONS.len().saturating_sub(1);
+                        command_menu = Some((selected + 1).min(max));
+                    }
+                    Action::A => {
+                        let id = action::ALL_ACTIONS[selected].id;
+                        match action::evaluate(&world, id) {
+                            action::Availability::Available { .. } => {
+                                let outcome = action::execute(&mut world, id);
+                                match outcome {
+                                    action::ExecuteOutcome::Done(msg) => {
+                                        log_info!("[menu] {}", msg)
+                                    }
+                                    action::ExecuteOutcome::NotImplemented => {
+                                        log_info!(
+                                            "[menu] {} not yet implemented",
+                                            action::ALL_ACTIONS[selected].name
+                                        );
+                                    }
+                                }
+                                command_menu = None;
+                            }
+                            action::Availability::Unavailable { reason } => {
+                                // Stay open so the player can pick another.
+                                log_info!(
+                                    "[menu] can't '{}': {}",
+                                    action::ALL_ACTIONS[selected].name,
+                                    reason
+                                );
+                            }
+                        }
+                    }
+                    Action::B | Action::Y => {
+                        command_menu = None;
+                    }
+                    Action::Start => break 'main,
+                    _ => {}
+                }
+                continue;
+            }
+
+            match input_action {
                 Action::Up => world.try_move_player(0, -1),
                 Action::Down => world.try_move_player(0, 1),
                 Action::Left => world.try_move_player(-1, 0),
@@ -217,6 +271,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if picked > 0 {
                         log_debug!("picked up {} stack(s)", picked);
                     }
+                }
+                Action::Y => {
+                    command_menu = Some(0);
                 }
                 Action::Start => break 'main,
                 Action::Select => save_game(
@@ -269,7 +326,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let day = world.day_count();
         let is_night = world.is_night();
         let tint = brightness_at(world.clock_seconds);
-        let ui_cells = build_ui_cells(&palette, needs, day, clock_h, clock_m, is_night);
+        let mut ui_cells = build_ui_cells(&palette, needs, day, clock_h, clock_m, is_night);
+        if let Some(selected) = command_menu {
+            draw_command_menu(&mut ui_cells, &world, selected, &palette);
+        }
 
         let draw_start = Instant::now();
         let mut changed_cells = 0;
@@ -500,6 +560,116 @@ fn push_meter(out: &mut Vec<u8>, glyph: u8, value: u8) {
     out.extend_from_slice(value.to_string().as_bytes());
 }
 
+fn draw_command_menu(
+    cells: &mut [Option<Cell>],
+    world: &World,
+    selected: usize,
+    palette: &Palette,
+) {
+    let x = 2;
+    let y = 4;
+    let w = 36;
+    let h = 21;
+    draw_panel(cells, x, y, w, h, palette.panel_fg, palette.panel_bg);
+    put_text(
+        cells,
+        x + 2,
+        y + 1,
+        "Actions",
+        palette.panel_title_fg,
+        palette.panel_bg,
+    );
+
+    let inner_right = x + w - 2;
+
+    for (i, ca) in action::ALL_ACTIONS.iter().enumerate() {
+        let row_y = y + 3 + i as i32;
+        let is_selected = i == selected;
+
+        // Cursor + name. Available actions render with the panel
+        // foreground; unavailable ones with the dim hud color so the
+        // greyed-out state reads at a glance.
+        let avail = action::evaluate(world, ca.id);
+        let available = matches!(avail, action::Availability::Available { .. });
+        let name_fg = match (is_selected, available) {
+            (true, true) => palette.panel_fg,
+            (true, false) => palette.need_critical_fg,
+            (false, true) => palette.panel_fg,
+            (false, false) => palette.panel_dim_fg,
+        };
+        let cursor = if is_selected { b'>' } else { b' ' };
+        put_cell(
+            cells,
+            x + 2,
+            row_y,
+            Cell {
+                glyph: cursor,
+                fg: palette.panel_title_fg,
+                bg: palette.panel_bg,
+            },
+        );
+        put_text(cells, x + 4, row_y, ca.name, name_fg, palette.panel_bg);
+
+        // Right-aligned status: cost like "3s" or the unavailable reason.
+        let (status, status_fg) = match avail {
+            action::Availability::Available { cost_game_seconds } => {
+                (format!("{}s", cost_game_seconds), palette.panel_fg)
+            }
+            action::Availability::Unavailable { reason } => {
+                (reason.to_string(), palette.panel_dim_fg)
+            }
+        };
+        // Truncate status to fit the inner width.
+        let max_status_len = (w - 4 - ca.name.len() as i32 - 2).max(4) as usize;
+        let status: String = status.chars().take(max_status_len).collect();
+        let status_x = inner_right - status.len() as i32;
+        put_text(cells, status_x, row_y, &status, status_fg, palette.panel_bg);
+    }
+
+    // Description line for the selected row (truncated to inner width).
+    let desc_y = y + h - 3;
+    if let Some(sel) = action::ALL_ACTIONS.get(selected) {
+        let max_desc_len = (w - 4) as usize;
+        let desc: String = sel.description.chars().take(max_desc_len).collect();
+        put_text(cells, x + 2, desc_y, &desc, palette.hud_fg, palette.panel_bg);
+    }
+
+    // Footer hint.
+    put_text(
+        cells,
+        x + 2,
+        y + h - 2,
+        "A: confirm   B/Y: close",
+        palette.panel_dim_fg,
+        palette.panel_bg,
+    );
+}
+
+fn draw_panel(
+    cells: &mut [Option<Cell>],
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    fg: Color,
+    bg: Color,
+) {
+    for py in y..(y + h) {
+        for px in x..(x + w) {
+            let glyph = if (px == x || px == x + w - 1) && (py == y || py == y + h - 1) {
+                b'+'
+            } else if py == y || py == y + h - 1 {
+                b'-'
+            } else if px == x || px == x + w - 1 {
+                b'|'
+            } else {
+                b' '
+            };
+            put_cell(cells, px, py, Cell { glyph, fg, bg });
+        }
+    }
+}
+
 fn put_bytes(cells: &mut [Option<Cell>], x: i32, y: i32, bytes: &[u8], fg: Color, bg: Color) {
     for (i, &b) in bytes.iter().enumerate() {
         put_cell(cells, x + i as i32, y, Cell { glyph: b, fg, bg });
@@ -586,6 +756,10 @@ struct Palette {
     hud_fg: Color,
     hud_bg: Color,
     need_critical_fg: Color,
+    panel_fg: Color,
+    panel_bg: Color,
+    panel_dim_fg: Color,
+    panel_title_fg: Color,
 }
 
 impl Default for Palette {
@@ -600,6 +774,10 @@ impl Default for Palette {
             hud_fg: Color::RGB(190, 205, 160),
             hud_bg: Color::RGB(20, 17, 13),
             need_critical_fg: Color::RGB(220, 110, 90),
+            panel_fg: Color::RGB(218, 205, 170),
+            panel_bg: Color::RGB(28, 22, 17),
+            panel_dim_fg: Color::RGB(110, 100, 80),
+            panel_title_fg: Color::RGB(230, 200, 120),
         }
     }
 }
