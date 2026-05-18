@@ -54,17 +54,21 @@ pub const NEED_CRITICAL_THRESHOLD: u8 = 10;
 /// dead time, slow enough that the player can react with B to cancel.
 pub const MULTI_TURN_GAME_SEC_PER_FRAME: u32 = 1;
 
-/// FOV radii. Phase 13b: lit fires extend the player's night vision to
-/// `FOV_RADIUS_FIRELIT_NIGHT` when any lit fire sits within Chebyshev
-/// `FIRE_LIGHT_RADIUS` of the player. The card "Survival - FOV.md"
-/// describes this as "cells within 5 of a lit fire are visible at
-/// radius 8 at night"; the simpler implementation here bumps the
-/// player's whole-FOV radius when they're near a fire and defers the
-/// strict per-cell illumination to slice 2.
+/// FOV radii. Player vision is `FOV_RADIUS_DAY` by day,
+/// `FOV_RADIUS_NIGHT` at night. Active light sources (any item
+/// carrying `ItemMetadata::Lit`) cast their own independent FOV at
+/// `LIGHT_SOURCE_RADIUS` at night — see `recompute_fov` for the
+/// per-source shadowcast that the player's visible set unions with.
 pub const FOV_RADIUS_DAY: i32 = 20;
 pub const FOV_RADIUS_NIGHT: i32 = 3;
-pub const FOV_RADIUS_FIRELIT_NIGHT: i32 = 8;
-pub const FIRE_LIGHT_RADIUS: i32 = 5;
+pub const LIGHT_SOURCE_RADIUS: i32 = 5;
+
+/// Cap on light sources tracked per `recompute_fov` so the enumeration
+/// fits in a stack buffer (zero-alloc per move on the Cortex-A7 Miyoo
+/// target). Slice 1 hits 1–3 in practice; 16 leaves comfortable
+/// headroom. If a future feature genuinely needs more, bump this — the
+/// truncation is silent.
+const MAX_LIGHT_SOURCES: usize = 16;
 
 /// Side length of the per-recompute blocker grid: covers `±FOV_RADIUS_DAY`
 /// in both axes plus the origin. The grid is stack-allocated in
@@ -317,6 +321,11 @@ pub struct CellState {
     /// Has been visible at least once. Persisted across save/load via
     /// `RunSave.explored_cells`.
     pub explored: bool,
+    /// Lit by an active light source (any `ItemMetadata::Lit` carrier)
+    /// this recompute. Render uses this to overlay a warm yellow tint
+    /// on top of the day/night dim. Transient like `visible` — reset
+    /// and rebuilt every `recompute_fov` call; not persisted.
+    pub fire_lit: bool,
 }
 
 impl CellState {
@@ -326,6 +335,7 @@ impl CellState {
             items: Vec::new(),
             visible: false,
             explored: false,
+            fire_lit: false,
         }
     }
 }
@@ -711,31 +721,38 @@ impl World {
         false
     }
 
-    /// Is there at least one active light source (any item carrying
-    /// `ItemMetadata::Lit`) within Chebyshev `radius` cells of
-    /// `origin`? Used by recompute_fov (phase 13b) to decide whether
-    /// to extend the player's night FOV. Treating Lit-metadata as the
-    /// abstraction means future light sources (torches, lanterns)
-    /// participate for free. Iterates loaded chunks and short-circuits
-    /// on the first hit; light sources are sparse so this stays cheap.
-    pub fn any_light_source_within(&self, origin: Position, radius: i32) -> bool {
+    /// Fill `buf` with the world positions of every active light source
+    /// (any item carrying `ItemMetadata::Lit`) in the loaded chunks,
+    /// up to MAX_LIGHT_SOURCES. Returns the count written. Caller-owned
+    /// stack buffer so we don't heap-allocate per `recompute_fov` —
+    /// recompute fires every move on a handheld and the Vec churn adds
+    /// up. Each returned position becomes the origin of an independent
+    /// FOV cast.
+    pub fn collect_light_sources_into(
+        &self,
+        buf: &mut [Position; MAX_LIGHT_SOURCES],
+    ) -> usize {
         let cw = CHUNK_W as i32;
         let ch = CHUNK_H as i32;
+        let mut count = 0;
         for chunk in self.chunks.values() {
             for (idx, cell) in chunk.cells.iter().enumerate() {
                 if !cell.items.iter().any(|i| matches!(i.metadata, ItemMetadata::Lit { .. })) {
                     continue;
                 }
+                if count >= MAX_LIGHT_SOURCES {
+                    return count;
+                }
                 let lx = (idx as i32) % cw;
                 let ly = (idx as i32) / cw;
-                let wx = chunk.coord.cx * cw + lx;
-                let wy = chunk.coord.cy * ch + ly;
-                if (wx - origin.x).abs() <= radius && (wy - origin.y).abs() <= radius {
-                    return true;
-                }
+                buf[count] = Position {
+                    x: chunk.coord.cx * cw + lx,
+                    y: chunk.coord.cy * ch + ly,
+                };
+                count += 1;
             }
         }
-        false
+        count
     }
 
     /// Is the player standing on a Pitched item of the given kind?
@@ -843,19 +860,52 @@ impl World {
     /// allocation per move — the previous implementation used a HashSet,
     /// which paid alloc/hash cost per recompute on the Cortex-A7 target.
     pub fn recompute_fov(&mut self) {
-        let origin = self.player_pos();
-        let radius = if self.is_night() {
-            if self.any_light_source_within(origin, FIRE_LIGHT_RADIUS) {
-                FOV_RADIUS_FIRELIT_NIGHT
-            } else {
-                FOV_RADIUS_NIGHT
+        // Reset transient flags across loaded cells. fire_lit is reset
+        // alongside visible so a fire that burned out doesn't leave
+        // stale glow on cells from the previous tick.
+        for chunk in self.chunks.values_mut() {
+            for cell in chunk.cells.iter_mut() {
+                cell.visible = false;
+                cell.fire_lit = false;
             }
+        }
+
+        // Player FOV: their own radius from their own position. Always
+        // runs; never marks fire_lit (the warm tint belongs to cells
+        // illuminated BY a fire, not cells the player just happens to
+        // see in their own night vision).
+        let player_radius = if self.is_night() {
+            FOV_RADIUS_NIGHT
         } else {
             FOV_RADIUS_DAY
         };
+        self.cast_from(self.player_pos(), player_radius, false);
 
-        // Snapshot blockers into a relative bit-grid keyed on (dx, dy)
-        // offsets from `origin`, padded by `BLOCKER_GRID_CENTER`.
+        // Per-light-source FOV: at night, every Lit-metadata carrier
+        // in the loaded chunks shadowcasts its own disc independently
+        // and marks the cells it reaches as fire_lit. Cells already in
+        // the player's FOV stay visible AND pick up fire_lit on overlap;
+        // cells outside the player's disc but inside a fire's disc
+        // become visible via the union. By day we skip — the player's
+        // radius-20 disc subsumes any fire's radius-5, and the warm
+        // tint would be invisible against daylight anyway.
+        if self.is_night() {
+            let mut sources = [Position { x: 0, y: 0 }; MAX_LIGHT_SOURCES];
+            let n = self.collect_light_sources_into(&mut sources);
+            for &src in &sources[..n] {
+                self.cast_from(src, LIGHT_SOURCE_RADIUS, true);
+            }
+        }
+    }
+
+    /// Shadowcast from `origin` at `radius`, marking each visible cell
+    /// as visible+explored (and, if `mark_fire_lit`, fire_lit too).
+    /// Shared by the player cast and each per-light-source cast in
+    /// `recompute_fov`.
+    fn cast_from(&mut self, origin: Position, radius: i32, mark_fire_lit: bool) {
+        // Stack-allocated blocker grid centered on `origin`; sized for
+        // FOV_RADIUS_DAY so every cast radius up to 20 fits without
+        // reallocation.
         let mut blockers = [false; BLOCKER_GRID_LEN];
         for dy in -radius..=radius {
             for dx in -radius..=radius {
@@ -867,19 +917,9 @@ impl World {
             }
         }
 
-        // Reset visible flags on every loaded cell.
-        for chunk in self.chunks.values_mut() {
-            for cell in chunk.cells.iter_mut() {
-                cell.visible = false;
-            }
-        }
-
         let visible = crate::fov::compute_visible((origin.x, origin.y), radius, |x, y| {
             let dx = x - origin.x;
             let dy = y - origin.y;
-            // Cells outside the grid coverage (impossible per the
-            // shadowcaster's bounds, but defensive) are treated as
-            // blockers so FOV doesn't escape the snapshot window.
             if dx.unsigned_abs() as i32 > FOV_RADIUS_DAY
                 || dy.unsigned_abs() as i32 > FOV_RADIUS_DAY
             {
@@ -892,6 +932,9 @@ impl World {
             if let Some(cell) = self.cell_at_mut(x as i64, y as i64) {
                 cell.visible = true;
                 cell.explored = true;
+                if mark_fire_lit {
+                    cell.fire_lit = true;
+                }
             }
         }
     }
@@ -1308,14 +1351,15 @@ mod tests {
     }
 
     #[test]
-    fn night_fov_extends_to_8_with_lit_fire_within_5_of_player() {
+    fn fire_casts_own_fov_disc_independent_of_player() {
         let mut world = World::new(CHUNK_W, CHUNK_H);
-        // Jump to deep night so the night radius selection runs.
+        // Deep night so the player's own FOV stays at radius 3.
         world.clock_seconds = 22 * 3600;
-        // Drop a lit fire 2 cells east of the player (well within
-        // FIRE_LIGHT_RADIUS = 5).
+        // Fire 9 east — far enough that its radius-5 disc doesn't
+        // overlap the player's radius-3 night FOV, so we can pin down
+        // "player FOV only" vs "fire FOV only" cells unambiguously.
         let pos = world.player_pos();
-        if let Some(cell) = world.cell_at_mut((pos.x + 2) as i64, pos.y as i64) {
+        if let Some(cell) = world.cell_at_mut((pos.x + 9) as i64, pos.y as i64) {
             cell.items.push(ItemInstance::unique(
                 ItemKind::Firewood,
                 500,
@@ -1324,29 +1368,41 @@ mod tests {
             ));
         }
         world.recompute_fov();
-        // Without the fire bump, a cell 5 east would be invisible at
-        // night radius 3. With the bump to radius 8 it must be visible.
-        let far = world
-            .cell_at((pos.x + 5) as i64, pos.y as i64)
-            .expect("cell");
-        assert!(
-            far.visible,
-            "fire-lit night FOV (radius 8) should reach (+5, 0)"
-        );
-        // A cell at distance 9 is outside the bumped radius.
-        let beyond = world
-            .cell_at((pos.x + 9) as i64, pos.y as i64)
-            .expect("cell");
-        assert!(!beyond.visible, "radius 8 must not reach (+9, 0)");
+
+        // Inside the player's own night FOV (distance 2): visible, NOT
+        // fire_lit — the warm tint belongs to cells the fire lights,
+        // not cells the player just happens to see in their own dim.
+        let near_player = world.cell_at((pos.x + 2) as i64, pos.y as i64).unwrap();
+        assert!(near_player.visible, "player FOV (radius 3) must reach (+2,0)");
+        assert!(!near_player.fire_lit, "(+2,0) is in player FOV only");
+
+        // Past player FOV but inside the fire's disc (distance 4 from
+        // fire): visible via fire-cast AND fire_lit.
+        let in_fire_glow = world.cell_at((pos.x + 5) as i64, pos.y as i64).unwrap();
+        assert!(in_fire_glow.visible, "fire FOV must reach (+5,0)");
+        assert!(in_fire_glow.fire_lit, "(+5,0) is lit by the fire");
+
+        // Fire's far edge (distance 5 from fire = +14 from player):
+        // still inside the fire's disc.
+        let fire_far_edge = world.cell_at((pos.x + 14) as i64, pos.y as i64).unwrap();
+        assert!(fire_far_edge.visible, "fire FOV reaches its own +5 east");
+        assert!(fire_far_edge.fire_lit);
+
+        // One cell past the fire's disc: invisible.
+        let beyond = world.cell_at((pos.x + 15) as i64, pos.y as i64).unwrap();
+        assert!(!beyond.visible, "past fire+5 should be invisible at night");
+        assert!(!beyond.fire_lit);
     }
 
     #[test]
-    fn night_fov_returns_to_night_radius_when_only_fire_burns_out() {
+    fn fire_lit_clears_when_fire_burns_out() {
         let mut world = World::new(CHUNK_W, CHUNK_H);
         world.clock_seconds = 22 * 3600;
-        // Lit fire with just 30s of fuel adjacent to the player.
         let pos = world.player_pos();
-        if let Some(cell) = world.cell_at_mut((pos.x + 1) as i64, pos.y as i64) {
+        // Lit fire 5 east with just enough fuel to die inside the next
+        // tick. From the fire's pos, its disc reaches +10 east; from the
+        // player's, those cells are well outside the night radius-3 FOV.
+        if let Some(cell) = world.cell_at_mut((pos.x + 5) as i64, pos.y as i64) {
             cell.items.push(ItemInstance::unique(
                 ItemKind::Firewood,
                 500,
@@ -1355,19 +1411,44 @@ mod tests {
             ));
         }
         world.recompute_fov();
-        // Sanity: at distance 5 the cell is visible while the fire
-        // still burns.
-        assert!(world.cell_at((pos.x + 5) as i64, pos.y as i64).unwrap().visible);
-        // Advance 60s -> fire dies inside tick_fires; advance_time_raw
-        // should trigger a recompute and the FOV must shrink.
+        let lit_cell = world.cell_at((pos.x + 8) as i64, pos.y as i64).unwrap();
+        assert!(lit_cell.visible && lit_cell.fire_lit, "fire-cast must light (+8,0)");
+
+        // Advance 60s — fire dies in tick_fires, advance_time_raw
+        // triggers recompute_fov, cells visible only via the fire
+        // contract back to invisible AND lose fire_lit.
         world.advance_time_raw(60);
-        assert!(
-            !world
-                .cell_at((pos.x + 5) as i64, pos.y as i64)
-                .unwrap()
-                .visible,
-            "FOV must contract back to night radius after fire dies"
-        );
+        let after = world.cell_at((pos.x + 8) as i64, pos.y as i64).unwrap();
+        assert!(!after.visible, "(+8,0) outside player FOV when fire dies");
+        assert!(!after.fire_lit, "fire_lit must reset on fire death");
+    }
+
+    #[test]
+    fn wall_blocks_fire_light() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        world.clock_seconds = 22 * 3600;
+        let pos = world.player_pos();
+        // Fire 4 cells east of player; TreeTrunk wall 2 cells east of
+        // the fire (player+6). Cells beyond the wall (player+7 east)
+        // are NOT fire_lit even though they're within radius 5 of the
+        // fire — sight-blockers block fire light by the same rule.
+        if let Some(cell) = world.cell_at_mut((pos.x + 4) as i64, pos.y as i64) {
+            cell.items.push(ItemInstance::unique(
+                ItemKind::Firewood,
+                500,
+                None,
+                ItemMetadata::Lit { fuel_seconds: 3600 },
+            ));
+        }
+        world.set_terrain_at((pos.x + 6) as i64, pos.y as i64, TerrainKind::TreeTrunk);
+        world.recompute_fov();
+
+        // The wall cell itself is the first blocker; shadowcast includes
+        // the blocker's own cell as visible. Cells BEHIND it on the same
+        // axis are shadowed.
+        let beyond_wall = world.cell_at((pos.x + 8) as i64, pos.y as i64).unwrap();
+        assert!(!beyond_wall.fire_lit, "wall must shadow (+8,0) from fire");
+        assert!(!beyond_wall.visible, "and the player can't see past it either");
     }
 
     #[test]

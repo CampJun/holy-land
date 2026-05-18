@@ -712,6 +712,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let cell_state = world.cell_at(wx, wy);
                 let visible = cell_state.map(|c| c.visible).unwrap_or(false);
                 let explored = cell_state.map(|c| c.explored).unwrap_or(false);
+                let fire_lit = cell_state.map(|c| c.fire_lit).unwrap_or(false);
 
                 // Items + player only render when the cell is currently
                 // visible. Memory of explored-but-unseen cells shows
@@ -757,8 +758,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     0.0
                 };
-                let fg = tint_color(fg, cell_brightness);
-                let bg = tint_color(bg, cell_brightness);
+                let mut fg = tint_color(fg, cell_brightness);
+                let mut bg = tint_color(bg, cell_brightness);
+                // Warm yellow overlay for cells inside a lit source's
+                // FOV disc at night. Applied AFTER the day/night dim so
+                // the fire-glow color survives the night-darkening
+                // multiply (a scalar tint on top of darkness erases the
+                // color; a blend toward warm RGB preserves it).
+                if fire_lit && is_night {
+                    const FIRE_TINT: [u8; 3] = [255, 200, 100];
+                    const FIRE_TINT_MIX: f32 = 0.35;
+                    fg = blend_to_terrain(FIRE_TINT, [fg.r, fg.g, fg.b], FIRE_TINT_MIX);
+                    bg = blend_to_terrain(FIRE_TINT, [bg.r, bg.g, bg.b], FIRE_TINT_MIX);
+                }
                 let mut cell = Cell { glyph, fg, bg };
                 let i = (vy as u32 * WORLD_W + vx as u32) as usize;
                 if let Some(ui_cell) = ui_cells[i] {
