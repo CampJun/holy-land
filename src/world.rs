@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::action::ActionId;
 use crate::items::{starting_pack, ItemInstance, ItemKind, ItemMetadata, Pack};
 use crate::needs::{Needs, NeedsEnv};
+use crate::skill::{Rng, Skills};
 
 pub const CHUNK_W: u32 = 40;
 pub const CHUNK_H: u32 = 30;
@@ -45,6 +46,23 @@ pub const COST_EAT_HERB: u32 = 5;
 pub const COST_DRINK_WATERSKIN: u32 = 5;
 pub const COST_PITCH_TENT: u32 = 300;
 pub const COST_UNROLL_BEDROLL: u32 = 30;
+pub const COST_FIRE_MAKING_ATTEMPT: u32 = 60;
+
+/// How long (in game-seconds) a successful StartFire's lit firewood
+/// burns before it extinguishes itself. Phase-12's "feed fire" verb
+/// will add fuel to extend this; for slice 1 the player gets 1
+/// game-hour per attempt.
+pub const FIRE_FUEL_SECONDS_PER_LIGHT: u32 = 3600;
+
+/// Flint and steel skill modifier per the design card. Other tools
+/// (bow drill, weather penalty, sheltered bonus) wire in here as more
+/// content lands.
+pub const FIRE_BONUS_FLINT_AND_STEEL: i32 = 30;
+
+/// Materials threshold for a single StartFire attempt.
+pub const FIRE_MIN_TINDER: u32 = 1;
+pub const FIRE_MIN_KINDLING: u32 = 3;
+pub const FIRE_MIN_FUEL: u32 = 2;
 
 /// Phase-9 multi-turn interrupt threshold. When any need drops below this
 /// during a multi-turn tick, the active action queue cancels and control
@@ -209,6 +227,10 @@ pub struct World {
     /// regular input is suspended while it is `Some`. Cleared on
     /// completion, cancellation, or interrupt.
     pub active_action: Option<ActiveAction>,
+    /// xorshift32 PRNG used for skill checks. Save/restore preserves
+    /// state so reloading after a critical roll re-rolls the SAME
+    /// outcome — prevents save-scumming.
+    pub rng: Rng,
 }
 
 /// In-flight multi-turn action queue. `steps[0]` is the currently-running
@@ -294,6 +316,7 @@ impl World {
             },
             starting_pack(),
             Needs::starting(),
+            Skills::starting(),
         ));
 
         let mut world = Self {
@@ -303,6 +326,7 @@ impl World {
             ecs,
             player,
             active_action: None,
+            rng: Rng::from_world_seed(DEFAULT_SEED),
         };
         seed_phase3_debris(&mut world);
         // The seeding marked the chunk dirty (via cell_at_mut); reset so a
@@ -394,6 +418,20 @@ impl World {
             .expect("player has Needs") = needs;
     }
 
+    pub fn player_skills(&self) -> Skills {
+        *self
+            .ecs
+            .get::<&Skills>(self.player)
+            .expect("player has Skills")
+    }
+
+    pub fn set_player_skills(&mut self, skills: Skills) {
+        *self
+            .ecs
+            .get::<&mut Skills>(self.player)
+            .expect("player has Skills") = skills;
+    }
+
     /// True if the in-game clock is between dusk and dawn.
     pub fn is_night(&self) -> bool {
         let time_of_day = self.clock_seconds % DAY_LENGTH_SECONDS;
@@ -443,9 +481,9 @@ impl World {
     }
 
     /// Advance the clock by `secs` game-seconds without recomputing the
-    /// need penalty. Ticks needs decay and refreshes FOV at day/night
-    /// boundaries. The "raw" suffix marks this as the bypass path for
-    /// per-second multi-turn simulation; instant verbs use
+    /// need penalty. Ticks needs decay, lit fires, and refreshes FOV at
+    /// day/night boundaries. The "raw" suffix marks this as the bypass
+    /// path for per-second multi-turn simulation; instant verbs use
     /// `spend_action_time`.
     pub fn advance_time_raw(&mut self, secs: u32) {
         if secs == 0 {
@@ -457,9 +495,57 @@ impl World {
         let mut needs = self.player_needs();
         needs.tick(secs, env);
         self.set_player_needs(needs);
+        self.tick_fires(secs);
         if self.is_night() != was_night {
             self.recompute_fov();
         }
+    }
+
+    /// Decrement `fuel_seconds` on every Lit item in every loaded chunk.
+    /// Items whose fuel hits 0 are removed (the fire burnt out and the
+    /// firewood is consumed). Phase-12's "feed fire" verb adds fuel
+    /// back from inventory before the timer hits 0.
+    fn tick_fires(&mut self, secs: u32) {
+        for chunk in self.chunks.values_mut() {
+            for cell in chunk.cells.iter_mut() {
+                if !cell.items.iter().any(|i| matches!(i.metadata, ItemMetadata::Lit { .. })) {
+                    continue;
+                }
+                cell.items.retain_mut(|item| {
+                    if let ItemMetadata::Lit { fuel_seconds } = &mut item.metadata {
+                        if *fuel_seconds > secs {
+                            *fuel_seconds -= secs;
+                            true
+                        } else {
+                            false // burned out
+                        }
+                    } else {
+                        true
+                    }
+                });
+                chunk.dirty = true;
+            }
+        }
+    }
+
+    /// Is there at least one lit fire in the player's cell or any of
+    /// the 8 adjacent cells? Phase-13 wires this into NeedsEnv for
+    /// warmth shelter; phase-10 exposes it now so action-evaluation
+    /// can use the same predicate.
+    #[allow(dead_code)] // consumed by needs_env() in phase 13 (warmth shelter)
+    pub fn lit_fire_adjacent_to_player(&self) -> bool {
+        let p = self.player_pos();
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let Some(cell) = self.cell_at((p.x + dx) as i64, (p.y + dy) as i64) else {
+                    continue;
+                };
+                if cell.items.iter().any(|i| matches!(i.metadata, ItemMetadata::Lit { .. })) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Queue a multi-turn action. `steps` lists the sub-actions in order
@@ -650,25 +736,35 @@ impl World {
             .expect("player has Pack") = pack;
     }
 
-    /// Greedy pickup: every item in the player's current cell that fits in
-    /// the pack moves into the pack. Items over capacity stay in the cell.
-    /// Returns the number of `ItemInstance` entries successfully picked up
-    /// (a merge counts as one entry).
+    /// Greedy pickup: every PICKABLE item in the player's current cell
+    /// that fits in the pack moves into the pack. Items over capacity
+    /// stay in the cell. Lit items (active fires) are NOT pickable —
+    /// you can't pocket a burning campfire. Pitched items (tents,
+    /// bedrolls) ARE pickable: re-stowing them is the "pack up camp"
+    /// behavior, intentional in phase 9.
+    ///
+    /// Returns the number of `ItemInstance` entries successfully picked
+    /// up (a merge counts as one entry).
     pub fn try_pickup_all_at_player(&mut self) -> usize {
         let pos = self.player_pos();
         let wx = pos.x as i64;
         let wy = pos.y as i64;
 
-        let cell_items: Vec<ItemInstance> = match self.cell_at_mut(wx, wy) {
-            Some(c) => std::mem::take(&mut c.items),
-            None => return 0,
-        };
+        // Partition the cell's items into pickable + non-pickable; only
+        // the pickable ones leave the cell.
+        let (pickable, unpickable): (Vec<ItemInstance>, Vec<ItemInstance>) =
+            match self.cell_at_mut(wx, wy) {
+                Some(c) => std::mem::take(&mut c.items)
+                    .into_iter()
+                    .partition(|i| !matches!(i.metadata, ItemMetadata::Lit { .. })),
+                None => return 0,
+            };
 
         let mut picked = 0;
         let mut rejects = Vec::new();
         {
             let mut pack = self.player_pack_mut();
-            for item in cell_items {
+            for item in pickable {
                 match pack.try_add(item) {
                     Ok(()) => picked += 1,
                     Err(item) => rejects.push(item),
@@ -676,10 +772,10 @@ impl World {
             }
         }
 
-        if !rejects.is_empty() {
-            if let Some(c) = self.cell_at_mut(wx, wy) {
-                c.items = rejects;
-            }
+        // Put back: rejects (didn't fit) + unpickable (lit fires).
+        if let Some(c) = self.cell_at_mut(wx, wy) {
+            c.items.extend(rejects);
+            c.items.extend(unpickable);
         }
 
         // Time only advances if at least one stack was picked up. Bouncing

@@ -98,6 +98,28 @@ pub struct RunSave {
     // PitchTent / SetupCamp resumes correctly on load.
     #[serde(default)]
     pub active_action: Option<ActiveActionSave>,
+    // Phase 10 (additive): skills + RNG state.
+    #[serde(default)]
+    pub skills: SkillsSave,
+    /// xorshift32 state, persisted so skill-check outcomes can't be
+    /// save-scummed by reloading. 0 falls back to "seed from world.seed
+    /// at load time" on legacy saves.
+    #[serde(default)]
+    pub rng_state: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct SkillsSave {
+    #[serde(default)]
+    pub fire_making: SkillSave,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct SkillSave {
+    #[serde(default)]
+    pub value: u8,
+    #[serde(default)]
+    pub daily_xp: u8,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -153,6 +175,8 @@ impl RunSave {
             needs: NeedsSave::default(),
             explored_cells: Vec::new(),
             active_action: None,
+            skills: SkillsSave::default(),
+            rng_state: 0,
         }
     }
 }
@@ -188,6 +212,10 @@ pub enum ItemMetadataSave {
     },
     /// Item is placed in the world (pitched tent, unrolled bedroll).
     Pitched,
+    /// A lit fire with remaining fuel in game-seconds.
+    Lit {
+        fuel_seconds: u32,
+    },
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -313,6 +341,8 @@ mod tests {
             },
             explored_cells: Vec::new(),
             active_action: None,
+            skills: SkillsSave::default(),
+            rng_state: 0xDEADBEEF,
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
@@ -388,6 +418,13 @@ mod tests {
                 }],
                 view_mode: "time_skip".to_string(),
             }),
+            skills: SkillsSave {
+                fire_making: SkillSave {
+                    value: 23,
+                    daily_xp: 6,
+                },
+            },
+            rng_state: 0xC0FFEE,
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
@@ -398,6 +435,9 @@ mod tests {
         assert_eq!(active.steps[0].id, "pitch_tent");
         assert_eq!(active.steps[0].elapsed_secs, 42);
         assert_eq!(active.view_mode, "time_skip");
+        assert_eq!(loaded.skills.fire_making.value, 23);
+        assert_eq!(loaded.skills.fire_making.daily_xp, 6);
+        assert_eq!(loaded.rng_state, 0xC0FFEE);
         assert_eq!(loaded.pack.contents.len(), 3);
         assert_eq!(loaded.pack.contents[0].kind, "axe");
         assert_eq!(loaded.pack.contents[1].kind, "waterskin");

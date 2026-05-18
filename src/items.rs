@@ -234,6 +234,13 @@ pub enum ItemMetadata {
     /// pack-stored counterparts. Phase 13 reads this flag for warmth
     /// shelter detection.
     Pitched,
+    /// A lit fire. `fuel_seconds` decrements via `World::tick_fires`
+    /// each game-second; reaches 0 -> item is removed from the cell.
+    /// Phase 12 adds "feed fire" verb to top up; phase 13 reads this
+    /// flag for warmth shelter and night-vision-radius extension.
+    Lit {
+        fuel_seconds: u32,
+    },
 }
 
 impl Default for ItemMetadata {
@@ -248,6 +255,7 @@ impl ItemMetadata {
             ItemMetadata::None => ItemMetadataSave::None,
             ItemMetadata::Waterskin { water_uses } => ItemMetadataSave::Waterskin { water_uses },
             ItemMetadata::Pitched => ItemMetadataSave::Pitched,
+            ItemMetadata::Lit { fuel_seconds } => ItemMetadataSave::Lit { fuel_seconds },
         }
     }
 
@@ -256,6 +264,7 @@ impl ItemMetadata {
             ItemMetadataSave::None => ItemMetadata::None,
             ItemMetadataSave::Waterskin { water_uses } => ItemMetadata::Waterskin { water_uses },
             ItemMetadataSave::Pitched => ItemMetadata::Pitched,
+            ItemMetadataSave::Lit { fuel_seconds } => ItemMetadata::Lit { fuel_seconds },
         }
     }
 }

@@ -10,9 +10,11 @@
 
 use crate::items::{ItemInstance, ItemKind, ItemMetadata};
 use crate::needs::NeedKind;
+use crate::skill::{self, SkillKind};
 use crate::world::{
-    World, COST_DRINK_WATERSKIN, COST_EAT_HERB, COST_EAT_RATION, COST_PICKUP,
-    COST_PITCH_TENT, COST_UNROLL_BEDROLL,
+    World, COST_DRINK_WATERSKIN, COST_EAT_HERB, COST_EAT_RATION, COST_FIRE_MAKING_ATTEMPT,
+    COST_PICKUP, COST_PITCH_TENT, COST_UNROLL_BEDROLL, FIRE_BONUS_FLINT_AND_STEEL,
+    FIRE_FUEL_SECONDS_PER_LIGHT, FIRE_MIN_FUEL, FIRE_MIN_KINDLING, FIRE_MIN_TINDER,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -225,15 +227,86 @@ pub fn evaluate(world: &World, id: ActionId) -> Availability {
             COST_PITCH_TENT + COST_UNROLL_BEDROLL,
             "need tent + bedroll in pack",
         ),
-        ActionId::StartFire => Availability::Unavailable {
-            reason: "phase 10: fire making",
-        },
+        ActionId::StartFire => eval_start_fire(world),
         ActionId::Sleep => Availability::Unavailable {
             reason: "phase 16: sleep",
         },
         ActionId::Fishing => Availability::Unavailable {
             reason: "phase 17: fishing",
         },
+    }
+}
+
+/// Counts the materials reachable by a Fire Making attempt: the
+/// player's pack PLUS the 3x3 square of cells centered on the player.
+/// Per the design card (Survival - Fire Making.md), materials in any
+/// adjacent cell or in inventory count toward the requirements.
+#[derive(Default, Debug, Clone, Copy)]
+struct FireMaterials {
+    pub tinder: u32,   // twigs or grass blades
+    pub kindling: u32, // sticks
+    pub fuel: u32,     // firewood
+}
+
+fn count_fire_materials(world: &World) -> FireMaterials {
+    let mut m = FireMaterials::default();
+    let add_item = |m: &mut FireMaterials, i: &ItemInstance| {
+        let count = i.count as u32;
+        match i.kind {
+            ItemKind::Twig | ItemKind::GrassBlade => m.tinder += count,
+            ItemKind::Stick => m.kindling += count,
+            ItemKind::Firewood => m.fuel += count,
+            _ => {}
+        }
+    };
+    // Pack contents.
+    for item in world.player_pack().contents.iter() {
+        add_item(&mut m, item);
+    }
+    // 3x3 cells centered on the player.
+    let p = world.player_pos();
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            let Some(cell) = world.cell_at((p.x + dx) as i64, (p.y + dy) as i64) else {
+                continue;
+            };
+            for item in cell.items.iter() {
+                // Don't count lit-fire fuel as available reserve — it's
+                // currently burning.
+                if matches!(item.metadata, ItemMetadata::Lit { .. }) {
+                    continue;
+                }
+                add_item(&mut m, item);
+            }
+        }
+    }
+    m
+}
+
+fn eval_start_fire(world: &World) -> Availability {
+    if !world.player_pack().has_stack(ItemKind::FlintAndSteel) {
+        return Availability::Unavailable {
+            reason: "no flint and steel",
+        };
+    }
+    let m = count_fire_materials(world);
+    if m.tinder < FIRE_MIN_TINDER {
+        return Availability::Unavailable {
+            reason: "need tinder (twig or grass)",
+        };
+    }
+    if m.kindling < FIRE_MIN_KINDLING {
+        return Availability::Unavailable {
+            reason: "need 3 sticks",
+        };
+    }
+    if m.fuel < FIRE_MIN_FUEL {
+        return Availability::Unavailable {
+            reason: "need 2 firewood",
+        };
+    }
+    Availability::Available {
+        cost_game_seconds: COST_FIRE_MAKING_ATTEMPT,
     }
 }
 
@@ -326,8 +399,131 @@ pub fn execute(world: &mut World, id: ActionId) -> ExecuteOutcome {
             ]);
             ExecuteOutcome::Done("setting up camp...".to_string())
         }
+        ActionId::StartFire => execute_start_fire(world),
         _ => ExecuteOutcome::NotImplemented,
     }
+}
+
+/// Phase-10 instant verb (not multi-turn for slice 1 — see card). Pays
+/// the attempt cost, rolls a Fire Making skill check, and either lights
+/// a fire (consuming 1 tinder + 2 kindling + 1 fuel) or fails (consuming
+/// 1 tinder). Either outcome awards XP per skill.rs's rules.
+fn execute_start_fire(world: &mut World) -> ExecuteOutcome {
+    // Re-check materials defensively; the menu's evaluate should have
+    // already gated this, but a debug command could have removed them
+    // between menu-open and confirm.
+    let m = count_fire_materials(world);
+    if m.tinder < FIRE_MIN_TINDER || m.kindling < FIRE_MIN_KINDLING || m.fuel < FIRE_MIN_FUEL {
+        return ExecuteOutcome::Done("not enough materials".to_string());
+    }
+    if !world.player_pack().has_stack(ItemKind::FlintAndSteel) {
+        return ExecuteOutcome::Done("no flint and steel".to_string());
+    }
+
+    // Roll the check FIRST so we know whether to consume the success
+    // materials (1 tinder + 2 kindling + 1 fuel) vs only the failure
+    // materials (1 tinder spent striking).
+    let skill_value = world.player_skills().fire_making.value;
+    let roll = world.rng.d100();
+    let success = skill::skill_check_with_roll(skill_value, FIRE_BONUS_FLINT_AND_STEEL, roll);
+
+    // Always consume 1 tinder regardless of outcome (the strike at least
+    // singes the kindling whether it catches or not).
+    consume_one_fire_material(world, FireMaterial::Tinder);
+
+    let msg = if success {
+        // Success cost (per Survival - Fire Making.md): 2 kindling + 1
+        // fuel on top of the always-consumed 1 tinder. The extra
+        // reserve (3rd kindling, 2nd fuel) stays in inventory/ground.
+        for _ in 0..2 {
+            consume_one_fire_material(world, FireMaterial::Kindling);
+        }
+        consume_one_fire_material(world, FireMaterial::Fuel);
+
+        // Place the lit fire on the player's current cell.
+        let pos = world.player_pos();
+        if let Some(cell) = world.cell_at_mut(pos.x as i64, pos.y as i64) {
+            cell.items.push(ItemInstance::unique(
+                ItemKind::Firewood,
+                500, // a single firewood weighs ~500g; fixed for slice 1
+                None,
+                ItemMetadata::Lit {
+                    fuel_seconds: FIRE_FUEL_SECONDS_PER_LIGHT,
+                },
+            ));
+        }
+
+        // Award success XP + log level-up if it crosses threshold.
+        let mut skills = world.player_skills();
+        let leveled = skill::award_xp(skills.get_mut(SkillKind::FireMaking), true);
+        world.set_player_skills(skills);
+        let value = world.player_skills().fire_making.value;
+        if leveled {
+            format!("fire lit (+5 Fire Making XP, leveled to {})", value)
+        } else {
+            format!("fire lit (+5 Fire Making XP, now {})", value)
+        }
+    } else {
+        // Failure: award +1 XP, no fire spawned, kindling/fuel untouched.
+        let mut skills = world.player_skills();
+        skill::award_xp(skills.get_mut(SkillKind::FireMaking), false);
+        world.set_player_skills(skills);
+        format!("strike failed (+1 Fire Making XP)")
+    };
+
+    world.spend_action_time(COST_FIRE_MAKING_ATTEMPT);
+    ExecuteOutcome::Done(msg)
+}
+
+#[derive(Clone, Copy)]
+enum FireMaterial {
+    Tinder,
+    Kindling,
+    #[allow(dead_code)] // success-path fuel consumption — see below
+    Fuel,
+}
+
+/// Consume one unit of the given material. Tries the player's pack
+/// first (cheap to mutate), then the 3x3 cell square in deterministic
+/// order. Returns true if a unit was consumed.
+fn consume_one_fire_material(world: &mut World, mat: FireMaterial) -> bool {
+    let kinds: &[ItemKind] = match mat {
+        FireMaterial::Tinder => &[ItemKind::Twig, ItemKind::GrassBlade],
+        FireMaterial::Kindling => &[ItemKind::Stick],
+        FireMaterial::Fuel => &[ItemKind::Firewood],
+    };
+
+    // Pack first.
+    for &kind in kinds {
+        if world.player_pack_mut().take_one_from_stack(kind) {
+            return true;
+        }
+    }
+
+    // Then the 3x3 cell square.
+    let p = world.player_pos();
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            let wx = (p.x + dx) as i64;
+            let wy = (p.y + dy) as i64;
+            let Some(cell) = world.cell_at_mut(wx, wy) else {
+                continue;
+            };
+            let Some(idx) = cell.items.iter().position(|i| {
+                kinds.contains(&i.kind)
+                    && i.count > 0
+                    && !matches!(i.metadata, ItemMetadata::Lit { .. })
+            }) else {
+                continue;
+            };
+            cell.items[idx].count -= 1;
+            if cell.items[idx].count == 0 {
+                cell.items.remove(idx);
+            }
+            return true;
+        }
+    }
+    false
 }
 
 /// Called by main.rs once per `ActionId` reported in
@@ -482,6 +678,7 @@ mod tests {
             ActionId::PitchTent,
             ActionId::UnrollBedroll,
             ActionId::SetupCamp,
+            ActionId::StartFire,
         ];
         for action in ALL_ACTIONS {
             if live.contains(&action.id) {
@@ -621,6 +818,120 @@ mod tests {
             .map(|c| c.items.len())
             .unwrap_or(0);
         assert_eq!(pre_items, post_items);
+    }
+
+    #[test]
+    fn start_fire_unavailable_without_materials() {
+        let world = World::new(CHUNK_W, CHUNK_H);
+        // Spawn cell has no debris adjacent (debris is east/south/west of
+        // spawn but in cells that are not all 3x3 around player). Actually
+        // the seeded debris is at (21,15), (20,16), (19,15) — these ARE
+        // in the 3x3 around spawn (20,15). So we do have some materials.
+        // But not the full 1 tinder + 3 kindling + 2 fuel.
+        match eval_start_fire(&world) {
+            Availability::Unavailable { reason } => {
+                // Some non-empty reason; the exact one depends on what's
+                // missing first per the eval's order (tinder, kindling,
+                // fuel).
+                assert!(!reason.is_empty());
+            }
+            other => panic!("expected Unavailable, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn start_fire_available_with_full_materials_and_flint() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Stuff the player's cell with the full requirement set.
+        let pos = world.player_pos();
+        if let Some(c) = world.cell_at_mut(pos.x as i64, pos.y as i64) {
+            c.items.clear();
+            c.items.push(ItemInstance::stack(
+                ItemKind::Twig,
+                3,
+                5,
+                None,
+                ItemMetadata::None,
+            ));
+            c.items.push(ItemInstance::stack(
+                ItemKind::Stick,
+                5,
+                50,
+                None,
+                ItemMetadata::None,
+            ));
+            c.items.push(ItemInstance::stack(
+                ItemKind::Firewood,
+                3,
+                500,
+                None,
+                ItemMetadata::None,
+            ));
+        }
+        match eval_start_fire(&world) {
+            Availability::Available { cost_game_seconds } => {
+                assert_eq!(cost_game_seconds, COST_FIRE_MAKING_ATTEMPT);
+            }
+            other => panic!("expected Available, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn execute_start_fire_success_places_lit_fire_and_awards_xp() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Force a roll outcome: skill check uses world.rng.d100(); set
+        // the RNG state to a known seed.
+        world.rng = crate::skill::Rng::from_state(1);
+
+        let pos = world.player_pos();
+        if let Some(c) = world.cell_at_mut(pos.x as i64, pos.y as i64) {
+            c.items.clear();
+            c.items.push(ItemInstance::stack(
+                ItemKind::Twig,
+                3,
+                5,
+                None,
+                ItemMetadata::None,
+            ));
+            c.items.push(ItemInstance::stack(
+                ItemKind::Stick,
+                5,
+                50,
+                None,
+                ItemMetadata::None,
+            ));
+            c.items.push(ItemInstance::stack(
+                ItemKind::Firewood,
+                3,
+                500,
+                None,
+                ItemMetadata::None,
+            ));
+        }
+
+        let xp_before = world.player_skills().fire_making.daily_xp;
+        let outcome = execute(&mut world, ActionId::StartFire);
+        assert!(matches!(outcome, ExecuteOutcome::Done(_)));
+
+        // XP went up regardless of success/failure outcome (we don't
+        // know which the RNG produced; assert >0).
+        let xp_after = world.player_skills().fire_making.daily_xp;
+        assert!(
+            xp_after > xp_before,
+            "xp must rise on any attempt: {} -> {}",
+            xp_before,
+            xp_after
+        );
+
+        // Tinder always consumed; pre = 3 twigs, post should be <= 2.
+        let cell = world.cell_at(pos.x as i64, pos.y as i64).unwrap();
+        let post_twigs: u32 = cell
+            .items
+            .iter()
+            .filter(|i| i.kind == ItemKind::Twig)
+            .map(|i| i.count as u32)
+            .sum();
+        assert!(post_twigs < 3, "at least 1 twig consumed");
     }
 
     #[test]

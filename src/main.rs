@@ -9,6 +9,7 @@ mod needs;
 mod platform;
 mod render;
 mod save;
+mod skill;
 mod world;
 
 use std::io::Write;
@@ -25,7 +26,9 @@ use needs::Needs;
 use render::{draw_glyph, load_atlas, CELL_SIZE};
 use save::{
     ActionStepSave, ActiveActionSave, CellItemsSave, MetaSave, NeedsSave, RunSave, SaveHeader,
+    SkillSave, SkillsSave,
 };
+use skill::{Rng, Skill, SkillKind, Skills};
 use world::{
     brightness_at, dawns_elapsed, Position, TerrainKind, ViewMode, World,
     MULTI_TURN_GAME_SEC_PER_FRAME,
@@ -212,6 +215,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                 }
             }
+        }
+        // Phase-10 skills + RNG. Legacy saves leave SkillsSave at all-
+        // zero defaults; treat all-zero as "no data, keep the freshly
+        // built Skills::starting()" so loaded games don't suddenly
+        // start with Fire Making 0.
+        let saved_skill = run.skills.fire_making;
+        if saved_skill.value > 0 || saved_skill.daily_xp > 0 {
+            world.set_player_skills(Skills {
+                fire_making: Skill {
+                    value: saved_skill.value,
+                    daily_xp: saved_skill.daily_xp,
+                },
+            });
+        }
+        if run.rng_state != 0 {
+            world.rng = Rng::from_state(run.rng_state);
         }
         // Recompute FOV after restoring position so the visible set is
         // correct for the loaded clock + player coord. (World::new already
@@ -464,6 +483,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 last_dawn_idx,
                 now_dawn_idx
             );
+            // Daily skill-XP caps reset at each dawn so the player can
+            // train each skill again. Reset before saving so the save
+            // captures the post-reset state.
+            let mut skills = world.player_skills();
+            skills.reset_daily_caps();
+            world.set_player_skills(skills);
             save_game(
                 &save_dir,
                 &mut meta,
@@ -489,7 +514,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let day = world.day_count();
         let is_night = world.is_night();
         let tint = brightness_at(world.clock_seconds);
-        let mut ui_cells = build_ui_cells(&palette, needs, day, clock_h, clock_m, is_night);
+        let player_skills = world.player_skills();
+        let mut ui_cells = build_ui_cells(
+            &palette,
+            needs,
+            day,
+            clock_h,
+            clock_m,
+            is_night,
+            player_skills,
+        );
         draw_here_line(&mut ui_cells, &world, &palette);
         if let Some(active) = world.active_action.as_ref() {
             draw_multi_turn_banner(&mut ui_cells, active, &palette);
@@ -525,7 +559,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // terrain only.
                 if visible {
                     if let Some(top) = cell_state.and_then(|c| c.items.last()) {
-                        let (g, [r, gn, b]) = top.kind.glyph_color();
+                        // Lit fires override the kind's default glyph so
+                        // a lit-firewood reads as fire (orange '*') rather
+                        // than a wood pile ('=' brown).
+                        let (g, [r, gn, b]) = match top.metadata {
+                            items::ItemMetadata::Lit { .. } => (b'*', [230, 140, 60]),
+                            _ => top.kind.glyph_color(),
+                        };
                         glyph = g;
                         fg = Color::RGB(r, gn, b);
                     }
@@ -657,6 +697,14 @@ fn save_game(
         warmth_acc_secs: n.warmth_acc_secs,
     };
     run.explored_cells = world.snapshot_explored();
+    let player_skills = world.player_skills();
+    run.skills = SkillsSave {
+        fire_making: SkillSave {
+            value: player_skills.fire_making.value,
+            daily_xp: player_skills.fire_making.daily_xp,
+        },
+    };
+    run.rng_state = world.rng.state;
     run.active_action = world.active_action.as_ref().map(|active| ActiveActionSave {
         steps: active
             .steps
@@ -705,15 +753,16 @@ fn build_ui_cells(
     clock_h: u8,
     clock_m: u8,
     is_night: bool,
+    skills: Skills,
 ) -> Vec<Option<Cell>> {
     let mut cells = vec![None; (WORLD_W * WORLD_H) as usize];
 
-    // Left side: "Day N HH:MM day|night".
+    // Row 1 left: "Day N HH:MM day|night".
     let suffix = if is_night { "night" } else { "day" };
     let left = format!("Day {} {:02}:{:02} {}", day, clock_h, clock_m, suffix);
     put_text(&mut cells, 1, 1, &left, palette.hud_fg, palette.hud_bg);
 
-    // Right side: four CP437 need meters, right-aligned. Compose to a
+    // Row 1 right: four CP437 need meters, right-aligned. Compose to a
     // Vec<u8> first so the layout shifts cleanly as warmth flips between
     // 100 (3 digits) and < 100 (2 digits).
     let mut bytes: Vec<u8> = Vec::with_capacity(20);
@@ -737,6 +786,11 @@ fn build_ui_cells(
     };
     let x = WORLD_W as i32 - bytes.len() as i32 - 1;
     put_bytes(&mut cells, x, 1, &bytes, fg, palette.hud_bg);
+
+    // Row 2 left: Fire Making skill readout. Single-skill HUD for slice 1.
+    let fm = skills.get(SkillKind::FireMaking);
+    let line = format!("{} {}%", SkillKind::FireMaking.display_name(), fm.value);
+    put_text(&mut cells, 1, 2, &line, palette.hud_fg, palette.hud_bg);
 
     cells
 }
@@ -766,6 +820,10 @@ fn draw_here_line(cells: &mut [Option<Cell>], world: &World, palette: &Palette) 
         let name = item.kind.name();
         let label = match item.metadata {
             items::ItemMetadata::Pitched => format!("{} (pitched)", name),
+            items::ItemMetadata::Lit { fuel_seconds } => {
+                let m = fuel_seconds / 60;
+                format!("{} (lit, {}m)", name, m)
+            }
             _ if item.count > 1 => format!("{} ({})", name, item.count),
             _ => name.to_string(),
         };

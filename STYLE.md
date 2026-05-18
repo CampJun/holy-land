@@ -193,7 +193,21 @@ and import it.
 (Yes, 10 edits. Adding a need is genuinely a cross-cutting change.
 Documenting this so it doesn't surprise anyone.)
 
-### 3.4 …`TerrainKind`
+### 3.4 …`SkillKind`
+1. Add variant to `SkillKind` enum (skill.rs).
+2. Add field to `Skills` struct + arms in `Skills::get/get_mut` (skill.rs).
+3. Add line to `Skills::starting()` for the new skill's initial value.
+4. Update `Skills::reset_daily_caps()` to zero the new skill's daily_xp.
+5. Add a field to `SkillsSave` (save.rs) — additive, `#[serde(default)]`.
+6. Wire save/load in main.rs (mirror the existing fire_making block).
+7. Add `display_name` + (slice-2) `save_key`/`from_save_key` arms in
+   `SkillKind`.
+8. HUD: add a row in `build_ui_cells` if you want this skill visible.
+9. Add a test or two in `skill::tests`.
+
+Verbs that use the skill route through `skill::skill_check_with_roll(value, mods, roll)` for testability and `skill::award_xp(skill, success)` for the XP + daily cap + level-up logic. Don't reimplement those locally.
+
+### 3.5 …`TerrainKind`
 1. Add variant to `TerrainKind` enum (world.rs).
 2. Update `generate_chunk_phase3` (will be replaced by `chunkgen.rs` in
    phase 11; for now, add the new terrain to chunk gen) (world.rs).
@@ -207,13 +221,13 @@ Documenting this so it doesn't surprise anyone.)
 When phase 11 lands, expect this list to consolidate via a `TerrainDef`
 table analogous to `ItemDef`.
 
-### 3.5 …debug command
+### 3.6 …debug command
 1. Add variant to `DebugCommand` enum (debug_console.rs).
 2. Add arm to `parse_command()` (debug_console.rs).
 3. Add arm to `apply_debug_command()` (debug_console.rs).
 4. Add a line to `print_help()` so QA sees the new command.
 
-### 3.6 …save field
+### 3.7 …save field
 **Additive (backward-compatible):** add the field to the relevant Save
 struct with `#[serde(default)]`. Update load + save call sites in
 main.rs to plumb the value. Schema stays v1. Done.
