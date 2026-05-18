@@ -923,7 +923,7 @@ fn save_game(
 /// literals because the source is UTF-8 and `put_text` writes raw bytes.
 const HUD_GLYPH_THIRST: u8 = 0x14; // custom mug sprite
 const HUD_GLYPH_HUNGER: u8 = 0xE0; // custom chicken-leg sprite (matches Ration)
-const HUD_GLYPH_SLEEP: u8 = b'z'; // classic Z's
+const HUD_GLYPH_SLEEP: u8 = 0xE9; // custom bed sprite
 const HUD_GLYPH_WARMTH: u8 = 0x0F; // ☼ sun / fire
 
 fn build_ui_cells(

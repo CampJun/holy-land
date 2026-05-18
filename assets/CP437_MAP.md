@@ -85,7 +85,7 @@ would use these.
 | Pause / command / info menu cursor | `0x3E` | `>` |
 | HUD: Thirst | `0x14` | Custom mug sprite (atlas-colored). |
 | HUD: Hunger | `0xE0` | Custom chicken-leg sprite (matches Ration item). |
-| HUD: Sleep | `0x7A` | `z` |
+| HUD: Sleep | `0xE9` | Custom bed sprite (atlas-colored). |
 | HUD: Warmth | `0x0F` | `☼` |
 
 ## Notes from inspection
