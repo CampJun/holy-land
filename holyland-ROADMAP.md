@@ -99,8 +99,10 @@ The numbering is rough — sessions are sized by "amount of work that fits befor
 
 **Goal:** the roguelike layer that sits on top of everything.
 
+> **2026-05-14 amendment:** the blessing-as-passive-stat model below (Ishtar +25% dmg, Hathor +1 HP regen, Asherah durability) is **superseded**. Blessings are now **multiplicative modifiers on a god's active power** — see the combat-design brainstorm and kanban cards [[Power system]], [[Blessing system]], [[Blessing combo and stacking]], [[16-god roster design]]. Each god grants one power + one blessing that modifies that specific power. The session-7 goal stays: introduce the first deity, the first run-start choice, and the run/death/clear loop — just on the new model.
+
 - Run starts when you leave the oasis. At that moment, offer 2–3 random blessings from a pool (Asherah, Ishtar, Hathor, Marduk, Yahweh-as-warrior, etc.). Pick one.
-- Each blessing is a component or a systemic effect. E.g. Ishtar's blessing = +25% damage; Hathor = +1 HP regen / 5 turns; Asherah = wooden weapons +50% durability.
+- ~~Each blessing is a component or a systemic effect. E.g. Ishtar's blessing = +25% damage; Hathor = +1 HP regen / 5 turns; Asherah = wooden weapons +50% durability.~~ (See amendment above — replaced by power+blessing model.)
 - Blessing persists for the run; cleared on respawn at oasis.
 - Display active blessing in HUD (top-right CP437 strip).
 - Add 1–2 more demons + 1–2 more blessings to start surfacing combo space.
