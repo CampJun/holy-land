@@ -100,7 +100,9 @@ impl ItemKind {
                 save_key: "tent",
                 name: "tent",
                 is_fungible: false,
-                glyph: b'A',
+                // CP437 0x1E = ▲ (BLACK UP-POINTING TRIANGLE). Reads as
+                // a canvas tent silhouette much better than the prior 'A'.
+                glyph: 0x1E,
                 color: [200, 180, 140],
             },
             ItemKind::Bedroll => ItemDef {
