@@ -18,7 +18,7 @@ use hecs::{Entity, World as Ecs};
 use serde::{Deserialize, Serialize};
 
 use crate::action::ActionId;
-use crate::items::{starting_pack, ItemInstance, ItemMetadata, Pack};
+use crate::items::{starting_pack, ItemInstance, ItemKind, ItemMetadata, Pack};
 use crate::needs::{Needs, NeedsEnv};
 use crate::skill::{Rng, Skills};
 
@@ -600,11 +600,9 @@ impl World {
     fn needs_env(&self) -> NeedsEnv {
         NeedsEnv {
             is_night: self.is_night(),
-            // Fire/tent/bedroll entities don't exist yet (phase 9-10).
-            // Wire them in once those phases land.
-            adjacent_fire: false,
-            inside_tent: false,
-            in_bedroll: false,
+            adjacent_fire: self.lit_fire_adjacent_to_player(),
+            inside_tent: self.player_on_pitched(ItemKind::Tent),
+            in_bedroll: self.player_on_pitched(ItemKind::Bedroll),
         }
     }
 
@@ -676,7 +674,6 @@ impl World {
     /// the 8 adjacent cells? Phase-13 wires this into NeedsEnv for
     /// warmth shelter; phase-10 exposes it now so action-evaluation
     /// can use the same predicate.
-    #[allow(dead_code)] // consumed by needs_env() in phase 13 (warmth shelter)
     pub fn lit_fire_adjacent_to_player(&self) -> bool {
         let p = self.player_pos();
         for dy in -1..=1 {
@@ -690,6 +687,19 @@ impl World {
             }
         }
         false
+    }
+
+    /// Is the player standing on a Pitched item of the given kind?
+    /// Used by needs_env() for tent/bedroll warmth shelter checks
+    /// (phase 13a). The Pitched metadata marker is set by
+    /// place_pitched_from_pack in action.rs.
+    pub fn player_on_pitched(&self, kind: ItemKind) -> bool {
+        let p = self.player_pos();
+        self.cell_at(p.x as i64, p.y as i64).map_or(false, |cell| {
+            cell.items
+                .iter()
+                .any(|i| i.kind == kind && matches!(i.metadata, ItemMetadata::Pitched))
+        })
     }
 
     /// Queue a multi-turn action. `steps` lists the sub-actions in order
@@ -1242,6 +1252,74 @@ mod tests {
         assert!(world.is_night());
         world.clock_seconds = 6 * 3600;
         assert!(!world.is_night());
+    }
+
+    #[test]
+    fn player_on_pitched_detects_bedroll_on_player_cell() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let pos = world.player_pos();
+        // Empty start state: neither helper sees anything.
+        assert!(!world.player_on_pitched(ItemKind::Bedroll));
+        assert!(!world.player_on_pitched(ItemKind::Tent));
+
+        // Drop a Pitched bedroll on the player's cell; helper flips true
+        // only for Bedroll, not Tent.
+        if let Some(cell) = world.cell_at_mut(pos.x as i64, pos.y as i64) {
+            cell.items.push(ItemInstance::unique(
+                ItemKind::Bedroll,
+                2_000,
+                None,
+                ItemMetadata::Pitched,
+            ));
+        }
+        assert!(world.player_on_pitched(ItemKind::Bedroll));
+        assert!(!world.player_on_pitched(ItemKind::Tent));
+
+        // A non-Pitched bedroll (e.g. stowed but somehow on a cell with
+        // ItemMetadata::None) must NOT count — the marker is what
+        // distinguishes "deployed" from "loose".
+        if let Some(cell) = world.cell_at_mut((pos.x + 1) as i64, pos.y as i64) {
+            cell.items.clear();
+            cell.items.push(ItemInstance::stack(
+                ItemKind::Bedroll,
+                1,
+                2_000,
+                None,
+                ItemMetadata::None,
+            ));
+        }
+        world.try_move_player(1, 0);
+        assert!(
+            !world.player_on_pitched(ItemKind::Bedroll),
+            "unpitched bedroll on the cell should not count"
+        );
+    }
+
+    #[test]
+    fn night_warmth_decay_softens_with_adjacent_lit_fire() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Jump to deep night.
+        world.clock_seconds = 22 * 3600;
+        // Drop a lit fire on the cell east of the player.
+        let pos = world.player_pos();
+        if let Some(cell) = world.cell_at_mut((pos.x + 1) as i64, pos.y as i64) {
+            cell.items.push(ItemInstance::unique(
+                ItemKind::Firewood,
+                500,
+                None,
+                ItemMetadata::Lit { fuel_seconds: 3600 },
+            ));
+        }
+        // Force warmth to a known value to isolate the decay.
+        let mut n = world.player_needs();
+        n.warmth = 100;
+        n.warmth_acc_secs = 0;
+        world.set_player_needs(n);
+
+        // 60 game-seconds of advance_time_raw at night with a fire
+        // adjacent: net -3 + 1 = -2 warmth.
+        world.advance_time_raw(60);
+        assert_eq!(world.player_needs().warmth, 98);
     }
 
     #[test]
