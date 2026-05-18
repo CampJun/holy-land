@@ -163,12 +163,12 @@ impl ItemKind {
                 save_key: "herb",
                 name: "herb",
                 is_fungible: false,
-                // 0xE7: custom herb/small-plant sprite (atlas-colored).
                 glyph: 0xE7,
-                // Near-white so the atlas's intrinsic green tint shows.
-                color: [230, 240, 220],
+                // Saturated green tints the grayscale atlas sprite.
+                // Atlas pixel * fg / 255 → shaded green herb.
+                color: [100, 165, 75],
                 default_weight_g: 10,
-                blends_with_terrain: false, // herbs pierce — pickable target
+                blends_with_terrain: false,
             },
             // Organic detritus: blends into the floor texture so the
             // eye glides past it. ChopTree drops firewood (which
@@ -195,12 +195,11 @@ impl ItemKind {
                 save_key: "firewood",
                 name: "firewood",
                 is_fungible: true,
-                // 0x16: custom 3-log pile sprite (atlas-colored).
                 glyph: 0x16,
-                // Near-white so the atlas's intrinsic brown tones show.
-                color: [240, 230, 215],
+                // Saturated wood-brown tints the grayscale log-pile.
+                color: [150, 100, 55],
                 default_weight_g: 500,
-                blends_with_terrain: false, // firewood pierces — the harvested resource
+                blends_with_terrain: false,
             },
             ItemKind::GrassBlade => ItemDef {
                 save_key: "grass_blade",
@@ -215,14 +214,13 @@ impl ItemKind {
                 save_key: "stone",
                 name: "stone",
                 is_fungible: true,
-                // 0x07: custom stone sprite (atlas-colored). Was the
-                // generic '*' bullet before; the atlas has a proper
-                // rock here.
                 glyph: 0x07,
-                // Near-white so the atlas's gray-stone shading shows.
-                color: [230, 230, 230],
+                // Cool gray — the atlas's shading still shows the
+                // rounded silhouette; this multiplier keeps it from
+                // looking too white.
+                color: [165, 165, 175],
                 default_weight_g: 200,
-                blends_with_terrain: false, // stones pierce
+                blends_with_terrain: false,
             },
             ItemKind::MossPatch => ItemDef {
                 save_key: "moss_patch",
@@ -246,12 +244,11 @@ impl ItemKind {
                 save_key: "ration",
                 name: "ration",
                 is_fungible: true,
-                // 0xE0: custom chicken-leg sprite (atlas-colored).
                 glyph: 0xE0,
-                // Near-white so the atlas's meat/skin tones show.
-                color: [240, 230, 210],
+                // Warm tan/skin — tints the grayscale chicken sprite.
+                color: [225, 180, 110],
                 default_weight_g: 500,
-                blends_with_terrain: false, // ration belongs in pack, not on ground
+                blends_with_terrain: false,
             },
         }
     }

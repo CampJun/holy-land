@@ -32,7 +32,7 @@ use save::{
 use skill::{Rng, Skill, SkillKind, Skills};
 use world::{
     brightness_at, dawns_elapsed, Position, TerrainKind, ViewMode, World,
-    MULTI_TURN_GAME_SEC_PER_FRAME, TREE_VARIANT_GLYPHS,
+    MULTI_TURN_GAME_SEC_PER_FRAME, TREE_TINT_VARIANTS, TREE_VARIANT_GLYPHS,
 };
 
 const WORLD_W: u32 = 40;
@@ -699,10 +699,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 // Per-cell tree-variant pick from TREE_VARIANT_GLYPHS
                 // so the forest has visual variety instead of a row of
-                // identical spades.
+                // identical spades. Tint is also picked per-cell from
+                // TREE_TINT_VARIANTS so adjacent trees have slightly
+                // different greens (with the occasional autumn-brown).
                 if terrain == TerrainKind::TreeTrunk {
-                    let i = tree_variant_index(wx as i32, wy as i32, world.seed);
-                    glyph = TREE_VARIANT_GLYPHS[i % TREE_VARIANT_GLYPHS.len()];
+                    let gi = tree_variant_index(wx as i32, wy as i32, world.seed);
+                    glyph = TREE_VARIANT_GLYPHS[gi % TREE_VARIANT_GLYPHS.len()];
+                    let ci = tree_tint_index(wx as i32, wy as i32, world.seed);
+                    let t = TREE_TINT_VARIANTS[ci % TREE_TINT_VARIANTS.len()];
+                    fg = Color::RGB(t[0], t[1], t[2]);
                 }
                 let cell_state = world.cell_at(wx, wy);
                 let visible = cell_state.map(|c| c.visible).unwrap_or(false);
@@ -937,30 +942,56 @@ fn build_ui_cells(
     let left = format!("Day {} {:02}:{:02} {}", day, clock_h, clock_m, suffix);
     put_text(&mut cells, 1, 1, &left, palette.hud_fg, palette.hud_bg);
 
-    // Row 1 right: four CP437 need meters, right-aligned. Compose to a
-    // Vec<u8> first so the layout shifts cleanly as warmth flips between
-    // 100 (3 digits) and < 100 (2 digits).
-    let mut bytes: Vec<u8> = Vec::with_capacity(20);
-    push_meter(&mut bytes, HUD_GLYPH_THIRST, needs.thirst);
-    bytes.push(b' ');
-    push_meter(&mut bytes, HUD_GLYPH_HUNGER, needs.hunger);
-    bytes.push(b' ');
-    push_meter(&mut bytes, HUD_GLYPH_SLEEP, needs.sleep);
-    bytes.push(b' ');
-    push_meter(&mut bytes, HUD_GLYPH_WARMTH, needs.warmth);
+    // Row 1 right: four CP437 need meters, each with its own symbol
+    // fg so the atlas-colored sprites (mug, chicken leg, sun) tint
+    // toward their natural hue. Critical state (any need < 25)
+    // overrides both symbol and digit fgs to need_critical_fg so the
+    // warning reads at a glance.
     let critical = needs
         .thirst
         .min(needs.hunger)
         .min(needs.sleep)
         .min(needs.warmth)
         < 25;
-    let fg = if critical {
+    let digit_fg = if critical {
         palette.need_critical_fg
     } else {
         palette.hud_fg
     };
-    let x = WORLD_W as i32 - bytes.len() as i32 - 1;
-    put_bytes(&mut cells, x, 1, &bytes, fg, palette.hud_bg);
+    // Per-symbol tints (overridden by critical_fg when critical).
+    let pick = |normal: Color| if critical { palette.need_critical_fg } else { normal };
+    let meters: [(u8, Color, u8); 4] = [
+        (HUD_GLYPH_THIRST, pick(Color::RGB(180, 140, 90)), needs.thirst),
+        (HUD_GLYPH_HUNGER, pick(Color::RGB(220, 180, 110)), needs.hunger),
+        (HUD_GLYPH_SLEEP, pick(palette.hud_fg), needs.sleep),
+        (HUD_GLYPH_WARMTH, pick(Color::RGB(240, 195, 80)), needs.warmth),
+    ];
+    // Pre-compute total width so we right-align.
+    let total_w: usize = meters
+        .iter()
+        .map(|(_, _, v)| 1 + v.to_string().len())
+        .sum::<usize>()
+        + (meters.len() - 1); // single-space gap between meters
+    let mut x = WORLD_W as i32 - total_w as i32 - 1;
+    for (i, (glyph, sym_fg, value)) in meters.iter().enumerate() {
+        put_cell(
+            &mut cells,
+            x,
+            1,
+            Cell {
+                glyph: *glyph,
+                fg: *sym_fg,
+                bg: palette.hud_bg,
+            },
+        );
+        x += 1;
+        let s = value.to_string();
+        put_text(&mut cells, x, 1, &s, digit_fg, palette.hud_bg);
+        x += s.len() as i32;
+        if i + 1 < meters.len() {
+            x += 1; // space between meters
+        }
+    }
 
     // Row 2 left: Fire Making skill readout. Single-skill HUD for slice 1.
     let fm = skills.get(SkillKind::FireMaking);
@@ -968,11 +999,6 @@ fn build_ui_cells(
     put_text(&mut cells, 1, 2, &line, palette.hud_fg, palette.hud_bg);
 
     cells
-}
-
-fn push_meter(out: &mut Vec<u8>, glyph: u8, value: u8) {
-    out.push(glyph);
-    out.extend_from_slice(value.to_string().as_bytes());
 }
 
 /// Per-cell ±8 RGB offset on a walkable terrain's `(fg, bg)` based on a
@@ -1035,6 +1061,19 @@ fn tree_variant_index(x: i32, y: i32, seed: u64) -> usize {
         .wrapping_add((y as i64).wrapping_mul(2_654_435_761))
         .wrapping_add(seed as i64);
     let mixed = (h as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    (mixed >> 28) as usize
+}
+
+/// Index into `TREE_TINT_VARIANTS` for a given cell. Uses different
+/// mixer constants from `tree_variant_index` so a cell's silhouette
+/// pick and its tint pick are decorrelated — same atlas glyph can
+/// appear in any tint, and vice versa.
+fn tree_tint_index(x: i32, y: i32, seed: u64) -> usize {
+    let h = (x as i64)
+        .wrapping_mul(2_246_822_519_i64)
+        .wrapping_add((y as i64).wrapping_mul(40_503))
+        .wrapping_add((seed as i64).wrapping_mul(73_856_093));
+    let mixed = (h as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     (mixed >> 28) as usize
 }
 
@@ -1609,12 +1648,6 @@ fn draw_panel(
             };
             put_cell(cells, px, py, Cell { glyph, fg, bg });
         }
-    }
-}
-
-fn put_bytes(cells: &mut [Option<Cell>], x: i32, y: i32, bytes: &[u8], fg: Color, bg: Color) {
-    for (i, &b) in bytes.iter().enumerate() {
-        put_cell(cells, x + i as i32, y, Cell { glyph: b, fg, bg });
     }
 }
 

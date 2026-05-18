@@ -171,6 +171,19 @@ pub struct TerrainDef {
 /// burnt-out groves) — see assets/CP437_MAP.md.
 pub const TREE_VARIANT_GLYPHS: &[u8] = &[0x05, 0x06, 0x17, 0x18];
 
+/// Tint colors applied per-cell to tree canopies so adjacent trees
+/// have slightly different hues. Atlas pixel × variant fg / 255 →
+/// shaded canopy in that base hue. Five entries cover summer-forest
+/// palette: bright green, deep green, olive, yellow-green, and one
+/// autumn-brown for accent. Hash mixer picks per cell.
+pub const TREE_TINT_VARIANTS: &[[u8; 3]] = &[
+    [85, 140, 55],   // bright forest green
+    [60, 100, 40],   // dark green
+    [110, 145, 60],  // olive
+    [130, 160, 50],  // yellow-green
+    [140, 100, 45],  // autumn brown (rare accent)
+];
+
 /// Iteration order for `TerrainKind::from_save_key`. Keep in sync with
 /// the enum variants — adding a kind here makes from_save_key find it.
 const ALL_TERRAINS: &[TerrainKind] = &[
@@ -212,12 +225,13 @@ impl TerrainKind {
             TerrainKind::Grass => TerrainDef {
                 save_key: "grass",
                 name: "grass",
-                // 0x9C: custom grass-tuft sprite (atlas-colored).
-                // Sparse-dot logic in main.rs renders blank for ~75% of
-                // cells; this glyph shows on the rest. Was '.'.
+                // 0x9C: custom grass-tuft sprite. Sparse-dot logic in
+                // main.rs renders blank for ~75% of cells; this glyph
+                // shows on the rest.
                 glyph: 0x9C,
-                // Near-white so the atlas tuft's green shading shows.
-                fg: [210, 220, 200],
+                // Saturated green tints the grayscale tuft; the
+                // per-cell floor_with_gradient adds ±8 variation.
+                fg: [80, 130, 55],
                 bg: [14, 22, 14],
                 walkable: true,
                 blocks_sight: false,
