@@ -50,6 +50,20 @@ struct Cell {
     bg: Color,
 }
 
+/// Start-button pause-menu options. Render order = display order.
+const PAUSE_OPTIONS: &[(PauseAction, &str)] = &[
+    (PauseAction::Save, "Save"),
+    (PauseAction::Quit, "Quit to desktop"),
+    (PauseAction::ResetSave, "Delete save and reset"),
+];
+
+#[derive(Clone, Copy, PartialEq)]
+enum PauseAction {
+    Save,
+    Quit,
+    ResetSave,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let save_dir = platform::save_dir();
     logging::init(&save_dir);
@@ -213,6 +227,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // selected. Phase 15 adds the hold-Y radial overlay alongside this.
     let mut command_menu: Option<usize> = None;
 
+    // Start-button pause menu (Save / Quit / Delete-save-and-reset). When
+    // open, every other input mode is suspended and multi-turn actions
+    // stop ticking. Replaces the previous "Start quits immediately".
+    let mut pause_menu: Option<usize> = None;
+
     #[cfg(not(target_arch = "arm"))]
     let debug = debug_console::DebugConsole::spawn();
 
@@ -246,10 +265,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         input.poll_gamepad();
 
         for input_action in input.drain() {
+            // Pause menu is the highest-priority input mode. While open,
+            // every other state (active_action, command_menu, world)
+            // is frozen. Multi-turn actions also stop ticking — see
+            // the "if pause_menu.is_none()" guard further down.
+            if let Some(selected) = pause_menu {
+                let count = PAUSE_OPTIONS.len();
+                match input_action {
+                    Action::Up => {
+                        pause_menu = Some(selected.saturating_sub(1));
+                    }
+                    Action::Down => {
+                        pause_menu = Some((selected + 1).min(count - 1));
+                    }
+                    Action::A => {
+                        let (chosen, _) = PAUSE_OPTIONS[selected];
+                        match chosen {
+                            PauseAction::Save => {
+                                save_game(
+                                    &save_dir,
+                                    &mut meta,
+                                    &world,
+                                    &mut prev_meta_header,
+                                    &mut prev_run_header,
+                                );
+                                pause_menu = None;
+                            }
+                            PauseAction::Quit => break 'main,
+                            PauseAction::ResetSave => {
+                                let _ = std::fs::remove_file(save_dir.join(META_FILE));
+                                let _ = std::fs::remove_file(save_dir.join(RUN_FILE));
+                                world = World::new(WORLD_W, WORLD_H);
+                                meta = MetaSave::empty(SaveHeader::fresh(None));
+                                prev_meta_header = meta.header.clone();
+                                prev_run_header = None;
+                                last_dawn_idx = dawns_elapsed(world.clock_seconds);
+                                command_menu = None;
+                                pause_menu = None;
+                                log_info!("[menu] save deleted; in-memory state reset");
+                            }
+                        }
+                    }
+                    Action::B | Action::Start => {
+                        pause_menu = None;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
             // Multi-turn-action mode: world is auto-ticking the queued
             // verb. The only inputs that mean anything are B (cancel),
-            // Select (toggle view mode), and Start (quit). Everything
-            // else is dropped so the player can't move/menu mid-pitch.
+            // Select (toggle view mode), and Start (open pause menu).
+            // Everything else is dropped so the player can't move/menu
+            // mid-pitch.
             if world.active_action.is_some() {
                 match input_action {
                     Action::B => {
@@ -265,7 +334,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .unwrap_or(ViewMode::ProgressBar);
                         log_info!("[action] view mode = {:?}", mode);
                     }
-                    Action::Start => break 'main,
+                    Action::Start => {
+                        pause_menu = Some(0);
+                    }
                     _ => {}
                 }
                 continue;
@@ -314,7 +385,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Action::B | Action::Y => {
                         command_menu = None;
                     }
-                    Action::Start => break 'main,
+                    Action::Start => {
+                        pause_menu = Some(0);
+                    }
                     _ => {}
                 }
                 continue;
@@ -334,7 +407,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Action::Y => {
                     command_menu = Some(0);
                 }
-                Action::Start => break 'main,
+                Action::Start => {
+                    pause_menu = Some(0);
+                }
                 Action::Select => save_game(
                     &save_dir,
                     &mut meta,
@@ -350,24 +425,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // on view_mode. Completed steps trigger action::complete_step
         // (which fires the verb's consume-from-pack and structure-place
         // effects). Interrupts (need < critical threshold) cancel the
-        // entire queue.
-        if let Some(view_mode) = world.active_action.as_ref().map(|a| a.view_mode) {
-            let advance = match view_mode {
-                ViewMode::ProgressBar => MULTI_TURN_GAME_SEC_PER_FRAME,
-                ViewMode::TimeSkip => world
-                    .active_action
-                    .as_ref()
-                    .map(|a| a.total_remaining_secs())
-                    .unwrap_or(0),
-            };
-            let result = world.tick_multi_turn(advance);
-            for step_id in result.completed_steps {
-                if let Some(msg) = action::complete_step(&mut world, step_id) {
-                    log_info!("[action] {}", msg);
+        // entire queue. Pause menu blocks ticking so the world stops
+        // when the player opens the menu mid-pitch.
+        let multi_view = world.active_action.as_ref().map(|a| a.view_mode);
+        if pause_menu.is_none() {
+            if let Some(view_mode) = multi_view {
+                let advance = match view_mode {
+                    ViewMode::ProgressBar => MULTI_TURN_GAME_SEC_PER_FRAME,
+                    ViewMode::TimeSkip => world
+                        .active_action
+                        .as_ref()
+                        .map(|a| a.total_remaining_secs())
+                        .unwrap_or(0),
+                };
+                let result = world.tick_multi_turn(advance);
+                for step_id in result.completed_steps {
+                    if let Some(msg) = action::complete_step(&mut world, step_id) {
+                        log_info!("[action] {}", msg);
+                    }
                 }
-            }
-            if result.interrupted {
-                log_info!("[action] interrupted (need critical)");
+                if result.interrupted {
+                    log_info!("[action] interrupted (need critical)");
+                }
             }
         }
 
@@ -417,6 +496,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(selected) = command_menu {
             draw_command_menu(&mut ui_cells, &world, selected, &palette);
+        }
+        if let Some(selected) = pause_menu {
+            draw_pause_menu(&mut ui_cells, selected, &palette);
         }
 
         let draw_start = Instant::now();
@@ -697,6 +779,54 @@ fn draw_here_line(cells: &mut [Option<Cell>], world: &World, palette: &Palette) 
     }
     let row = WORLD_H as i32 - 1;
     put_text(cells, 1, row, &joined, palette.hud_fg, palette.hud_bg);
+}
+
+fn draw_pause_menu(cells: &mut [Option<Cell>], selected: usize, palette: &Palette) {
+    let w: i32 = 28;
+    let h: i32 = 9;
+    let x = ((WORLD_W as i32) - w) / 2;
+    let y = ((WORLD_H as i32) - h) / 2;
+    draw_panel(cells, x, y, w, h, palette.panel_fg, palette.panel_bg);
+    put_text(
+        cells,
+        x + 2,
+        y + 1,
+        "Paused",
+        palette.panel_title_fg,
+        palette.panel_bg,
+    );
+
+    for (i, (action, label)) in PAUSE_OPTIONS.iter().enumerate() {
+        let row_y = y + 3 + i as i32;
+        let is_selected = i == selected;
+        let cursor = if is_selected { b'>' } else { b' ' };
+        let fg = match (is_selected, action) {
+            (true, PauseAction::ResetSave) => palette.need_critical_fg,
+            (true, _) => palette.panel_fg,
+            (false, PauseAction::ResetSave) => palette.need_critical_fg,
+            (false, _) => palette.hud_fg,
+        };
+        put_cell(
+            cells,
+            x + 2,
+            row_y,
+            Cell {
+                glyph: cursor,
+                fg: palette.panel_title_fg,
+                bg: palette.panel_bg,
+            },
+        );
+        put_text(cells, x + 4, row_y, label, fg, palette.panel_bg);
+    }
+
+    put_text(
+        cells,
+        x + 2,
+        y + h - 2,
+        "A: confirm   B/Start: back",
+        palette.panel_dim_fg,
+        palette.panel_bg,
+    );
 }
 
 fn draw_multi_turn_banner(
