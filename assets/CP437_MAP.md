@@ -26,9 +26,9 @@ clock-driven brightness, so dimming works either way.
 
 ## How to inspect
 
-In-game: press **D** (X face button) to open the **CP437 glyph
-palette** overlay. Browse with dpad; the header shows the current
-byte. **B** or **D** to close.
+In-game: press **Esc / Start** to open the pause menu, then select
+**CP437 glyph palette (dev)**. Browse with dpad; the header shows the
+current byte. **B** to close (returns to game).
 
 When you spot a useful sprite, write its byte index here next to a
 description, then update `items.rs::ItemDef::def()` or

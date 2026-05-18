@@ -59,6 +59,7 @@ const PAUSE_OPTIONS: &[(PauseAction, &str)] = &[
     (PauseAction::Save, "Save"),
     (PauseAction::Quit, "Quit to desktop"),
     (PauseAction::ResetSave, "Delete save and reset"),
+    (PauseAction::GlyphPalette, "CP437 glyph palette (dev)"),
 ];
 
 #[derive(Clone, Copy, PartialEq)]
@@ -66,6 +67,7 @@ enum PauseAction {
     Save,
     Quit,
     ResetSave,
+    GlyphPalette,
 }
 
 /// Select-button info hub tabs. Display order = `INFO_TABS`.
@@ -381,6 +383,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 pause_menu = None;
                                 log_info!("[menu] save deleted; in-memory state reset");
                             }
+                            PauseAction::GlyphPalette => {
+                                pause_menu = None;
+                                glyph_palette = Some(0);
+                            }
                         }
                     }
                     Action::B | Action::Start => {
@@ -399,7 +405,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Action::Down => glyph_palette = Some(cursor.wrapping_add(16)),
                     Action::Left => glyph_palette = Some(cursor.wrapping_sub(1)),
                     Action::Right => glyph_palette = Some(cursor.wrapping_add(1)),
-                    Action::B | Action::X => glyph_palette = None,
+                    Action::B => glyph_palette = None,
                     Action::Start => pause_menu = Some(0),
                     _ => {}
                 }
@@ -538,10 +544,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Action::Y => {
                     command_menu = Some(0);
-                }
-                Action::X => {
-                    // Dev: open the CP437 glyph palette overlay.
-                    glyph_palette = Some(0);
                 }
                 Action::Start => {
                     pause_menu = Some(0);
@@ -1224,7 +1226,7 @@ fn draw_glyph_palette(cells: &mut [Option<Cell>], cursor: u8, palette: &Palette)
         cells,
         &layout,
         &title,
-        "dpad: navigate   B/X: close",
+        "dpad: navigate   B: close",
         palette,
     );
 
