@@ -31,7 +31,7 @@ use save::{
 };
 use skill::{Rng, Skill, SkillKind, Skills};
 use world::{
-    brightness_at, dawns_elapsed, Position, ViewMode, World,
+    brightness_at, dawns_elapsed, Position, TerrainKind, ViewMode, World,
     MULTI_TURN_GAME_SEC_PER_FRAME,
 };
 
@@ -640,10 +640,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let wy = cam_y + vy as i64;
                 // Base terrain glyph via TerrainDef (one source of truth
                 // for glyph + fg + bg per kind; see world.rs).
-                let terrain_def = world.tile_at(wx, wy).def();
+                let terrain = world.tile_at(wx, wy);
+                let terrain_def = terrain.def();
                 let mut glyph = terrain_def.glyph;
                 let mut fg = Color::RGB(terrain_def.fg[0], terrain_def.fg[1], terrain_def.fg[2]);
                 let bg = Color::RGB(terrain_def.bg[0], terrain_def.bg[1], terrain_def.bg[2]);
+                // Sparse grass dots: hash-driven so most grass cells
+                // render as blank background; only ~25% show '.'.
+                // Creates a sparse field-of-grass texture instead of a
+                // wall of dots. Deterministic across reloads via
+                // world.seed.
+                if terrain == TerrainKind::Grass
+                    && !grass_dot_visible(wx as i32, wy as i32, world.seed)
+                {
+                    glyph = b' ';
+                }
                 let cell_state = world.cell_at(wx, wy);
                 let visible = cell_state.map(|c| c.visible).unwrap_or(false);
                 let explored = cell_state.map(|c| c.explored).unwrap_or(false);
@@ -901,6 +912,22 @@ fn build_ui_cells(
 fn push_meter(out: &mut Vec<u8>, glyph: u8, value: u8) {
     out.push(glyph);
     out.extend_from_slice(value.to_string().as_bytes());
+}
+
+/// Returns true for ~25% of grass cells, deterministically per
+/// `(x, y, world.seed)`. Used by the render loop to render a sparse
+/// pattern of '.' across grass rather than a wall of dots. Tweaking
+/// the modulus threshold changes the density (lower = sparser).
+fn grass_dot_visible(x: i32, y: i32, seed: u64) -> bool {
+    // Mixing constants: Knuth's multiplicative hash + two large primes
+    // for spatial decorrelation, then a final golden-ratio shuffle so
+    // adjacent cells don't show banding.
+    let h = (x as i64)
+        .wrapping_mul(73_856_093)
+        .wrapping_add((y as i64).wrapping_mul(19_349_663))
+        .wrapping_add(seed as i64);
+    let mixed = (h as u64).wrapping_mul(2_654_435_761);
+    (mixed >> 24) % 100 < 25
 }
 
 /// Bottom-left "what's underfoot" line. Reads the player's current

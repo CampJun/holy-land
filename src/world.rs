@@ -193,12 +193,16 @@ impl TerrainKind {
     /// the enum arm, then add an arm here. Exhaustive-match enforces it.
     pub fn def(self) -> TerrainDef {
         match self {
+            // Aesthetic note: ground terrains (grass, dirt, sand) are
+            // desaturated on purpose so trees and water remain the
+            // visual landmarks and items on the floor read with
+            // contrast. See STYLE.md §2.8 / the aesthetic pass commit.
             TerrainKind::Grass => TerrainDef {
                 save_key: "grass",
                 name: "grass",
                 glyph: b'.',
-                fg: [60, 110, 60],
-                bg: [15, 25, 15],
+                fg: [40, 65, 40],
+                bg: [12, 20, 12],
                 walkable: true,
                 blocks_sight: false,
             },
@@ -206,8 +210,8 @@ impl TerrainKind {
                 save_key: "bare_dirt",
                 name: "dirt",
                 glyph: b'.',
-                fg: [120, 90, 60],
-                bg: [20, 17, 13],
+                fg: [80, 65, 45],
+                bg: [18, 15, 11],
                 walkable: true,
                 blocks_sight: false,
             },
@@ -215,11 +219,13 @@ impl TerrainKind {
                 save_key: "sand_shore",
                 name: "sand",
                 glyph: b'.',
-                fg: [200, 180, 120],
-                bg: [40, 35, 25],
+                fg: [140, 125, 90],
+                bg: [30, 25, 18],
                 walkable: true,
                 blocks_sight: false,
             },
+            // Trees + water keep most of their saturation so they
+            // anchor the eye against the muted floor.
             TerrainKind::TreeTrunk => TerrainDef {
                 save_key: "tree_trunk",
                 name: "tree",
@@ -227,7 +233,7 @@ impl TerrainKind {
                 // canopy in monochrome glyph fonts.
                 glyph: 0x06,
                 fg: [70, 130, 50],
-                bg: [15, 25, 15],
+                bg: [12, 20, 12],
                 walkable: false,
                 blocks_sight: true,
             },
@@ -235,8 +241,8 @@ impl TerrainKind {
                 save_key: "stream_water",
                 name: "stream",
                 glyph: b'~',
-                fg: [110, 170, 220],
-                bg: [25, 40, 60],
+                fg: [85, 130, 175],
+                bg: [20, 30, 50],
                 walkable: false,
                 blocks_sight: false,
             },
@@ -244,8 +250,8 @@ impl TerrainKind {
                 save_key: "pond_water",
                 name: "pond",
                 glyph: b'~',
-                fg: [70, 130, 200],
-                bg: [20, 35, 55],
+                fg: [55, 100, 155],
+                bg: [18, 28, 48],
                 walkable: false,
                 blocks_sight: false,
             },
@@ -316,7 +322,9 @@ pub struct World {
     /// bounds. Direct mutation of cells via this map will silently
     /// bypass dirty-tracking and break saves.
     pub(crate) chunks: HashMap<ChunkCoord, Box<Chunk>>,
-    #[allow(dead_code)] // consumed by chunkgen.rs in phase 11 (seeded gen)
+    /// World seed. Consumed by chunkgen for layout determinism and by
+    /// main.rs's sparse-grass-dot hash so the visual texture is stable
+    /// across reloads.
     pub seed: u64,
     /// Game-time clock in seconds since "game start" (not real-time). Wraps
     /// the 24-hour day for time-of-day queries via div/mod with

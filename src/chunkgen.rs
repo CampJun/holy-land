@@ -225,19 +225,24 @@ fn apply_skeleton_trees(cells: &mut [CellState]) {
 
 // ---- Debris rolls ----
 
-/// Roll the debris items for a single grass cell per the table in this
-/// module's header comment. Mutates `out` in place; advances `rng`.
-/// `near_water` is the precomputed adjacency flag for this cell.
+/// Roll the debris items for a single grass cell. Mutates `out` in
+/// place; advances `rng`. `near_water` is the precomputed adjacency
+/// flag for this cell.
+///
+/// Probabilities halved from the original spec for visual readability
+/// (most grass cells should be empty so trees + items pop). Material
+/// availability stays sufficient: a 40x30 chunk still rolls ~150 twigs,
+/// ~75 sticks, ~60 firewood for slice-1 fire-making + cooking needs.
 fn roll_debris(out: &mut Vec<ItemInstance>, rng: &mut Rng, near_water: bool) {
-    if rng.next_u32() % 100 < 50 {
+    if rng.next_u32() % 100 < 25 {
         let n = 1 + (rng.next_u32() % 3) as u16; // 1..=3
         out.push(ItemInstance::stack(ItemKind::Twig, n, 5, None, ItemMetadata::None));
     }
-    if rng.next_u32() % 100 < 30 {
+    if rng.next_u32() % 100 < 15 {
         let n = 1 + (rng.next_u32() % 2) as u16; // 1..=2
         out.push(ItemInstance::stack(ItemKind::Stick, n, 50, None, ItemMetadata::None));
     }
-    if rng.next_u32() % 100 < 25 {
+    if rng.next_u32() % 100 < 12 {
         let n = 1 + (rng.next_u32() % 2) as u16; // 1..=2
         out.push(ItemInstance::stack(
             ItemKind::Firewood,
@@ -247,7 +252,7 @@ fn roll_debris(out: &mut Vec<ItemInstance>, rng: &mut Rng, near_water: bool) {
             ItemMetadata::None,
         ));
     }
-    if rng.next_u32() % 100 < 40 {
+    if rng.next_u32() % 100 < 20 {
         let n = 1 + (rng.next_u32() % 2) as u16; // 1..=2
         out.push(ItemInstance::stack(
             ItemKind::GrassBlade,
@@ -257,7 +262,7 @@ fn roll_debris(out: &mut Vec<ItemInstance>, rng: &mut Rng, near_water: bool) {
             ItemMetadata::None,
         ));
     }
-    if rng.next_u32() % 100 < 20 {
+    if rng.next_u32() % 100 < 10 {
         out.push(ItemInstance::stack(
             ItemKind::Stone,
             1,
@@ -266,7 +271,7 @@ fn roll_debris(out: &mut Vec<ItemInstance>, rng: &mut Rng, near_water: bool) {
             ItemMetadata::None,
         ));
     }
-    if rng.next_u32() % 100 < 15 {
+    if rng.next_u32() % 100 < 8 {
         out.push(ItemInstance::stack(
             ItemKind::MossPatch,
             1,
@@ -275,7 +280,7 @@ fn roll_debris(out: &mut Vec<ItemInstance>, rng: &mut Rng, near_water: bool) {
             ItemMetadata::None,
         ));
     }
-    if rng.next_u32() % 100 < 10 && near_water {
+    if rng.next_u32() % 100 < 5 && near_water {
         out.push(ItemInstance::stack(
             ItemKind::Mud,
             1,
