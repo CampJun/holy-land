@@ -50,6 +50,13 @@ pub struct ItemDef {
     /// here are EMPTY (200g, water_uses=0); a full one is heavier and
     /// is constructed explicitly by `starting_pack`.
     pub default_weight_g: u32,
+    /// Aesthetic flag: organic detritus (twigs, grass, moss, mud) reads
+    /// as part of the floor texture when rendered on the ground —
+    /// main.rs mixes the item color heavily toward the cell's terrain
+    /// fg so the eye glides past it. Distinct items (stones, firewood,
+    /// herbs, tools, structures) keep their saturation so they pierce
+    /// the floor as visual landmarks.
+    pub blends_with_terrain: bool,
 }
 
 /// Iteration order used by `from_save_key` and tests. Keep in sync with
@@ -87,6 +94,7 @@ impl ItemKind {
                 glyph: b'P',
                 color: [180, 180, 200],
                 default_weight_g: 1_000,
+                blends_with_terrain: false,
             },
             ItemKind::Knife => ItemDef {
                 save_key: "knife",
@@ -95,6 +103,7 @@ impl ItemKind {
                 glyph: b'-',
                 color: [180, 180, 200],
                 default_weight_g: 200,
+                blends_with_terrain: false,
             },
             ItemKind::Pack => ItemDef {
                 save_key: "pack",
@@ -103,16 +112,16 @@ impl ItemKind {
                 glyph: b'[',
                 color: [130, 90, 50],
                 default_weight_g: 1_000,
+                blends_with_terrain: false,
             },
             ItemKind::Tent => ItemDef {
                 save_key: "tent",
                 name: "tent",
                 is_fungible: false,
-                // CP437 0x1E = ▲ (BLACK UP-POINTING TRIANGLE). Reads as
-                // a canvas tent silhouette much better than the prior 'A'.
                 glyph: 0x1E,
                 color: [200, 180, 140],
                 default_weight_g: 5_000,
+                blends_with_terrain: false,
             },
             ItemKind::Bedroll => ItemDef {
                 save_key: "bedroll",
@@ -121,6 +130,7 @@ impl ItemKind {
                 glyph: b'=',
                 color: [220, 200, 160],
                 default_weight_g: 2_000,
+                blends_with_terrain: false,
             },
             ItemKind::CookingPan => ItemDef {
                 save_key: "cooking_pan",
@@ -129,6 +139,7 @@ impl ItemKind {
                 glyph: b'O',
                 color: [80, 80, 90],
                 default_weight_g: 1_000,
+                blends_with_terrain: false,
             },
             ItemKind::Waterskin => ItemDef {
                 save_key: "waterskin",
@@ -136,9 +147,8 @@ impl ItemKind {
                 is_fungible: false,
                 glyph: b'u',
                 color: [100, 140, 200],
-                // Empty waterskin (no water). Use starting_pack to make a
-                // full one (1200g with water_uses=4).
                 default_weight_g: 200,
+                blends_with_terrain: false,
             },
             ItemKind::FlintAndSteel => ItemDef {
                 save_key: "flint_and_steel",
@@ -147,6 +157,7 @@ impl ItemKind {
                 glyph: b'!',
                 color: [230, 140, 60],
                 default_weight_g: 100,
+                blends_with_terrain: false,
             },
             ItemKind::Herb => ItemDef {
                 save_key: "herb",
@@ -155,7 +166,11 @@ impl ItemKind {
                 glyph: b'*',
                 color: [80, 160, 70],
                 default_weight_g: 10,
+                blends_with_terrain: false, // herbs pierce — pickable target
             },
+            // Organic detritus: blends into the floor texture so the
+            // eye glides past it. ChopTree drops firewood (which
+            // pierces) so material is still visible.
             ItemKind::Twig => ItemDef {
                 save_key: "twig",
                 name: "twig",
@@ -163,6 +178,7 @@ impl ItemKind {
                 glyph: b',',
                 color: [200, 170, 110],
                 default_weight_g: 5,
+                blends_with_terrain: true,
             },
             ItemKind::Stick => ItemDef {
                 save_key: "stick",
@@ -171,6 +187,7 @@ impl ItemKind {
                 glyph: b'/',
                 color: [200, 170, 110],
                 default_weight_g: 50,
+                blends_with_terrain: true,
             },
             ItemKind::Firewood => ItemDef {
                 save_key: "firewood",
@@ -179,6 +196,7 @@ impl ItemKind {
                 glyph: b'=',
                 color: [110, 80, 50],
                 default_weight_g: 500,
+                blends_with_terrain: false, // firewood pierces — the harvested resource
             },
             ItemKind::GrassBlade => ItemDef {
                 save_key: "grass_blade",
@@ -187,6 +205,7 @@ impl ItemKind {
                 glyph: b'"',
                 color: [80, 160, 70],
                 default_weight_g: 2,
+                blends_with_terrain: true,
             },
             ItemKind::Stone => ItemDef {
                 save_key: "stone",
@@ -195,6 +214,7 @@ impl ItemKind {
                 glyph: b'*',
                 color: [150, 150, 150],
                 default_weight_g: 200,
+                blends_with_terrain: false, // stones pierce
             },
             ItemKind::MossPatch => ItemDef {
                 save_key: "moss_patch",
@@ -203,6 +223,7 @@ impl ItemKind {
                 glyph: b'%',
                 color: [50, 100, 50],
                 default_weight_g: 10,
+                blends_with_terrain: true,
             },
             ItemKind::Mud => ItemDef {
                 save_key: "mud",
@@ -211,6 +232,7 @@ impl ItemKind {
                 glyph: b'%',
                 color: [110, 80, 50],
                 default_weight_g: 300,
+                blends_with_terrain: true,
             },
             ItemKind::Ration => ItemDef {
                 save_key: "ration",
@@ -219,6 +241,7 @@ impl ItemKind {
                 glyph: b'%',
                 color: [220, 200, 160],
                 default_weight_g: 500,
+                blends_with_terrain: false, // ration belongs in pack, not on ground
             },
         }
     }

@@ -643,8 +643,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let terrain = world.tile_at(wx, wy);
                 let terrain_def = terrain.def();
                 let mut glyph = terrain_def.glyph;
-                let mut fg = Color::RGB(terrain_def.fg[0], terrain_def.fg[1], terrain_def.fg[2]);
-                let bg = Color::RGB(terrain_def.bg[0], terrain_def.bg[1], terrain_def.bg[2]);
+                // Per-cell color gradient for walkable terrain: small
+                // hash-driven RGB offset on fg+bg so the floor reads as
+                // organic texture rather than a flat region. Unwalkable
+                // terrain (trees, water) stays flat-saturated so it
+                // pierces the floor as a visual landmark.
+                let apply_gradient =
+                    matches!(terrain, TerrainKind::Grass | TerrainKind::BareDirt | TerrainKind::SandShore);
+                let (fg_arr, bg_arr) = if apply_gradient {
+                    floor_with_gradient(terrain_def, wx as i32, wy as i32, world.seed)
+                } else {
+                    (terrain_def.fg, terrain_def.bg)
+                };
+                let mut fg = Color::RGB(fg_arr[0], fg_arr[1], fg_arr[2]);
+                let bg = Color::RGB(bg_arr[0], bg_arr[1], bg_arr[2]);
                 // Sparse grass dots: hash-driven so most grass cells
                 // render as blank background; only ~25% show '.'.
                 // Creates a sparse field-of-grass texture instead of a
@@ -672,7 +684,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             _ => top.kind.glyph_color(),
                         };
                         glyph = g;
-                        fg = Color::RGB(r, gn, b);
+                        // Blendable items mix their fg ~45% toward the
+                        // (per-cell-gradiented) terrain fg, so twigs /
+                        // grass / moss / mud read as part of the floor
+                        // texture. Stones / firewood / herbs / tools
+                        // stay full-saturation and pierce the floor.
+                        let is_blendable =
+                            !matches!(top.metadata, items::ItemMetadata::Lit { .. })
+                                && top.kind.def().blends_with_terrain;
+                        fg = if is_blendable {
+                            blend_to_terrain([r, gn, b], fg_arr, 0.45)
+                        } else {
+                            Color::RGB(r, gn, b)
+                        };
                     }
                     if wx == pwx && wy == pwy {
                         glyph = b'@';
@@ -912,6 +936,56 @@ fn build_ui_cells(
 fn push_meter(out: &mut Vec<u8>, glyph: u8, value: u8) {
     out.push(glyph);
     out.extend_from_slice(value.to_string().as_bytes());
+}
+
+/// Per-cell ±8 RGB offset on a walkable terrain's `(fg, bg)` based on a
+/// hash of `(x, y, world.seed)`. The result is the terrain's base
+/// color jittered slightly per cell so the floor reads as gradient
+/// texture instead of a flat region. Three independent hashes for R,
+/// G, B keep the variation organic rather than monochromatic.
+fn floor_with_gradient(
+    def: world::TerrainDef,
+    x: i32,
+    y: i32,
+    seed: u64,
+) -> ([u8; 3], [u8; 3]) {
+    let base = (x as i64)
+        .wrapping_mul(73_856_093)
+        .wrapping_add((y as i64).wrapping_mul(19_349_663))
+        .wrapping_add(seed as i64);
+    // Three uncorrelated mixers per channel.
+    let mr = base.wrapping_mul(2_654_435_761_i64) as i32;
+    let mg = base.wrapping_mul(40_503_i64) ^ 0x9E37_79B9;
+    let mb = base.wrapping_mul(2_246_822_519_i64) as i32;
+    // Offset range: ±8 per channel. The mod-17 maps to 0..=16; we
+    // subtract 8 to center on zero.
+    let dr = ((mr.rem_euclid(17)) - 8) as i16;
+    let dg = ((mg as i32).rem_euclid(17) - 8) as i16;
+    let db = ((mb.rem_euclid(17)) - 8) as i16;
+    let fg = [
+        (def.fg[0] as i16 + dr).clamp(0, 255) as u8,
+        (def.fg[1] as i16 + dg).clamp(0, 255) as u8,
+        (def.fg[2] as i16 + db).clamp(0, 255) as u8,
+    ];
+    let bg = [
+        (def.bg[0] as i16 + dr / 2).clamp(0, 255) as u8,
+        (def.bg[1] as i16 + dg / 2).clamp(0, 255) as u8,
+        (def.bg[2] as i16 + db / 2).clamp(0, 255) as u8,
+    ];
+    (fg, bg)
+}
+
+/// Linearly mix an item color toward a terrain fg. `mix` is the
+/// fraction of the item color retained (0.0 = pure terrain, 1.0 = pure
+/// item). Used for `blends_with_terrain` items so organic detritus
+/// merges into the floor texture instead of clashing.
+fn blend_to_terrain(item_rgb: [u8; 3], terrain_fg: [u8; 3], mix: f32) -> Color {
+    let m = mix.clamp(0.0, 1.0);
+    let one = 1.0 - m;
+    let r = (item_rgb[0] as f32 * m + terrain_fg[0] as f32 * one) as u8;
+    let g = (item_rgb[1] as f32 * m + terrain_fg[1] as f32 * one) as u8;
+    let b = (item_rgb[2] as f32 * m + terrain_fg[2] as f32 * one) as u8;
+    Color::RGB(r, g, b)
 }
 
 /// Returns true for ~25% of grass cells, deterministically per

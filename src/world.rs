@@ -197,12 +197,17 @@ impl TerrainKind {
             // desaturated on purpose so trees and water remain the
             // visual landmarks and items on the floor read with
             // contrast. See STYLE.md §2.8 / the aesthetic pass commit.
+            // Floor terrains use heavily desaturated fg toned toward
+            // their bg; the render path adds a per-cell ±8 RGB jitter
+            // (see floor_color_offset in main.rs) to make the floor
+            // read as a gradient texture rather than flat tone. Trees
+            // + water keep saturation so they pierce the field.
             TerrainKind::Grass => TerrainDef {
                 save_key: "grass",
                 name: "grass",
                 glyph: b'.',
-                fg: [40, 65, 40],
-                bg: [12, 20, 12],
+                fg: [42, 52, 42],
+                bg: [14, 22, 14],
                 walkable: true,
                 blocks_sight: false,
             },
@@ -210,7 +215,7 @@ impl TerrainKind {
                 save_key: "bare_dirt",
                 name: "dirt",
                 glyph: b'.',
-                fg: [80, 65, 45],
+                fg: [62, 52, 40],
                 bg: [18, 15, 11],
                 walkable: true,
                 blocks_sight: false,
@@ -219,8 +224,8 @@ impl TerrainKind {
                 save_key: "sand_shore",
                 name: "sand",
                 glyph: b'.',
-                fg: [140, 125, 90],
-                bg: [30, 25, 18],
+                fg: [105, 95, 72],
+                bg: [32, 27, 19],
                 walkable: true,
                 blocks_sight: false,
             },
