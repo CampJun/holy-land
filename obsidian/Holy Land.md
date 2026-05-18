@@ -42,8 +42,10 @@ kanban-plugin: board
 	Author the per-skill activity-to-XP rules (RS-style: cook food = Cooking XP, swing sword = Attack/Strength XP, etc.).
 
 
-## Planning
+## Drafts
 
+- [ ] [[Combat model comparison]]
+	Pros/cons of current AP system vs. ToME 4 energy/speed vs. DCSS auts. Pick a direction before deepening the combat draft.
 - [ ] [[Miyoo cross-compile resume]]
 	Finish Session 1/H2 — musl ARM toolchain, static SDL2, package and test on real hardware.
 - [ ] [[FOV and lighting]]
@@ -78,6 +80,11 @@ kanban-plugin: board
 	Extend `src/input.rs::Action` for power selection, target cycle, free-aim, careful-step, brace — without painting out the future analog-stick wheel.
 
 
+## Planning
+
+
+
+
 ## Implemented
 
 
@@ -99,6 +106,6 @@ kanban-plugin: board
 
 %% kanban:settings
 ```
-{"kanban-plugin":"board","list-collapse":[false,false,false,false,false]}
+{"kanban-plugin":"board","list-collapse":[false,false,false,false,false,false]}
 ```
 %%
