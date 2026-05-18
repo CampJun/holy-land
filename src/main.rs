@@ -411,6 +411,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let is_night = world.is_night();
         let tint = brightness_at(world.clock_seconds);
         let mut ui_cells = build_ui_cells(&palette, needs, day, clock_h, clock_m, is_night);
+        draw_here_line(&mut ui_cells, &world, &palette);
         if let Some(active) = world.active_action.as_ref() {
             draw_multi_turn_banner(&mut ui_cells, active, &palette);
         }
@@ -661,6 +662,41 @@ fn build_ui_cells(
 fn push_meter(out: &mut Vec<u8>, glyph: u8, value: u8) {
     out.push(glyph);
     out.extend_from_slice(value.to_string().as_bytes());
+}
+
+/// Bottom-left "what's underfoot" line. Reads the player's current
+/// cell's `items` and prints a comma-separated list (with stack counts
+/// and `(pitched)` markers) on the last row. Renders nothing when the
+/// cell is empty so empty grass doesn't get visual chrome.
+///
+/// Width budget: starts at col 1, ends before col 39. Truncates with
+/// `...` if the join overflows.
+fn draw_here_line(cells: &mut [Option<Cell>], world: &World, palette: &Palette) {
+    let pos = world.player_pos();
+    let Some(cell) = world.cell_at(pos.x as i64, pos.y as i64) else {
+        return;
+    };
+    if cell.items.is_empty() {
+        return;
+    }
+    let mut parts: Vec<String> = Vec::with_capacity(cell.items.len());
+    for item in cell.items.iter() {
+        let name = item.kind.name();
+        let label = match item.metadata {
+            items::ItemMetadata::Pitched => format!("{} (pitched)", name),
+            _ if item.count > 1 => format!("{} ({})", name, item.count),
+            _ => name.to_string(),
+        };
+        parts.push(label);
+    }
+    let mut joined = parts.join(", ");
+    let max = (WORLD_W as usize).saturating_sub(2);
+    if joined.len() > max {
+        joined.truncate(max.saturating_sub(3));
+        joined.push_str("...");
+    }
+    let row = WORLD_H as i32 - 1;
+    put_text(cells, 1, row, &joined, palette.hud_fg, palette.hud_bg);
 }
 
 fn draw_multi_turn_banner(

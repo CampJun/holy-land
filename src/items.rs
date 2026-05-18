@@ -226,6 +226,12 @@ impl ItemKind {
 pub enum ItemMetadata {
     None,
     Waterskin { water_uses: u8 },
+    /// The item is placed in the world (pitched tent, unrolled bedroll).
+    /// Renders identically to a normal ItemInstance via the glyph table
+    /// but never stack-merges, and `try_add` keeps it distinct from
+    /// pack-stored counterparts. Phase 13 reads this flag for warmth
+    /// shelter detection.
+    Pitched,
 }
 
 impl Default for ItemMetadata {
@@ -239,6 +245,7 @@ impl ItemMetadata {
         match *self {
             ItemMetadata::None => ItemMetadataSave::None,
             ItemMetadata::Waterskin { water_uses } => ItemMetadataSave::Waterskin { water_uses },
+            ItemMetadata::Pitched => ItemMetadataSave::Pitched,
         }
     }
 
@@ -246,6 +253,7 @@ impl ItemMetadata {
         match *s {
             ItemMetadataSave::None => ItemMetadata::None,
             ItemMetadataSave::Waterskin { water_uses } => ItemMetadata::Waterskin { water_uses },
+            ItemMetadataSave::Pitched => ItemMetadata::Pitched,
         }
     }
 }

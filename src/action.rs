@@ -8,7 +8,7 @@
 // `reason` names the phase that unlocks it. Reading the menu in-game is
 // a live punch-list of remaining work.
 
-use crate::items::ItemKind;
+use crate::items::{ItemInstance, ItemKind, ItemMetadata};
 use crate::needs::NeedKind;
 use crate::world::{
     World, COST_DRINK_WATERSKIN, COST_EAT_HERB, COST_EAT_RATION, COST_PICKUP,
@@ -338,24 +338,46 @@ pub fn execute(world: &mut World, id: ActionId) -> ExecuteOutcome {
 /// card.
 pub fn complete_step(world: &mut World, id: ActionId) -> Option<String> {
     match id {
-        ActionId::PitchTent => {
-            let _took = world.player_pack_mut().take_one_from_stack(ItemKind::Tent);
-            // Phase-13 will spawn a Structure { kind: Tent, pos }
-            // entity here for warmth shelter and bedroll-target
-            // anchoring. For now we just consume + log.
-            Some("tent pitched (phase 13 will place a shelter entity)".to_string())
-        }
+        ActionId::PitchTent => place_pitched_from_pack(world, ItemKind::Tent, 5_000, "tent pitched"),
         ActionId::UnrollBedroll => {
-            let _took = world
-                .player_pack_mut()
-                .take_one_from_stack(ItemKind::Bedroll);
-            Some("bedroll unrolled (phase 13 will place a sleep target)".to_string())
+            place_pitched_from_pack(world, ItemKind::Bedroll, 2_000, "bedroll unrolled")
         }
         // SetupCamp expands into PitchTent + UnrollBedroll steps in the
         // queue; complete_step is never called with SetupCamp itself.
         // Other future multi-turn verbs land their finish effects here.
         _ => None,
     }
+}
+
+/// Shared "consume one of `kind` from the pack, drop a Pitched
+/// ItemInstance on the player's cell" finisher. Used by PitchTent and
+/// UnrollBedroll; future placement verbs in phase 12+ (e.g. place pan
+/// on fire) will compose differently because the source/target shape
+/// differs.
+///
+/// Returns the success message if the consume succeeded. If the pack
+/// is empty (edge case: player's tent was removed via debug mid-action),
+/// returns None and the world is unchanged.
+fn place_pitched_from_pack(
+    world: &mut World,
+    kind: ItemKind,
+    weight_g: u32,
+    success_msg: &str,
+) -> Option<String> {
+    let took = world.player_pack_mut().take_one_from_stack(kind);
+    if !took {
+        return None;
+    }
+    let pos = world.player_pos();
+    if let Some(cell) = world.cell_at_mut(pos.x as i64, pos.y as i64) {
+        cell.items.push(ItemInstance::unique(
+            kind,
+            weight_g,
+            None,
+            ItemMetadata::Pitched,
+        ));
+    }
+    Some(success_msg.to_string())
 }
 
 /// Shape shared by every "consume one source unit, restore one need"
@@ -549,6 +571,56 @@ mod tests {
             other => panic!("expected Waterskin metadata, got {:?}", other),
         }
         assert_eq!(drained.weight_g_each, 950);
+    }
+
+    #[test]
+    fn complete_pitch_tent_places_pitched_item_on_player_cell() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let pos = world.player_pos();
+        // Force the spawn cell empty so the assertion isolates the new
+        // pitched item (the spawn cell has no debris by default but be
+        // explicit).
+        let pre_count = world
+            .cell_at(pos.x as i64, pos.y as i64)
+            .map(|c| c.items.len())
+            .unwrap_or(0);
+
+        let msg = complete_step(&mut world, ActionId::PitchTent);
+        assert_eq!(msg.as_deref(), Some("tent pitched"));
+
+        let cell = world
+            .cell_at(pos.x as i64, pos.y as i64)
+            .expect("player's cell exists");
+        assert_eq!(cell.items.len(), pre_count + 1);
+        let pitched = cell
+            .items
+            .iter()
+            .find(|i| i.kind == ItemKind::Tent)
+            .expect("tent on cell");
+        assert!(matches!(pitched.metadata, ItemMetadata::Pitched));
+
+        // Pack lost one Tent in exchange.
+        assert!(!world.player_pack().has_stack(ItemKind::Tent));
+    }
+
+    #[test]
+    fn complete_pitch_tent_noop_when_pack_empty() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Drain all tents first.
+        while world.player_pack_mut().take_one_from_stack(ItemKind::Tent) {}
+        let pos = world.player_pos();
+        let pre_items = world
+            .cell_at(pos.x as i64, pos.y as i64)
+            .map(|c| c.items.len())
+            .unwrap_or(0);
+
+        let msg = complete_step(&mut world, ActionId::PitchTent);
+        assert!(msg.is_none(), "no pack tent -> no placement");
+        let post_items = world
+            .cell_at(pos.x as i64, pos.y as i64)
+            .map(|c| c.items.len())
+            .unwrap_or(0);
+        assert_eq!(pre_items, post_items);
     }
 
     #[test]

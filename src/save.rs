@@ -186,6 +186,8 @@ pub enum ItemMetadataSave {
     Waterskin {
         water_uses: u8,
     },
+    /// Item is placed in the world (pitched tent, unrolled bedroll).
+    Pitched,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
