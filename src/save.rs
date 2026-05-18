@@ -89,6 +89,11 @@ pub struct RunSave {
     pub clock_seconds: u64,
     #[serde(default)]
     pub needs: NeedsSave,
+    // Phase 6 (additive): explored cells from FOV memory. Sparse
+    // (Vec<(x, y)>) since slice 1 is one chunk; can switch to bit-packed
+    // per chunk later if explored sets get big.
+    #[serde(default)]
+    pub explored_cells: Vec<(i32, i32)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -121,6 +126,7 @@ impl RunSave {
             cell_items: Vec::new(),
             clock_seconds: 0,
             needs: NeedsSave::default(),
+            explored_cells: Vec::new(),
         }
     }
 }
@@ -277,6 +283,7 @@ mod tests {
                 sleep_acc_secs: 0,
                 warmth_acc_secs: 0,
             },
+            explored_cells: Vec::new(),
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
@@ -343,10 +350,12 @@ mod tests {
             cell_items,
             clock_seconds: 0,
             needs: NeedsSave::default(),
+            explored_cells: vec![(21, 15), (22, 16)],
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
         assert_eq!(loaded.pack.capacity_g, 15_000);
+        assert_eq!(loaded.explored_cells, vec![(21, 15), (22, 16)]);
         assert_eq!(loaded.pack.contents.len(), 3);
         assert_eq!(loaded.pack.contents[0].kind, "axe");
         assert_eq!(loaded.pack.contents[1].kind, "waterskin");

@@ -1,5 +1,6 @@
 #[cfg(not(target_arch = "arm"))]
 mod debug_console;
+mod fov;
 mod input;
 mod items;
 mod logging;
@@ -160,6 +161,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 warmth_acc_secs: run.needs.warmth_acc_secs,
             });
         }
+        if !run.explored_cells.is_empty() {
+            world.restore_explored(&run.explored_cells);
+        }
+        // Recompute FOV after restoring position so the visible set is
+        // correct for the loaded clock + player coord. (World::new already
+        // did a recompute, but the loaded position may differ.)
+        world.recompute_fov();
     }
 
     // Track dawn crossings for auto-save-on-dawn. Init from the (possibly
@@ -273,26 +281,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for vx in 0..WORLD_W as i32 {
                 let wx = cam_x + vx as i64;
                 let wy = cam_y + vy as i64;
+                // Base terrain glyph.
                 let (mut glyph, mut fg, bg) = match world.tile_at(wx, wy) {
                     TerrainKind::Floor => (b'.', palette.floor_fg, palette.floor_bg),
                     TerrainKind::Wall => (b'#', palette.wall_fg, palette.wall_bg),
                 };
-                // Ground items override terrain glyph; topmost stack wins.
-                if let Some(cell) = world.cell_at(wx, wy) {
-                    if let Some(top) = cell.items.last() {
+                let cell_state = world.cell_at(wx, wy);
+                let visible = cell_state.map(|c| c.visible).unwrap_or(false);
+                let explored = cell_state.map(|c| c.explored).unwrap_or(false);
+
+                // Items + player only render when the cell is currently
+                // visible. Memory of explored-but-unseen cells shows
+                // terrain only.
+                if visible {
+                    if let Some(top) = cell_state.and_then(|c| c.items.last()) {
                         let (g, [r, gn, b]) = top.kind.glyph_color();
                         glyph = g;
                         fg = Color::RGB(r, gn, b);
                     }
+                    if wx == pwx && wy == pwy {
+                        glyph = b'@';
+                        fg = palette.player_fg;
+                    }
                 }
-                if wx == pwx && wy == pwy {
-                    glyph = b'@';
-                    fg = palette.player_fg;
-                }
-                // Apply day/night tint to world cells. UI cells (HUD)
-                // overlay at full brightness below.
-                let fg = tint_color(fg, tint);
-                let bg = tint_color(bg, tint);
+
+                // Three visibility levels modulate brightness:
+                //   visible:   full color + day/night tint
+                //   explored:  fixed dim (25%) regardless of clock
+                //   neither:   black
+                let cell_brightness = if visible {
+                    tint
+                } else if explored {
+                    0.25
+                } else {
+                    0.0
+                };
+                let fg = tint_color(fg, cell_brightness);
+                let bg = tint_color(bg, cell_brightness);
                 let mut cell = Cell { glyph, fg, bg };
                 let i = (vy as u32 * WORLD_W + vx as u32) as usize;
                 if let Some(ui_cell) = ui_cells[i] {
@@ -401,6 +426,7 @@ fn save_game(
         sleep_acc_secs: n.sleep_acc_secs,
         warmth_acc_secs: n.warmth_acc_secs,
     };
+    run.explored_cells = world.snapshot_explored();
     if let Err(e) = save::save_atomic(&save_dir.join(RUN_FILE), &run) {
         log_info!("run save failed: {}", e);
     } else {

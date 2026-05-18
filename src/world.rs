@@ -40,6 +40,11 @@ pub const DUSK_HOUR: u64 = 20;
 pub const COST_MOVE_TILE: u32 = 5;
 pub const COST_PICKUP: u32 = 3;
 
+/// FOV radii. Phase-10 adds a fire-light-source bump for night cells
+/// within 5 of a lit fire.
+pub const FOV_RADIUS_DAY: i32 = 20;
+pub const FOV_RADIUS_NIGHT: i32 = 3;
+
 /// Day/night dimming endpoints. Floor stays at 0.4 so nothing goes pitch
 /// black before FOV+fires (phase 6+10) reach gameplay.
 const TINT_DAY: f32 = 1.0;
@@ -101,6 +106,12 @@ pub enum TerrainKind {
 pub struct CellState {
     pub terrain: TerrainKind,
     pub items: Vec<ItemInstance>,
+    /// Currently in the player's FOV. Recomputed on move + day/night flip;
+    /// not persisted.
+    pub visible: bool,
+    /// Has been visible at least once. Persisted across save/load via
+    /// `RunSave.explored_cells`.
+    pub explored: bool,
 }
 
 impl CellState {
@@ -108,12 +119,16 @@ impl CellState {
         Self {
             terrain: TerrainKind::Floor,
             items: Vec::new(),
+            visible: false,
+            explored: false,
         }
     }
     fn wall() -> Self {
         Self {
             terrain: TerrainKind::Wall,
             items: Vec::new(),
+            visible: false,
+            explored: false,
         }
     }
 }
@@ -198,6 +213,9 @@ impl World {
         if let Some(c) = world.chunks.get_mut(&origin) {
             c.dirty = false;
         }
+        // First-frame FOV so the renderer doesn't draw a black screen on
+        // the very first paint.
+        world.recompute_fov();
         world
     }
 
@@ -260,6 +278,7 @@ impl World {
         if matches!(self.tile_at(nx as i64, ny as i64), TerrainKind::Floor) {
             self.set_player_pos(Position { x: nx, y: ny });
             self.spend_action_time(COST_MOVE_TILE);
+            self.recompute_fov();
         }
     }
 
@@ -311,8 +330,10 @@ impl World {
 
     /// Advance the game-time clock by an action's cost and apply needs
     /// decay. Cost is amplified by any active need penalty (worst-need
-    /// wins, +20% / +50%).
+    /// wins, +20% / +50%). Recomputes FOV when the clock crosses the
+    /// day/night boundary because the visibility radius changes.
     pub fn spend_action_time(&mut self, base_cost: u32) {
+        let was_night = self.is_night();
         let needs = self.player_needs();
         let penalty_pct = needs.action_cost_penalty_pct();
         let elapsed = base_cost.saturating_add(base_cost * penalty_pct / 100);
@@ -321,6 +342,82 @@ impl World {
         let mut needs = self.player_needs();
         needs.tick(elapsed, env);
         self.set_player_needs(needs);
+        if self.is_night() != was_night {
+            self.recompute_fov();
+        }
+    }
+
+    /// Reset visibility flags across loaded chunks and cast FOV from the
+    /// player's current position. Radius depends on day/night. Also marks
+    /// newly-seen cells as `explored` so the renderer can show them dimmed
+    /// after the player walks away.
+    pub fn recompute_fov(&mut self) {
+        let origin = self.player_pos();
+        let radius = if self.is_night() {
+            FOV_RADIUS_NIGHT
+        } else {
+            FOV_RADIUS_DAY
+        };
+
+        // Snapshot blockers in a square around the origin so the closure
+        // passed to fov::compute_visible doesn't need to borrow self
+        // alongside the later cell_at_mut visits.
+        let mut blockers = std::collections::HashSet::new();
+        for dy in -(radius + 1)..=(radius + 1) {
+            for dx in -(radius + 1)..=(radius + 1) {
+                let wx = origin.x as i64 + dx as i64;
+                let wy = origin.y as i64 + dy as i64;
+                if matches!(self.tile_at(wx, wy), TerrainKind::Wall) {
+                    blockers.insert((origin.x + dx, origin.y + dy));
+                }
+            }
+        }
+
+        // Reset visible flags on every loaded cell.
+        for chunk in self.chunks.values_mut() {
+            for cell in chunk.cells.iter_mut() {
+                cell.visible = false;
+            }
+        }
+
+        let visible = crate::fov::compute_visible((origin.x, origin.y), radius, |x, y| {
+            blockers.contains(&(x, y))
+        });
+
+        for (x, y) in visible {
+            if let Some(cell) = self.cell_at_mut(x as i64, y as i64) {
+                cell.visible = true;
+                cell.explored = true;
+            }
+        }
+    }
+
+    /// Snapshot all explored cells in loaded chunks for save serialization.
+    pub fn snapshot_explored(&self) -> Vec<(i32, i32)> {
+        let mut out = Vec::new();
+        for (coord, chunk) in &self.chunks {
+            for (i, cell) in chunk.cells.iter().enumerate() {
+                if !cell.explored {
+                    continue;
+                }
+                let lx = i as u32 % CHUNK_W;
+                let ly = i as u32 / CHUNK_W;
+                let wx = coord.cx * CHUNK_W as i32 + lx as i32;
+                let wy = coord.cy * CHUNK_H as i32 + ly as i32;
+                out.push((wx, wy));
+            }
+        }
+        out
+    }
+
+    /// Restore explored bits from a save. Coords outside loaded chunks are
+    /// silently ignored.
+    pub fn restore_explored(&mut self, coords: &[(i32, i32)]) {
+        for &(wx, wy) in coords {
+            if let Some(cell) = self.cell_at_mut(wx as i64, wy as i64) {
+                cell.explored = true;
+            }
+        }
     }
 
     pub fn player_pack(&self) -> hecs::Ref<'_, Pack> {
@@ -628,6 +725,67 @@ mod tests {
 
         world.try_move_player(1, 0);
         assert_eq!(world.clock_seconds, STARTING_CLOCK_SECONDS + 5);
+    }
+
+    #[test]
+    fn initial_fov_covers_floor_around_spawn() {
+        let world = World::new(CHUNK_W, CHUNK_H);
+        // Adjacent floor cells must be visible at spawn.
+        for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+            let cell = world.cell_at(20 + dx, 15 + dy).expect("cell");
+            assert!(cell.visible, "({}, {}) should be visible at spawn", dx, dy);
+            assert!(cell.explored);
+        }
+    }
+
+    #[test]
+    fn moving_marks_new_cells_explored() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Walk east until something far isn't yet explored, then check
+        // that walking towards it explores it.
+        let before = world.cell_at(35, 15).expect("cell").explored;
+        // 35 - 20 = 15 cells east of spawn; with radius 20 day this is
+        // already visible from spawn.
+        assert!(before, "(35, 15) is within initial day-radius 20");
+
+        // Far cell well past the chunk: at world coord (50, 15) tile_at
+        // returns Wall (unloaded). Still, walking 10 east doesn't change
+        // exploration of out-of-chunk cells.
+        world.try_move_player(1, 0);
+        assert!(world.cell_at(35, 15).expect("cell").explored);
+    }
+
+    #[test]
+    fn night_fov_radius_is_tight() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Jump clock to 22:00, well into night.
+        world.clock_seconds = 22 * 3600;
+        world.recompute_fov();
+        // A cell 5 east of spawn (25, 15) should NOT be visible at night
+        // radius 3.
+        let far = world.cell_at(25, 15).expect("cell");
+        assert!(!far.visible, "night FOV radius is 3; (25, 15) is 5 away");
+        // A cell 2 east is within radius 3.
+        let close = world.cell_at(22, 15).expect("cell");
+        assert!(close.visible);
+    }
+
+    #[test]
+    fn explored_snapshot_round_trips() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let snap = world.snapshot_explored();
+        assert!(!snap.is_empty(), "spawn should explore at least the FOV disc");
+
+        // Clear all explored bits.
+        for chunk in world.chunks.values_mut() {
+            for cell in chunk.cells.iter_mut() {
+                cell.explored = false;
+            }
+        }
+        assert!(!world.cell_at(20, 15).expect("cell").explored);
+
+        world.restore_explored(&snap);
+        assert!(world.cell_at(20, 15).expect("cell").explored);
     }
 
     #[test]

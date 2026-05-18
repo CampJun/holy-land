@@ -144,6 +144,8 @@ pub fn apply_debug_command(world: &mut World, cmd: DebugCommand) {
             // which can rewind if the current time is already past 06:00.
             let day_offset = world.clock_seconds / DAY_LENGTH_SECONDS * DAY_LENGTH_SECONDS;
             world.clock_seconds = day_offset + h as u64 * 3600 + m as u64 * 60;
+            // Day/night radius may have changed; refresh FOV.
+            world.recompute_fov();
             crate::log_info!(
                 "[debug] time set to {:02}:{:02} day {} (clock {}s)",
                 h,
@@ -155,6 +157,7 @@ pub fn apply_debug_command(world: &mut World, cmd: DebugCommand) {
 
         DebugCommand::AdvanceSecs(secs) => {
             world.clock_seconds = world.clock_seconds.saturating_add(secs as u64);
+            world.recompute_fov();
             let (h, m) = world.clock_hm();
             crate::log_info!(
                 "[debug] advanced {}s -> {:02}:{:02} day {}",
@@ -194,6 +197,7 @@ pub fn apply_debug_command(world: &mut World, cmd: DebugCommand) {
 
         DebugCommand::Teleport(x, y) => {
             world.set_player_pos(Position { x, y });
+            world.recompute_fov();
             crate::log_info!("[debug] teleported to ({}, {})", x, y);
         }
     }
