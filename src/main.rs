@@ -302,6 +302,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // phases.
     let mut info_menu: Option<InfoMenuState> = None;
 
+    // Dev tool: X-button toggles a CP437 glyph palette overlay so we
+    // can audit which bytes have which sprites in our custom atlas.
+    // Browse with dpad; the header shows the highlighted byte's value
+    // so we can pick replacements for the items.rs / world.rs glyph
+    // fields.
+    let mut glyph_palette: Option<u8> = None;
+
     #[cfg(not(target_arch = "arm"))]
     let debug = debug_console::DebugConsole::spawn();
 
@@ -379,6 +386,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Action::B | Action::Start => {
                         pause_menu = None;
                     }
+                    _ => {}
+                }
+                continue;
+            }
+
+            // Dev glyph-palette overlay (X). Highest non-pause priority
+            // so it overlays whatever else is open.
+            if let Some(cursor) = glyph_palette {
+                match input_action {
+                    Action::Up => glyph_palette = Some(cursor.wrapping_sub(16)),
+                    Action::Down => glyph_palette = Some(cursor.wrapping_add(16)),
+                    Action::Left => glyph_palette = Some(cursor.wrapping_sub(1)),
+                    Action::Right => glyph_palette = Some(cursor.wrapping_add(1)),
+                    Action::B | Action::X => glyph_palette = None,
+                    Action::Start => pause_menu = Some(0),
                     _ => {}
                 }
                 continue;
@@ -517,6 +539,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Action::Y => {
                     command_menu = Some(0);
                 }
+                Action::X => {
+                    // Dev: open the CP437 glyph palette overlay.
+                    glyph_palette = Some(0);
+                }
                 Action::Start => {
                     pause_menu = Some(0);
                 }
@@ -623,6 +649,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(state) = info_menu.as_ref() {
             draw_info_menu(&mut ui_cells, &world, state, &palette);
+        }
+        if let Some(cursor) = glyph_palette {
+            draw_glyph_palette(&mut ui_cells, cursor, &palette);
         }
         if let Some(selected) = pause_menu {
             draw_pause_menu(&mut ui_cells, selected, &palette);
@@ -1158,6 +1187,74 @@ fn draw_menu_row(
         let truncated: String = status.chars().take(max_status_len).collect();
         let status_x = layout.inner_right() - truncated.len() as i32;
         put_text(cells, status_x, row_y, &truncated, status_fg, palette.panel_bg);
+    }
+}
+
+/// Dev overlay: render every CP437 byte (0x00–0xFF) in a 16x16 grid so
+/// we can audit what's actually in our custom atlas. The cursor byte
+/// is inverted (bg <-> fg) and shown in the header. Dpad navigates
+/// (wraps); B/X closes.
+fn draw_glyph_palette(cells: &mut [Option<Cell>], cursor: u8, palette: &Palette) {
+    let layout = PanelLayout::centered(36, 24);
+    let cur_row = cursor >> 4;
+    let cur_col = cursor & 0x0F;
+    let title = format!(
+        "CP437 0x{:02X} (row {:X}, col {:X})",
+        cursor, cur_row, cur_col
+    );
+    draw_panel_frame(
+        cells,
+        &layout,
+        &title,
+        "dpad: navigate   B/X: close",
+        palette,
+    );
+
+    // The grid sits at first_row_y, taking 16 rows x 16 columns. We
+    // also draw thin row/column labels in hex above and beside the
+    // grid so the player can read coords without counting.
+    let grid_x = layout.inner_x() + 2; // leave 2 cols for row labels
+    let grid_y = layout.first_row_y() + 1; // row above is column header
+
+    // Column header row.
+    for col in 0..16u8 {
+        put_text(
+            cells,
+            grid_x + col as i32,
+            grid_y - 1,
+            &format!("{:X}", col),
+            palette.panel_dim_fg,
+            palette.panel_bg,
+        );
+    }
+
+    // Row labels + cells.
+    for row in 0..16u8 {
+        put_text(
+            cells,
+            layout.inner_x(),
+            grid_y + row as i32,
+            &format!("{:X}", row),
+            palette.panel_dim_fg,
+            palette.panel_bg,
+        );
+        for col in 0..16u8 {
+            let byte = (row << 4) | col;
+            let is_cursor = byte == cursor;
+            // Render the glyph at its real byte index. Inversion on
+            // the cursor cell (bg as fg, fg as bg) so it stands out.
+            let (fg, bg) = if is_cursor {
+                (palette.panel_bg, palette.panel_fg)
+            } else {
+                (palette.panel_fg, palette.panel_bg)
+            };
+            put_cell(
+                cells,
+                grid_x + col as i32,
+                grid_y + row as i32,
+                Cell { glyph: byte, fg, bg },
+            );
+        }
     }
 }
 
