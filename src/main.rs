@@ -19,7 +19,7 @@ use items::{ItemInstance, Pack};
 use needs::Needs;
 use render::{draw_glyph, load_atlas, CELL_SIZE};
 use save::{CellItemsSave, MetaSave, NeedsSave, RunSave, SaveHeader};
-use world::{Position, TerrainKind, World};
+use world::{brightness_at, dawns_elapsed, Position, TerrainKind, World};
 
 const WORLD_W: u32 = 40;
 const WORLD_H: u32 = 30;
@@ -154,6 +154,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Track dawn crossings for auto-save-on-dawn. Init from the (possibly
+    // loaded) clock so a loaded save mid-day doesn't immediately re-save.
+    let mut last_dawn_idx = dawns_elapsed(world.clock_seconds);
+
     let palette = Palette::default();
 
     // B-style per-cell diff renderer. `prev_cells` mirrors what we last painted
@@ -207,6 +211,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // Auto-save on dawn crossing. dawns_elapsed monotonically counts
+        // 06:00 boundaries since the game-time epoch; an increment means
+        // the player just stepped past one.
+        let now_dawn_idx = dawns_elapsed(world.clock_seconds);
+        if now_dawn_idx > last_dawn_idx {
+            eprintln!(
+                "auto-save: crossed dawn (day {} -> {})",
+                last_dawn_idx, now_dawn_idx
+            );
+            last_dawn_idx = now_dawn_idx;
+            save_game(
+                &save_dir,
+                &mut meta,
+                &world,
+                &mut prev_meta_header,
+                &mut prev_run_header,
+            );
+        }
+
         // Camera in world coords. While the world fits the viewport we anchor
         // at (0, 0); when the world grows beyond the viewport, switch this to
         //   let cam_x = player.x as i64 - WORLD_W as i64 / 2;
@@ -217,24 +240,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let player = world.player_pos();
         let pwx = player.x as i64;
         let pwy = player.y as i64;
-        let (pack_weight_g, pack_capacity_g) = {
-            let p = world.player_pack();
-            (p.total_weight_g(), p.capacity_g)
-        };
         let needs = world.player_needs();
         let (clock_h, clock_m) = world.clock_hm();
         let day = world.day_count();
         let is_night = world.is_night();
-        let ui_cells = build_ui_cells(
-            &palette,
-            pack_weight_g,
-            pack_capacity_g,
-            needs,
-            day,
-            clock_h,
-            clock_m,
-            is_night,
-        );
+        let tint = brightness_at(world.clock_seconds);
+        let ui_cells = build_ui_cells(&palette, needs, day, clock_h, clock_m, is_night);
 
         let draw_start = Instant::now();
         let mut changed_cells = 0;
@@ -262,6 +273,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     glyph = b'@';
                     fg = palette.player_fg;
                 }
+                // Apply day/night tint to world cells. UI cells (HUD)
+                // overlay at full brightness below.
+                let fg = tint_color(fg, tint);
+                let bg = tint_color(bg, tint);
                 let mut cell = Cell { glyph, fg, bg };
                 let i = (vy as u32 * WORLD_W + vx as u32) as usize;
                 if let Some(ui_cell) = ui_cells[i] {
@@ -384,11 +399,15 @@ fn save_game(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// CP437 byte glyphs used in the HUD; can't be embedded in Rust string
+/// literals because the source is UTF-8 and `put_text` writes raw bytes.
+const HUD_GLYPH_THIRST: u8 = 0xF7; // ≈ wavy water
+const HUD_GLYPH_HUNGER: u8 = b'%'; // matches the ration ground-item glyph
+const HUD_GLYPH_SLEEP: u8 = b'z'; // classic Z's
+const HUD_GLYPH_WARMTH: u8 = 0x0F; // ☼ sun / fire
+
 fn build_ui_cells(
     palette: &Palette,
-    pack_weight_g: u32,
-    pack_capacity_g: u32,
     needs: Needs,
     day: u64,
     clock_h: u8,
@@ -397,32 +416,57 @@ fn build_ui_cells(
 ) -> Vec<Option<Cell>> {
     let mut cells = vec![None; (WORLD_W * WORLD_H) as usize];
 
-    // Row 1: "Day N  HH:MM (day/night)"      "Pack X.X / X.X kg"
+    // Left side: "Day N HH:MM day|night".
     let suffix = if is_night { "night" } else { "day" };
     let left = format!("Day {} {:02}:{:02} {}", day, clock_h, clock_m, suffix);
     put_text(&mut cells, 1, 1, &left, palette.hud_fg, palette.hud_bg);
-    let weight = format!(
-        "Pack {:.1} / {:.1} kg",
-        pack_weight_g as f32 / 1000.0,
-        pack_capacity_g as f32 / 1000.0
-    );
-    let weight_x = WORLD_W as i32 - weight.len() as i32 - 1;
-    put_text(&mut cells, weight_x, 1, &weight, palette.hud_fg, palette.hud_bg);
 
-    // Row 2: four need meters with a critical-color shift.
-    let meters = format!(
-        "Thirst {:3}  Hunger {:3}  Sleep {:3}  Warmth {:3}",
-        needs.thirst, needs.hunger, needs.sleep, needs.warmth
-    );
-    let critical = needs.thirst.min(needs.hunger).min(needs.sleep).min(needs.warmth) < 25;
+    // Right side: four CP437 need meters, right-aligned. Compose to a
+    // Vec<u8> first so the layout shifts cleanly as warmth flips between
+    // 100 (3 digits) and < 100 (2 digits).
+    let mut bytes: Vec<u8> = Vec::with_capacity(20);
+    push_meter(&mut bytes, HUD_GLYPH_THIRST, needs.thirst);
+    bytes.push(b' ');
+    push_meter(&mut bytes, HUD_GLYPH_HUNGER, needs.hunger);
+    bytes.push(b' ');
+    push_meter(&mut bytes, HUD_GLYPH_SLEEP, needs.sleep);
+    bytes.push(b' ');
+    push_meter(&mut bytes, HUD_GLYPH_WARMTH, needs.warmth);
+    let critical = needs
+        .thirst
+        .min(needs.hunger)
+        .min(needs.sleep)
+        .min(needs.warmth)
+        < 25;
     let fg = if critical {
         palette.need_critical_fg
     } else {
         palette.hud_fg
     };
-    put_text(&mut cells, 1, 2, &meters, fg, palette.hud_bg);
+    let x = WORLD_W as i32 - bytes.len() as i32 - 1;
+    put_bytes(&mut cells, x, 1, &bytes, fg, palette.hud_bg);
 
     cells
+}
+
+fn push_meter(out: &mut Vec<u8>, glyph: u8, value: u8) {
+    out.push(glyph);
+    out.extend_from_slice(value.to_string().as_bytes());
+}
+
+fn put_bytes(cells: &mut [Option<Cell>], x: i32, y: i32, bytes: &[u8], fg: Color, bg: Color) {
+    for (i, &b) in bytes.iter().enumerate() {
+        put_cell(cells, x + i as i32, y, Cell { glyph: b, fg, bg });
+    }
+}
+
+fn tint_color(c: Color, t: f32) -> Color {
+    Color::RGBA(
+        (c.r as f32 * t) as u8,
+        (c.g as f32 * t) as u8,
+        (c.b as f32 * t) as u8,
+        c.a,
+    )
 }
 
 fn put_text(cells: &mut [Option<Cell>], x: i32, y: i32, text: &str, fg: Color, bg: Color) {

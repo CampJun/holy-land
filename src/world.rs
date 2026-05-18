@@ -40,6 +40,51 @@ pub const DUSK_HOUR: u64 = 20;
 pub const COST_MOVE_TILE: u32 = 5;
 pub const COST_PICKUP: u32 = 3;
 
+/// Day/night dimming endpoints. Floor stays at 0.4 so nothing goes pitch
+/// black before FOV+fires (phase 6+10) reach gameplay.
+const TINT_DAY: f32 = 1.0;
+const TINT_NIGHT: f32 = 0.4;
+/// Linear-blend windows around the dusk/dawn transitions. The mechanical
+/// is_night boundary stays sharp at 20:00 / 06:00; the visual blend is
+/// centered on those boundaries so dusk darkens over an hour.
+const DUSK_START_SECS: u64 = 19 * 3600 + 1800; // 19:30
+const DUSK_END_SECS: u64 = 20 * 3600 + 1800; // 20:30
+const DAWN_START_SECS: u64 = 5 * 3600 + 1800; // 05:30
+const DAWN_END_SECS: u64 = 6 * 3600 + 1800; // 06:30
+
+/// Whole-screen brightness multiplier in `[TINT_NIGHT, TINT_DAY]` derived
+/// from the in-game time of day. Pure function of `clock_seconds`; render
+/// applies it per cell.
+pub fn brightness_at(clock_seconds: u64) -> f32 {
+    let tod = clock_seconds % DAY_LENGTH_SECONDS;
+    if tod < DAWN_START_SECS {
+        TINT_NIGHT
+    } else if tod < DAWN_END_SECS {
+        let t = (tod - DAWN_START_SECS) as f32 / (DAWN_END_SECS - DAWN_START_SECS) as f32;
+        TINT_NIGHT + (TINT_DAY - TINT_NIGHT) * t
+    } else if tod < DUSK_START_SECS {
+        TINT_DAY
+    } else if tod < DUSK_END_SECS {
+        let t = (tod - DUSK_START_SECS) as f32 / (DUSK_END_SECS - DUSK_START_SECS) as f32;
+        TINT_DAY + (TINT_NIGHT - TINT_DAY) * t
+    } else {
+        TINT_NIGHT
+    }
+}
+
+/// Monotonically-increasing count of dawn crossings since the game-time
+/// epoch (`clock_seconds = 0`, midnight of "day 0"). A 14:00 spawn returns
+/// 1 (day-1 dawn has already passed). Crossing 06:00 of the next day
+/// bumps the count; main loop uses this to fire the auto-save-on-dawn.
+pub fn dawns_elapsed(clock_seconds: u64) -> u64 {
+    const DAWN_OFFSET: u64 = 6 * 3600;
+    if clock_seconds < DAWN_OFFSET {
+        0
+    } else {
+        (clock_seconds - DAWN_OFFSET) / DAY_LENGTH_SECONDS + 1
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ChunkCoord {
     pub cx: i32,
@@ -583,6 +628,41 @@ mod tests {
 
         world.try_move_player(1, 0);
         assert_eq!(world.clock_seconds, STARTING_CLOCK_SECONDS + 5);
+    }
+
+    #[test]
+    fn brightness_at_known_times() {
+        // Noon: full day.
+        assert!((brightness_at(12 * 3600) - 1.0).abs() < 1e-6);
+        // Midnight: full night.
+        assert!((brightness_at(0) - 0.4).abs() < 1e-6);
+        // Start of dusk: still day.
+        assert!((brightness_at(19 * 3600 + 1800) - 1.0).abs() < 1e-6);
+        // Middle of dusk: midpoint.
+        assert!((brightness_at(20 * 3600) - 0.7).abs() < 1e-3);
+        // End of dusk: full night.
+        assert!((brightness_at(20 * 3600 + 1800) - 0.4).abs() < 1e-6);
+        // Middle of dawn: midpoint.
+        assert!((brightness_at(6 * 3600) - 0.7).abs() < 1e-3);
+        // End of dawn: full day.
+        assert!((brightness_at(6 * 3600 + 1800) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dawns_elapsed_counts_each_06_00_crossing() {
+        // Before day-1 dawn: 0 dawns elapsed.
+        assert_eq!(dawns_elapsed(0), 0);
+        assert_eq!(dawns_elapsed(6 * 3600 - 1), 0);
+        // At day-1 dawn exactly: 1.
+        assert_eq!(dawns_elapsed(6 * 3600), 1);
+        // 14:00 day 1 (player spawn): 1.
+        assert_eq!(dawns_elapsed(STARTING_CLOCK_SECONDS), 1);
+        // Day-2 dawn: 2.
+        assert_eq!(dawns_elapsed(86400 + 6 * 3600), 2);
+        // Day-2 noon: still 2.
+        assert_eq!(dawns_elapsed(86400 + 12 * 3600), 2);
+        // Day-3 dawn: 3.
+        assert_eq!(dawns_elapsed(2 * 86400 + 6 * 3600), 3);
     }
 
     #[test]
