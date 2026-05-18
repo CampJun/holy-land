@@ -10,10 +10,6 @@ kanban-plugin: board
 
 ## Drafts
 
-- [ ] [[Survival - Chunk and per-cell items]]
-	Single-chunk world + per-cell item lists. The storage substrate everything else sits on.
-- [ ] [[Survival - ItemInstance and weights]]
-	Replace stack-based inventory with `Vec<ItemInstance>`; per-item weight grams + 15kg pack cap.
 - [ ] [[Survival - Game time clock and needs]]
 	Per-action game clock + four needs (Thirst, Hunger, Sleep, Warmth). Death enabled at 0.
 - [ ] [[Survival - Day night cycle]]
@@ -46,6 +42,10 @@ kanban-plugin: board
 
 ## Implemented
 
+- [ ] [[Survival - Chunk and per-cell items]]
+	Single-chunk world + per-cell item lists. The storage substrate everything else sits on. **Phase 3 shipped on cd440a2.**
+- [ ] [[Survival - ItemInstance and weights]]
+	`Vec<ItemInstance>` (stackable fungibles, unique uniques) + per-item weight grams + 15kg pack cap. **Phase 3 shipped on cd440a2.**
 
 
 ## Playtest
