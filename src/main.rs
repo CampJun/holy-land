@@ -975,7 +975,11 @@ fn build_ui_cells(
     let meters: [(u8, Color, u8); 4] = [
         (HUD_GLYPH_THIRST, pick(Color::RGB(180, 140, 90)), needs.thirst),
         (HUD_GLYPH_HUNGER, pick(Color::RGB(220, 180, 110)), needs.hunger),
-        (HUD_GLYPH_SLEEP, pick(palette.hud_fg), needs.sleep),
+        // Near-white fg lets the atlas's intrinsic colors come
+        // through if the bed sprite is pre-painted (e.g. brown frame
+        // + red blanket). If the atlas bed is grayscale instead, we
+        // need to implement luminance-banded tinting.
+        (HUD_GLYPH_SLEEP, pick(Color::RGB(240, 240, 240)), needs.sleep),
         (HUD_GLYPH_WARMTH, pick(Color::RGB(240, 195, 80)), needs.warmth),
     ];
     // Pre-compute total width so we right-align.
