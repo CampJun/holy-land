@@ -12,6 +12,7 @@ use crate::items::ItemKind;
 use crate::needs::NeedKind;
 use crate::world::{
     World, COST_DRINK_WATERSKIN, COST_EAT_HERB, COST_EAT_RATION, COST_PICKUP,
+    COST_PITCH_TENT, COST_UNROLL_BEDROLL,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,9 +27,54 @@ pub enum ActionId {
     PickHerb,
     PitchTent,
     UnrollBedroll,
+    SetupCamp,
     StartFire,
     Sleep,
     Fishing,
+}
+
+impl ActionId {
+    /// Stable string key for save round-tripping (ActiveActionSave). Keep
+    /// in sync with `from_save_key`. Mirrors the ItemKind::save_key
+    /// pattern.
+    pub fn save_key(self) -> &'static str {
+        match self {
+            ActionId::Pickup => "pickup",
+            ActionId::DrinkFromStream => "drink_from_stream",
+            ActionId::FillWaterskin => "fill_waterskin",
+            ActionId::DrinkWaterskin => "drink_waterskin",
+            ActionId::EatRation => "eat_ration",
+            ActionId::EatHerb => "eat_herb",
+            ActionId::ChopTree => "chop_tree",
+            ActionId::PickHerb => "pick_herb",
+            ActionId::PitchTent => "pitch_tent",
+            ActionId::UnrollBedroll => "unroll_bedroll",
+            ActionId::SetupCamp => "setup_camp",
+            ActionId::StartFire => "start_fire",
+            ActionId::Sleep => "sleep",
+            ActionId::Fishing => "fishing",
+        }
+    }
+
+    pub fn from_save_key(s: &str) -> Option<Self> {
+        Some(match s {
+            "pickup" => ActionId::Pickup,
+            "drink_from_stream" => ActionId::DrinkFromStream,
+            "fill_waterskin" => ActionId::FillWaterskin,
+            "drink_waterskin" => ActionId::DrinkWaterskin,
+            "eat_ration" => ActionId::EatRation,
+            "eat_herb" => ActionId::EatHerb,
+            "chop_tree" => ActionId::ChopTree,
+            "pick_herb" => ActionId::PickHerb,
+            "pitch_tent" => ActionId::PitchTent,
+            "unroll_bedroll" => ActionId::UnrollBedroll,
+            "setup_camp" => ActionId::SetupCamp,
+            "start_fire" => ActionId::StartFire,
+            "sleep" => ActionId::Sleep,
+            "fishing" => ActionId::Fishing,
+            _ => return None,
+        })
+    }
 }
 
 pub struct ContextAction {
@@ -90,6 +136,11 @@ pub const ALL_ACTIONS: &[ContextAction] = &[
         id: ActionId::UnrollBedroll,
         name: "Unroll bedroll",
         description: "Lay out a bedroll inside a tent.",
+    },
+    ContextAction {
+        id: ActionId::SetupCamp,
+        name: "Setup camp",
+        description: "Pitch the tent, then unroll the bedroll inside.",
     },
     ContextAction {
         id: ActionId::StartFire,
@@ -159,9 +210,21 @@ pub fn evaluate(world: &World, id: ActionId) -> Availability {
         ActionId::PickHerb => Availability::Unavailable {
             reason: "phase 11: no herbs yet",
         },
-        ActionId::PitchTent | ActionId::UnrollBedroll => Availability::Unavailable {
-            reason: "phase 9: multi-turn actions",
-        },
+        ActionId::PitchTent => Availability::from_has(
+            pack.has_stack(ItemKind::Tent),
+            COST_PITCH_TENT,
+            "no tent in pack",
+        ),
+        ActionId::UnrollBedroll => Availability::from_has(
+            pack.has_stack(ItemKind::Bedroll),
+            COST_UNROLL_BEDROLL,
+            "no bedroll in pack",
+        ),
+        ActionId::SetupCamp => Availability::from_has(
+            pack.has_stack(ItemKind::Tent) && pack.has_stack(ItemKind::Bedroll),
+            COST_PITCH_TENT + COST_UNROLL_BEDROLL,
+            "need tent + bedroll in pack",
+        ),
         ActionId::StartFire => Availability::Unavailable {
             reason: "phase 10: fire making",
         },
@@ -248,7 +311,50 @@ pub fn execute(world: &mut World, id: ActionId) -> ExecuteOutcome {
             "drank from waterskin (+20 thirst)",
             "no water to drink",
         ),
+        ActionId::PitchTent => {
+            world.queue_multi_turn(&[(ActionId::PitchTent, COST_PITCH_TENT)]);
+            ExecuteOutcome::Done("pitching tent...".to_string())
+        }
+        ActionId::UnrollBedroll => {
+            world.queue_multi_turn(&[(ActionId::UnrollBedroll, COST_UNROLL_BEDROLL)]);
+            ExecuteOutcome::Done("unrolling bedroll...".to_string())
+        }
+        ActionId::SetupCamp => {
+            world.queue_multi_turn(&[
+                (ActionId::PitchTent, COST_PITCH_TENT),
+                (ActionId::UnrollBedroll, COST_UNROLL_BEDROLL),
+            ]);
+            ExecuteOutcome::Done("setting up camp...".to_string())
+        }
         _ => ExecuteOutcome::NotImplemented,
+    }
+}
+
+/// Called by main.rs once per `ActionId` reported in
+/// `MultiTurnTickResult.completed_steps`. This is where the verb's
+/// post-completion side-effects fire (consume from pack, place
+/// structure, etc.). Steps that interrupt or get cancelled DO NOT
+/// reach this function — partial work is forfeited per the design
+/// card.
+pub fn complete_step(world: &mut World, id: ActionId) -> Option<String> {
+    match id {
+        ActionId::PitchTent => {
+            let _took = world.player_pack_mut().take_one_from_stack(ItemKind::Tent);
+            // Phase-13 will spawn a Structure { kind: Tent, pos }
+            // entity here for warmth shelter and bedroll-target
+            // anchoring. For now we just consume + log.
+            Some("tent pitched (phase 13 will place a shelter entity)".to_string())
+        }
+        ActionId::UnrollBedroll => {
+            let _took = world
+                .player_pack_mut()
+                .take_one_from_stack(ItemKind::Bedroll);
+            Some("bedroll unrolled (phase 13 will place a sleep target)".to_string())
+        }
+        // SetupCamp expands into PitchTent + UnrollBedroll steps in the
+        // queue; complete_step is never called with SetupCamp itself.
+        // Other future multi-turn verbs land their finish effects here.
+        _ => None,
     }
 }
 
@@ -351,6 +457,9 @@ mod tests {
             ActionId::EatRation,
             ActionId::EatHerb,
             ActionId::DrinkWaterskin,
+            ActionId::PitchTent,
+            ActionId::UnrollBedroll,
+            ActionId::SetupCamp,
         ];
         for action in ALL_ACTIONS {
             if live.contains(&action.id) {

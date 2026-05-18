@@ -23,8 +23,13 @@ use input::{Action, Input};
 use items::{ItemInstance, Pack};
 use needs::Needs;
 use render::{draw_glyph, load_atlas, CELL_SIZE};
-use save::{CellItemsSave, MetaSave, NeedsSave, RunSave, SaveHeader};
-use world::{brightness_at, dawns_elapsed, Position, TerrainKind, World};
+use save::{
+    ActionStepSave, ActiveActionSave, CellItemsSave, MetaSave, NeedsSave, RunSave, SaveHeader,
+};
+use world::{
+    brightness_at, dawns_elapsed, Position, TerrainKind, ViewMode, World,
+    MULTI_TURN_GAME_SEC_PER_FRAME,
+};
 
 const WORLD_W: u32 = 40;
 const WORLD_H: u32 = 30;
@@ -165,6 +170,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !run.explored_cells.is_empty() {
             world.restore_explored(&run.explored_cells);
         }
+        // Phase-9 active-action restore: rehydrate the queue + view mode
+        // so a save mid-PitchTent resumes correctly. Steps with unknown
+        // ActionId strings are dropped silently (forward-compat).
+        if let Some(saved) = run.active_action.as_ref() {
+            let steps: Vec<(action::ActionId, u32)> = saved
+                .steps
+                .iter()
+                .filter_map(|s| {
+                    action::ActionId::from_save_key(&s.id).map(|id| (id, s.target_secs))
+                })
+                .collect();
+            if !steps.is_empty() {
+                world.queue_multi_turn(&steps);
+                // Restore elapsed counters for the current step (which
+                // queue_multi_turn just zeroed) and the view mode.
+                if let Some(active) = world.active_action.as_mut() {
+                    for (i, src) in saved.steps.iter().enumerate() {
+                        if let Some(dst) = active.steps.get_mut(i) {
+                            dst.elapsed_secs = src.elapsed_secs;
+                            dst.target_secs = src.target_secs;
+                        }
+                    }
+                    active.view_mode = match saved.view_mode.as_str() {
+                        "time_skip" => ViewMode::TimeSkip,
+                        _ => ViewMode::ProgressBar,
+                    };
+                }
+            }
+        }
         // Recompute FOV after restoring position so the visible set is
         // correct for the loaded clock + player coord. (World::new already
         // did a recompute, but the loaded position may differ.)
@@ -212,6 +246,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         input.poll_gamepad();
 
         for input_action in input.drain() {
+            // Multi-turn-action mode: world is auto-ticking the queued
+            // verb. The only inputs that mean anything are B (cancel),
+            // Select (toggle view mode), and Start (quit). Everything
+            // else is dropped so the player can't move/menu mid-pitch.
+            if world.active_action.is_some() {
+                match input_action {
+                    Action::B => {
+                        world.cancel_multi_turn();
+                        log_info!("[action] cancelled");
+                    }
+                    Action::Select => {
+                        world.toggle_multi_turn_view();
+                        let mode = world
+                            .active_action
+                            .as_ref()
+                            .map(|a| a.view_mode)
+                            .unwrap_or(ViewMode::ProgressBar);
+                        log_info!("[action] view mode = {:?}", mode);
+                    }
+                    Action::Start => break 'main,
+                    _ => {}
+                }
+                continue;
+            }
+
             // Menu mode: dpad navigates, A confirms (if available), B/Y
             // closes. Everything else is dropped so the world doesn't tick
             // while the player is browsing the catalog.
@@ -287,6 +346,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // Multi-turn action tick. Runs per-frame; advance rate depends
+        // on view_mode. Completed steps trigger action::complete_step
+        // (which fires the verb's consume-from-pack and structure-place
+        // effects). Interrupts (need < critical threshold) cancel the
+        // entire queue.
+        if let Some(view_mode) = world.active_action.as_ref().map(|a| a.view_mode) {
+            let advance = match view_mode {
+                ViewMode::ProgressBar => MULTI_TURN_GAME_SEC_PER_FRAME,
+                ViewMode::TimeSkip => world
+                    .active_action
+                    .as_ref()
+                    .map(|a| a.total_remaining_secs())
+                    .unwrap_or(0),
+            };
+            let result = world.tick_multi_turn(advance);
+            for step_id in result.completed_steps {
+                if let Some(msg) = action::complete_step(&mut world, step_id) {
+                    log_info!("[action] {}", msg);
+                }
+            }
+            if result.interrupted {
+                log_info!("[action] interrupted (need critical)");
+            }
+        }
+
         #[cfg(not(target_arch = "arm"))]
         debug.drain(|cmd| debug_console::apply_debug_command(&mut world, cmd));
 
@@ -327,6 +411,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let is_night = world.is_night();
         let tint = brightness_at(world.clock_seconds);
         let mut ui_cells = build_ui_cells(&palette, needs, day, clock_h, clock_m, is_night);
+        if let Some(active) = world.active_action.as_ref() {
+            draw_multi_turn_banner(&mut ui_cells, active, &palette);
+        }
         if let Some(selected) = command_menu {
             draw_command_menu(&mut ui_cells, &world, selected, &palette);
         }
@@ -487,6 +574,22 @@ fn save_game(
         warmth_acc_secs: n.warmth_acc_secs,
     };
     run.explored_cells = world.snapshot_explored();
+    run.active_action = world.active_action.as_ref().map(|active| ActiveActionSave {
+        steps: active
+            .steps
+            .iter()
+            .map(|s| ActionStepSave {
+                id: s.id.save_key().to_string(),
+                elapsed_secs: s.elapsed_secs,
+                target_secs: s.target_secs,
+            })
+            .collect(),
+        view_mode: match active.view_mode {
+            ViewMode::ProgressBar => "progress_bar",
+            ViewMode::TimeSkip => "time_skip",
+        }
+        .to_string(),
+    });
     if let Err(e) = save::save_atomic(&save_dir.join(RUN_FILE), &run) {
         log_info!("run save failed: {}", e);
     } else {
@@ -558,6 +661,83 @@ fn build_ui_cells(
 fn push_meter(out: &mut Vec<u8>, glyph: u8, value: u8) {
     out.push(glyph);
     out.extend_from_slice(value.to_string().as_bytes());
+}
+
+fn draw_multi_turn_banner(
+    cells: &mut [Option<Cell>],
+    active: &world::ActiveAction,
+    palette: &Palette,
+) {
+    let Some(step) = active.current_step() else {
+        return;
+    };
+    let total_remaining = active.total_remaining_secs();
+    let mode_tag = match active.view_mode {
+        ViewMode::ProgressBar => "watching",
+        ViewMode::TimeSkip => "time-skip",
+    };
+    // Banner centered around row 4; width 34. Layout:
+    //   +-------------- pitch_tent --------------+
+    //   |  [######......]  03:25 remaining       |
+    //   |  B cancel    Select toggle (watching)  |
+    //   +----------------------------------------+
+    let w: i32 = 34;
+    let h: i32 = 5;
+    let x = ((WORLD_W as i32) - w) / 2;
+    let y = 4;
+    draw_panel(cells, x, y, w, h, palette.panel_fg, palette.panel_bg);
+
+    let label = step.id.save_key();
+    put_text(
+        cells,
+        x + 2,
+        y + 1,
+        label,
+        palette.panel_title_fg,
+        palette.panel_bg,
+    );
+
+    // Progress bar of the current step (not the whole queue). Width 12.
+    let bar_w: i32 = 12;
+    let filled = if step.target_secs == 0 {
+        bar_w
+    } else {
+        ((step.elapsed_secs as i64 * bar_w as i64) / step.target_secs as i64) as i32
+    };
+    for i in 0..bar_w {
+        let glyph = if i < filled { 0xDB } else { 0xB1 }; // █ vs ▒
+        put_cell(
+            cells,
+            x + 2 + i,
+            y + 2,
+            Cell {
+                glyph,
+                fg: palette.panel_fg,
+                bg: palette.panel_bg,
+            },
+        );
+    }
+    let remaining_m = total_remaining / 60;
+    let remaining_s = total_remaining % 60;
+    let remaining = format!(" {}:{:02} remaining", remaining_m, remaining_s);
+    put_text(
+        cells,
+        x + 2 + bar_w,
+        y + 2,
+        &remaining,
+        palette.hud_fg,
+        palette.panel_bg,
+    );
+
+    let footer = format!("B cancel    Select toggle ({})", mode_tag);
+    put_text(
+        cells,
+        x + 2,
+        y + 3,
+        &footer,
+        palette.panel_dim_fg,
+        palette.panel_bg,
+    );
 }
 
 fn draw_command_menu(

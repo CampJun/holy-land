@@ -12,11 +12,12 @@
 //
 // `Pack` lives as a hecs component on the player entity; see items.rs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use hecs::{Entity, World as Ecs};
 use serde::{Deserialize, Serialize};
 
+use crate::action::ActionId;
 use crate::items::{starting_pack, ItemInstance, ItemKind, ItemMetadata, Pack};
 use crate::needs::{Needs, NeedsEnv};
 
@@ -42,6 +43,19 @@ pub const COST_PICKUP: u32 = 3;
 pub const COST_EAT_RATION: u32 = 10;
 pub const COST_EAT_HERB: u32 = 5;
 pub const COST_DRINK_WATERSKIN: u32 = 5;
+pub const COST_PITCH_TENT: u32 = 300;
+pub const COST_UNROLL_BEDROLL: u32 = 30;
+
+/// Phase-9 multi-turn interrupt threshold. When any need drops below this
+/// during a multi-turn tick, the active action queue cancels and control
+/// returns to the player. Death gate (phase 14) re-uses the same value.
+pub const NEED_CRITICAL_THRESHOLD: u8 = 10;
+
+/// How many game-seconds a ProgressBar-mode multi-turn action advances
+/// per render frame. At ~60 fps, this means a 300-sec PitchTent
+/// completes in ~5 real-time seconds — fast enough to not feel like
+/// dead time, slow enough that the player can react with B to cancel.
+pub const MULTI_TURN_GAME_SEC_PER_FRAME: u32 = 1;
 
 /// FOV radii. Phase-10 adds a fire-light-source bump for night cells
 /// within 5 of a lit fire.
@@ -190,6 +204,66 @@ pub struct World {
     pub clock_seconds: u64,
     pub ecs: Ecs,
     pub player: Entity,
+    /// Set when the player commits to a multi-turn verb (phase 9). The
+    /// main loop ticks this each frame and surfaces a progress overlay;
+    /// regular input is suspended while it is `Some`. Cleared on
+    /// completion, cancellation, or interrupt.
+    pub active_action: Option<ActiveAction>,
+}
+
+/// In-flight multi-turn action queue. `steps[0]` is the currently-running
+/// step; completed steps pop off the front. The queue empties on the
+/// last step's completion (or all-at-once on cancel/interrupt).
+#[derive(Clone, Debug)]
+pub struct ActiveAction {
+    pub steps: VecDeque<ActionStep>,
+    pub view_mode: ViewMode,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ActionStep {
+    pub id: ActionId,
+    pub elapsed_secs: u32,
+    pub target_secs: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewMode {
+    ProgressBar,
+    TimeSkip,
+}
+
+impl ViewMode {
+    pub fn toggled(self) -> Self {
+        match self {
+            ViewMode::ProgressBar => ViewMode::TimeSkip,
+            ViewMode::TimeSkip => ViewMode::ProgressBar,
+        }
+    }
+}
+
+impl ActiveAction {
+    pub fn current_step(&self) -> Option<&ActionStep> {
+        self.steps.front()
+    }
+
+    /// Total game-seconds across all remaining steps (current step's
+    /// remainder plus all unstarted steps). Used by the progress-bar UI.
+    pub fn total_remaining_secs(&self) -> u32 {
+        self.steps
+            .iter()
+            .map(|s| s.target_secs.saturating_sub(s.elapsed_secs))
+            .sum()
+    }
+}
+
+/// Returned by `World::tick_multi_turn`. The frame loop reads this to:
+///   1. Call `action::complete_step` for each finished step
+///   2. Log an interruption reason if `interrupted` is true
+#[derive(Default)]
+pub struct MultiTurnTickResult {
+    pub completed_steps: Vec<ActionId>,
+    pub interrupted: bool,
 }
 
 impl World {
@@ -228,6 +302,7 @@ impl World {
             clock_seconds: STARTING_CLOCK_SECONDS,
             ecs,
             player,
+            active_action: None,
         };
         seed_phase3_debris(&mut world);
         // The seeding marked the chunk dirty (via cell_at_mut); reset so a
@@ -351,22 +426,121 @@ impl World {
         }
     }
 
-    /// Advance the game-time clock by an action's cost and apply needs
-    /// decay. Cost is amplified by any active need penalty (worst-need
-    /// wins, +20% / +50%). Recomputes FOV when the clock crosses the
-    /// day/night boundary because the visibility radius changes.
+    /// Advance the game-time clock by an action's cost, amplified by the
+    /// current need penalty. This is the canonical path for "instant"
+    /// verbs (move, pickup, eat, drink).
+    ///
+    /// Multi-turn verbs DO NOT call this directly. Each per-second tick
+    /// during a multi-turn action goes through `advance_time_raw`
+    /// (penalty already baked into the queued target_secs at action
+    /// start), because applying the penalty per-second would silently
+    /// truncate the bonus on tiny ticks.
     pub fn spend_action_time(&mut self, base_cost: u32) {
-        let was_night = self.is_night();
         let needs = self.player_needs();
         let penalty_pct = needs.action_cost_penalty_pct();
         let elapsed = base_cost.saturating_add(base_cost * penalty_pct / 100);
-        self.clock_seconds = self.clock_seconds.saturating_add(elapsed as u64);
+        self.advance_time_raw(elapsed);
+    }
+
+    /// Advance the clock by `secs` game-seconds without recomputing the
+    /// need penalty. Ticks needs decay and refreshes FOV at day/night
+    /// boundaries. The "raw" suffix marks this as the bypass path for
+    /// per-second multi-turn simulation; instant verbs use
+    /// `spend_action_time`.
+    pub fn advance_time_raw(&mut self, secs: u32) {
+        if secs == 0 {
+            return;
+        }
+        let was_night = self.is_night();
+        self.clock_seconds = self.clock_seconds.saturating_add(secs as u64);
         let env = self.needs_env();
         let mut needs = self.player_needs();
-        needs.tick(elapsed, env);
+        needs.tick(secs, env);
         self.set_player_needs(needs);
         if self.is_night() != was_night {
             self.recompute_fov();
+        }
+    }
+
+    /// Queue a multi-turn action. `steps` lists the sub-actions in order
+    /// with their base costs in game-seconds; the current need penalty
+    /// is applied once at queueing so each step's `target_secs` is the
+    /// amplified value. Subsequent need degradation during the action
+    /// doesn't re-stretch the queue.
+    pub fn queue_multi_turn(&mut self, steps: &[(ActionId, u32)]) {
+        let penalty_pct = self.player_needs().action_cost_penalty_pct();
+        let amplify = |base: u32| base.saturating_add(base * penalty_pct / 100);
+        let q: VecDeque<ActionStep> = steps
+            .iter()
+            .map(|&(id, base)| ActionStep {
+                id,
+                elapsed_secs: 0,
+                target_secs: amplify(base),
+            })
+            .collect();
+        self.active_action = Some(ActiveAction {
+            steps: q,
+            view_mode: ViewMode::ProgressBar,
+        });
+    }
+
+    /// Advance the active multi-turn action by up to `advance_secs`
+    /// game-seconds, ticking needs once per second and checking the
+    /// interrupt threshold each step. Returns the ActionIds of any
+    /// steps that completed during this tick (caller invokes
+    /// `action::complete_step` for each) plus whether an interrupt
+    /// fired (in which case the entire queue is abandoned and `Done`
+    /// effects do NOT run for the partially-completed current step).
+    pub fn tick_multi_turn(&mut self, advance_secs: u32) -> MultiTurnTickResult {
+        let mut result = MultiTurnTickResult::default();
+        let Some(mut active) = self.active_action.take() else {
+            return result;
+        };
+
+        let mut remaining = advance_secs;
+        while remaining > 0 && !active.steps.is_empty() {
+            self.advance_time_raw(1);
+            remaining -= 1;
+
+            // Interrupt check after each simulated second. The
+            // partially-elapsed current step is abandoned; the player
+            // does not pay the consume-from-pack price.
+            let n = self.player_needs();
+            if n.thirst < NEED_CRITICAL_THRESHOLD
+                || n.hunger < NEED_CRITICAL_THRESHOLD
+                || n.sleep < NEED_CRITICAL_THRESHOLD
+                || n.warmth < NEED_CRITICAL_THRESHOLD
+            {
+                result.interrupted = true;
+                break;
+            }
+
+            let step = active.steps.front_mut().expect("non-empty checked above");
+            step.elapsed_secs += 1;
+            if step.elapsed_secs >= step.target_secs {
+                result.completed_steps.push(step.id);
+                active.steps.pop_front();
+            }
+        }
+
+        // Put active back only if there's still work to do and we
+        // weren't interrupted; otherwise the queue is gone.
+        if !result.interrupted && !active.steps.is_empty() {
+            self.active_action = Some(active);
+        }
+        result
+    }
+
+    /// Player-driven cancel (B). Drops the queue without firing any
+    /// completion effects. Time already spent stays spent (the player
+    /// "wasted" those game-seconds).
+    pub fn cancel_multi_turn(&mut self) {
+        self.active_action = None;
+    }
+
+    pub fn toggle_multi_turn_view(&mut self) {
+        if let Some(active) = self.active_action.as_mut() {
+            active.view_mode = active.view_mode.toggled();
         }
     }
 
@@ -904,6 +1078,110 @@ mod tests {
         assert_eq!(after_move - before, 5);
         world.try_pickup_all_at_player();
         assert_eq!(world.clock_seconds - after_move, 3);
+    }
+
+    #[test]
+    fn multi_turn_progress_bar_advances_step_by_step() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        world.queue_multi_turn(&[(ActionId::PitchTent, 10)]);
+        // Healthy needs, no penalty: target_secs = base_cost = 10.
+        assert_eq!(world.active_action.as_ref().unwrap().steps.len(), 1);
+
+        let result = world.tick_multi_turn(3);
+        assert!(result.completed_steps.is_empty());
+        assert!(!result.interrupted);
+        let active = world.active_action.as_ref().unwrap();
+        assert_eq!(active.steps.front().unwrap().elapsed_secs, 3);
+    }
+
+    #[test]
+    fn multi_turn_completes_step_and_clears_when_queue_empty() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        world.queue_multi_turn(&[(ActionId::UnrollBedroll, 5)]);
+        let result = world.tick_multi_turn(10);
+        assert_eq!(result.completed_steps, vec![ActionId::UnrollBedroll]);
+        assert!(!result.interrupted);
+        assert!(world.active_action.is_none());
+    }
+
+    #[test]
+    fn multi_turn_two_step_queue_completes_in_order() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        world.queue_multi_turn(&[
+            (ActionId::PitchTent, 3),
+            (ActionId::UnrollBedroll, 2),
+        ]);
+        // 5 seconds = exactly the queue total. Both steps should
+        // complete in this single tick, in queue order.
+        let result = world.tick_multi_turn(10);
+        assert_eq!(
+            result.completed_steps,
+            vec![ActionId::PitchTent, ActionId::UnrollBedroll]
+        );
+        assert!(world.active_action.is_none());
+    }
+
+    #[test]
+    fn multi_turn_interrupts_when_need_crashes_below_threshold() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Drop thirst to threshold+1; one second of decay will cross
+        // the boundary... actually needs decay 1/min, so a single
+        // second won't drop thirst by 1. Force it lower so the tick's
+        // critical check trips.
+        let mut n = world.player_needs();
+        n.thirst = NEED_CRITICAL_THRESHOLD - 1;
+        n.thirst_acc_secs = 0;
+        world.set_player_needs(n);
+
+        world.queue_multi_turn(&[(ActionId::PitchTent, 30)]);
+        let result = world.tick_multi_turn(30);
+        assert!(result.interrupted);
+        assert!(result.completed_steps.is_empty());
+        // Active action gone: interrupted means queue cancelled.
+        assert!(world.active_action.is_none());
+    }
+
+    #[test]
+    fn cancel_multi_turn_drops_queue_without_completion() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        world.queue_multi_turn(&[(ActionId::PitchTent, 10)]);
+        world.tick_multi_turn(3); // partial progress
+        world.cancel_multi_turn();
+        assert!(world.active_action.is_none());
+    }
+
+    #[test]
+    fn queue_amplifies_target_by_current_need_penalty() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Drop thirst to 9 (below 10) so the penalty is +50%.
+        let mut n = world.player_needs();
+        n.thirst = 9;
+        n.thirst_acc_secs = 0;
+        world.set_player_needs(n);
+
+        world.queue_multi_turn(&[(ActionId::PitchTent, 10)]);
+        let step = world.active_action.as_ref().unwrap().steps.front().unwrap();
+        assert_eq!(step.target_secs, 15, "10 + 50% = 15");
+    }
+
+    #[test]
+    fn toggle_view_mode_flips_progress_and_skip() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        world.queue_multi_turn(&[(ActionId::PitchTent, 10)]);
+        assert_eq!(
+            world.active_action.as_ref().unwrap().view_mode,
+            ViewMode::ProgressBar
+        );
+        world.toggle_multi_turn_view();
+        assert_eq!(
+            world.active_action.as_ref().unwrap().view_mode,
+            ViewMode::TimeSkip
+        );
+        world.toggle_multi_turn_view();
+        assert_eq!(
+            world.active_action.as_ref().unwrap().view_mode,
+            ViewMode::ProgressBar
+        );
     }
 
     #[test]

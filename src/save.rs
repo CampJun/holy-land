@@ -94,6 +94,31 @@ pub struct RunSave {
     // per chunk later if explored sets get big.
     #[serde(default)]
     pub explored_cells: Vec<(i32, i32)>,
+    // Phase 9 (additive): mid-action queue snapshot so a save during a
+    // PitchTent / SetupCamp resumes correctly on load.
+    #[serde(default)]
+    pub active_action: Option<ActiveActionSave>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ActiveActionSave {
+    #[serde(default)]
+    pub steps: Vec<ActionStepSave>,
+    /// "progress_bar" | "time_skip". Defaults to progress_bar on
+    /// unknown values for forward-compat.
+    #[serde(default)]
+    pub view_mode: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ActionStepSave {
+    /// `ActionId::save_key()` string. Unknown ids are dropped on load.
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub elapsed_secs: u32,
+    #[serde(default)]
+    pub target_secs: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -127,6 +152,7 @@ impl RunSave {
             clock_seconds: 0,
             needs: NeedsSave::default(),
             explored_cells: Vec::new(),
+            active_action: None,
         }
     }
 }
@@ -284,6 +310,7 @@ mod tests {
                 warmth_acc_secs: 0,
             },
             explored_cells: Vec::new(),
+            active_action: None,
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
@@ -351,11 +378,24 @@ mod tests {
             clock_seconds: 0,
             needs: NeedsSave::default(),
             explored_cells: vec![(21, 15), (22, 16)],
+            active_action: Some(ActiveActionSave {
+                steps: vec![ActionStepSave {
+                    id: "pitch_tent".to_string(),
+                    elapsed_secs: 42,
+                    target_secs: 300,
+                }],
+                view_mode: "time_skip".to_string(),
+            }),
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
         assert_eq!(loaded.pack.capacity_g, 15_000);
         assert_eq!(loaded.explored_cells, vec![(21, 15), (22, 16)]);
+        let active = loaded.active_action.expect("active_action round-trip");
+        assert_eq!(active.steps.len(), 1);
+        assert_eq!(active.steps[0].id, "pitch_tent");
+        assert_eq!(active.steps[0].elapsed_secs, 42);
+        assert_eq!(active.view_mode, "time_skip");
         assert_eq!(loaded.pack.contents.len(), 3);
         assert_eq!(loaded.pack.contents[0].kind, "axe");
         assert_eq!(loaded.pack.contents[1].kind, "waterskin");

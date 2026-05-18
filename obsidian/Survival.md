@@ -12,8 +12,10 @@ kanban-plugin: board
 
 - [ ] [[Survival - Game time clock and needs]] — death gate (slated for phase 14)
 	Clock + needs decay + HUD shipped phase 4. Remaining: death-on-zero (DEATH_ENABLED flip + game-over UX) + +0.5/min tent warmth resolution.
-- [ ] [[Survival - Command menu]] — radial overlay (phase 15) + multi-turn toggle (phase 9)
-	Tap-Y vertical menu shipped phase 7: 13-action registry, availability resolver with greyed-out reasons, A-confirms / B-Y-close, scroll via dpad, name+cost or name+reason per row, description footer. Pickup wired through it. Remaining: hold-Y 4-direction radial overlay and Select-hold toggle for multi-turn-action view modes.
+- [ ] [[Survival - Command menu]] — radial overlay (phase 15)
+	Tap-Y vertical menu shipped phase 7: 14-action registry (SetupCamp added phase 9), availability resolver with greyed-out reasons, A-confirms / B-Y-close, scroll via dpad, name+cost or name+reason per row, description footer. Pickup/EatRation/EatHerb/DrinkWaterskin/PitchTent/UnrollBedroll/SetupCamp wired. Remaining: hold-Y 4-direction radial overlay.
+- [ ] [[Survival - Multi-turn action queue]] — Phase 13 will plug in structure placement on completion
+	Queue+tick+cancel+toggle+save-roundtrip shipped phase 9. PitchTent (300s), UnrollBedroll (30s), SetupCamp (queues both) live. Progress-bar banner overlay; Select toggles to time-skip (simulates each second for interrupts). Need-critical interrupt threshold = 10. Penalty amplified at queue time, not per-second. Remaining: structure entities (Tent, Bedroll) need actual world placement once warmth/sleep wiring lands in phase 13.
 - [ ] [[Survival - Multi-turn action queue]]
 	Progress-bar / time-skip modes; simulate every elapsed turn so interrupts can fire.
 - [ ] [[Survival - Skill system URW]]
