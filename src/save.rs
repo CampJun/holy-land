@@ -1,9 +1,9 @@
-// Portable, sync-friendly save format. Format and discipline locked here in
-// Session 3 — every save we ever write going forward must be loadable via the
-// migration chain below.
+// Portable, sync-friendly save format. Format and discipline locked in
+// Session 3 (Holy Land); the *machinery* survives the survival redesign even
+// as the field contents change.
 //
 // Format: CBOR (cross-platform, language-agnostic, deterministic). Every save
-// starts with `SaveHeader`; the rest is type-specific. Forward-compat is by
+// starts with `SaveHeader`; the rest is type-specific. Forward-compat by
 // `#[serde(default)]` on every non-header field so older binaries skip unknown
 // fields silently and newer binaries fill in defaults for absent fields.
 //
@@ -15,9 +15,13 @@
 //      migration code is needed — `#[serde(default)]` handles it.
 //   4. If the change reshapes an existing field, the migration must do a
 //      Value-level read (ciborium::Value) and convert before final deser.
+//
+// Phase-2 gut: dropped Holy Land run/meta fields (essence/demon_currency,
+// shrine_unlocked, oasis_intro_complete, reeds, ground_items, region). Schema
+// version stays at 1 for now; phase 19's "Save schema v2" card bumps it to 2
+// once needs/clock/inventory/chunks land.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
@@ -54,15 +58,7 @@ pub struct MetaSave {
     #[serde(default)]
     pub xp: u64,
     #[serde(default)]
-    pub demon_currency: u64,
-    #[serde(default)]
-    pub deity_affinity: BTreeMap<String, i32>,
-    #[serde(default)]
     pub unlocks: Vec<String>,
-    #[serde(default)]
-    pub oasis_intro_complete: bool,
-    #[serde(default)]
-    pub shrine_unlocked: bool,
 }
 
 impl MetaSave {
@@ -70,21 +66,9 @@ impl MetaSave {
         Self {
             header,
             xp: 0,
-            demon_currency: 0,
-            deity_affinity: BTreeMap::new(),
             unlocks: Vec::new(),
-            oasis_intro_complete: false,
-            shrine_unlocked: false,
         }
     }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct GroundItemSave {
-    pub kind: String,
-    pub count: u32,
-    pub x: i32,
-    pub y: i32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -94,23 +78,6 @@ pub struct RunSave {
     pub player_x: i32,
     #[serde(default)]
     pub player_y: i32,
-    // Legacy: pre-inventory builds tracked this counter directly. Newer
-    // builds write the authoritative state in `inventory` and only read this
-    // field as a fallback when `inventory` is absent (saves from old builds).
-    #[serde(default)]
-    pub reeds_harvested: u8,
-    #[serde(default)]
-    pub harvested_reeds: Vec<[i32; 2]>,
-    #[serde(default)]
-    pub inventory: BTreeMap<String, u32>,
-    #[serde(default = "default_region")]
-    pub region: String,
-    #[serde(default)]
-    pub ground_items: Vec<GroundItemSave>,
-}
-
-fn default_region() -> String {
-    "oasis".to_string()
 }
 
 impl RunSave {
@@ -119,11 +86,6 @@ impl RunSave {
             header,
             player_x: 0,
             player_y: 0,
-            reeds_harvested: 0,
-            harvested_reeds: Vec::new(),
-            inventory: BTreeMap::new(),
-            region: default_region(),
-            ground_items: Vec::new(),
         }
     }
 }
@@ -197,20 +159,18 @@ mod tests {
 
     #[test]
     fn round_trip_meta() {
-        let dir = std::env::temp_dir().join(format!("holyland-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("survival-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("meta.cbor");
 
         let mut meta = MetaSave::empty(SaveHeader::fresh(None));
         meta.xp = 42;
-        meta.oasis_intro_complete = true;
-        meta.unlocks.push("starter_oasis".to_string());
+        meta.unlocks.push("first_fire".to_string());
         save_atomic(&path, &meta).unwrap();
 
         let loaded = load_meta(&path).unwrap();
         assert_eq!(loaded.xp, 42);
-        assert!(loaded.oasis_intro_complete);
-        assert_eq!(loaded.unlocks, vec!["starter_oasis"]);
+        assert_eq!(loaded.unlocks, vec!["first_fire"]);
         assert_eq!(loaded.header.schema_version, SCHEMA_VERSION);
         assert_eq!(loaded.header.device_id, meta.header.device_id);
 
@@ -219,47 +179,27 @@ mod tests {
 
     #[test]
     fn round_trip_run() {
-        let dir = std::env::temp_dir().join(format!("holyland-run-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("survival-run-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("run.cbor");
 
         let header = SaveHeader::fresh(None);
-        let mut inventory = BTreeMap::new();
-        inventory.insert("reed".to_string(), 2);
         let run = RunSave {
             header,
             player_x: 5,
             player_y: 7,
-            reeds_harvested: 0,
-            harvested_reeds: vec![[8, 5], [9, 5]],
-            inventory,
-            region: "wilderness".to_string(),
-            ground_items: vec![GroundItemSave {
-                kind: "reed".to_string(),
-                count: 2,
-                x: 12,
-                y: 14,
-            }],
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
         assert_eq!(loaded.player_x, 5);
         assert_eq!(loaded.player_y, 7);
-        assert_eq!(loaded.harvested_reeds, vec![[8, 5], [9, 5]]);
-        assert_eq!(loaded.inventory.get("reed"), Some(&2));
-        assert_eq!(loaded.region, "wilderness");
-        assert_eq!(loaded.ground_items.len(), 1);
-        assert_eq!(loaded.ground_items[0].kind, "reed");
-        assert_eq!(loaded.ground_items[0].count, 2);
-        assert_eq!(loaded.ground_items[0].x, 12);
-        assert_eq!(loaded.ground_items[0].y, 14);
 
         fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn rejects_future_schema() {
-        let dir = std::env::temp_dir().join(format!("holyland-fut-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("survival-fut-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("future.cbor");
 
@@ -284,26 +224,5 @@ mod tests {
         assert_eq!(h3.save_counter, 3);
         assert_eq!(h1.device_id, h2.device_id);
         assert_eq!(h2.device_id, h3.device_id);
-    }
-
-    #[test]
-    fn starter_oasis_unlock_is_not_duplicated() {
-        let mut meta = MetaSave::empty(SaveHeader::fresh(None));
-        complete_starter_oasis(&mut meta);
-        complete_starter_oasis(&mut meta);
-
-        assert!(meta.oasis_intro_complete);
-        assert_eq!(meta.unlocks, vec!["starter_oasis"]);
-        assert_eq!(meta.xp, 1);
-    }
-
-    fn complete_starter_oasis(meta: &mut MetaSave) {
-        if !meta.oasis_intro_complete {
-            meta.oasis_intro_complete = true;
-            meta.xp += 1;
-        }
-        if !meta.unlocks.iter().any(|u| u == "starter_oasis") {
-            meta.unlocks.push("starter_oasis".to_string());
-        }
     }
 }
