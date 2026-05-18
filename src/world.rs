@@ -48,6 +48,21 @@ pub const COST_DRINK_WATERSKIN: u32 = 5;
 pub const FOV_RADIUS_DAY: i32 = 20;
 pub const FOV_RADIUS_NIGHT: i32 = 3;
 
+/// Side length of the per-recompute blocker grid: covers `±FOV_RADIUS_DAY`
+/// in both axes plus the origin. The grid is stack-allocated in
+/// `recompute_fov` to avoid the per-move HashSet alloc the previous
+/// implementation paid.
+const BLOCKER_GRID_SIDE: usize = (2 * FOV_RADIUS_DAY + 1) as usize;
+const BLOCKER_GRID_LEN: usize = BLOCKER_GRID_SIDE * BLOCKER_GRID_SIDE;
+const BLOCKER_GRID_CENTER: i32 = FOV_RADIUS_DAY;
+
+#[inline]
+fn blocker_idx(dx: i32, dy: i32) -> usize {
+    let lx = (dx + BLOCKER_GRID_CENTER) as usize;
+    let ly = (dy + BLOCKER_GRID_CENTER) as usize;
+    ly * BLOCKER_GRID_SIDE + lx
+}
+
 /// Day/night dimming endpoints. Floor stays at 0.4 so nothing goes pitch
 /// black before FOV+fires (phase 6+10) reach gameplay.
 const TINT_DAY: f32 = 1.0;
@@ -161,7 +176,12 @@ pub struct Renderable {
 pub struct Player;
 
 pub struct World {
-    pub chunks: HashMap<ChunkCoord, Box<Chunk>>,
+    /// Chunk store keyed on grid coords. Outside this module, prefer the
+    /// `tile_at` / `cell_at` / `cell_at_mut` / `snapshot_*` accessor
+    /// methods — those preserve the chunk's `dirty` flag and validate
+    /// bounds. Direct mutation of cells via this map will silently
+    /// bypass dirty-tracking and break saves.
+    pub(crate) chunks: HashMap<ChunkCoord, Box<Chunk>>,
     #[allow(dead_code)] // consumed by chunkgen.rs in phase 11 (seeded gen)
     pub seed: u64,
     /// Game-time clock in seconds since "game start" (not real-time). Wraps
@@ -354,6 +374,11 @@ impl World {
     /// player's current position. Radius depends on day/night. Also marks
     /// newly-seen cells as `explored` so the renderer can show them dimmed
     /// after the player walks away.
+    ///
+    /// Blocker snapshot lives in a stack-allocated bool grid (1681 bytes
+    /// for the radius-20 worst case) so this method does no heap
+    /// allocation per move — the previous implementation used a HashSet,
+    /// which paid alloc/hash cost per recompute on the Cortex-A7 target.
     pub fn recompute_fov(&mut self) {
         let origin = self.player_pos();
         let radius = if self.is_night() {
@@ -362,16 +387,15 @@ impl World {
             FOV_RADIUS_DAY
         };
 
-        // Snapshot blockers in a square around the origin so the closure
-        // passed to fov::compute_visible doesn't need to borrow self
-        // alongside the later cell_at_mut visits.
-        let mut blockers = std::collections::HashSet::new();
-        for dy in -(radius + 1)..=(radius + 1) {
-            for dx in -(radius + 1)..=(radius + 1) {
+        // Snapshot blockers into a relative bit-grid keyed on (dx, dy)
+        // offsets from `origin`, padded by `BLOCKER_GRID_CENTER`.
+        let mut blockers = [false; BLOCKER_GRID_LEN];
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
                 let wx = origin.x as i64 + dx as i64;
                 let wy = origin.y as i64 + dy as i64;
                 if matches!(self.tile_at(wx, wy), TerrainKind::Wall) {
-                    blockers.insert((origin.x + dx, origin.y + dy));
+                    blockers[blocker_idx(dx, dy)] = true;
                 }
             }
         }
@@ -384,7 +408,17 @@ impl World {
         }
 
         let visible = crate::fov::compute_visible((origin.x, origin.y), radius, |x, y| {
-            blockers.contains(&(x, y))
+            let dx = x - origin.x;
+            let dy = y - origin.y;
+            // Cells outside the grid coverage (impossible per the
+            // shadowcaster's bounds, but defensive) are treated as
+            // blockers so FOV doesn't escape the snapshot window.
+            if dx.unsigned_abs() as i32 > FOV_RADIUS_DAY
+                || dy.unsigned_abs() as i32 > FOV_RADIUS_DAY
+            {
+                return true;
+            }
+            blockers[blocker_idx(dx, dy)]
         });
 
         for (x, y) in visible {

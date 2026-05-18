@@ -171,21 +171,46 @@ pub enum NeedKind {
 }
 
 impl Needs {
+    /// Single source of truth for "address a need by selector"; every
+    /// mutator method below goes through this. Returns the two mutable
+    /// references (value, accumulator) so callers can update both
+    /// without re-matching on the kind.
+    fn mut_pair(&mut self, kind: NeedKind) -> (&mut u8, &mut u32) {
+        match kind {
+            NeedKind::Thirst => (&mut self.thirst, &mut self.thirst_acc_secs),
+            NeedKind::Hunger => (&mut self.hunger, &mut self.hunger_acc_secs),
+            NeedKind::Sleep => (&mut self.sleep, &mut self.sleep_acc_secs),
+            NeedKind::Warmth => (&mut self.warmth, &mut self.warmth_acc_secs),
+        }
+    }
+
     /// Add `amount` points to a need, clamped at NEED_MAX, and reset the
     /// matching sub-point accumulator so the next decay tick starts fresh
     /// from the new value (otherwise stale fractional progress could
     /// immediately knock the need back down).
     pub fn restore(&mut self, kind: NeedKind, amount: u8) {
-        let (value, acc) = match kind {
-            NeedKind::Thirst => (&mut self.thirst, &mut self.thirst_acc_secs),
-            NeedKind::Hunger => (&mut self.hunger, &mut self.hunger_acc_secs),
-            NeedKind::Sleep => (&mut self.sleep, &mut self.sleep_acc_secs),
-            NeedKind::Warmth => (&mut self.warmth, &mut self.warmth_acc_secs),
-        };
+        let (value, acc) = self.mut_pair(kind);
         *value = (*value as u16)
             .saturating_add(amount as u16)
             .min(NEED_MAX as u16) as u8;
         *acc = 0;
+    }
+
+    /// Set a need to a specific value (clamped at NEED_MAX) and reset its
+    /// accumulator. Used by the debug console; gameplay restorers prefer
+    /// `restore` so they accumulate from the current value.
+    pub fn set(&mut self, kind: NeedKind, value: u8) {
+        let (v, acc) = self.mut_pair(kind);
+        *v = value.min(NEED_MAX);
+        *acc = 0;
+    }
+
+    /// Zero the sub-point accumulator for `kind` without touching the
+    /// meter. Verbs that mutate a need by other means call this so the
+    /// next decay tick starts fresh.
+    #[allow(dead_code)] // wired in once a verb needs it independently
+    pub fn reset_accumulator(&mut self, kind: NeedKind) {
+        *self.mut_pair(kind).1 = 0;
     }
 }
 

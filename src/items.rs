@@ -36,111 +36,189 @@ pub enum ItemKind {
     Ration,
 }
 
+/// All per-kind metadata in one place. Adding a new `ItemKind` variant is
+/// a one-stop edit: extend `ItemKind`, then extend `def()` with a new
+/// arm. The compiler's exhaustive-match check enforces both halves.
+pub struct ItemDef {
+    pub save_key: &'static str,
+    pub name: &'static str,
+    pub is_fungible: bool,
+    pub glyph: u8,
+    pub color: [u8; 3],
+}
+
+/// Iteration order used by `from_save_key` and tests. Keep in sync with
+/// the `ItemKind` enum variants.
+const ALL_KINDS: &[ItemKind] = &[
+    ItemKind::Axe,
+    ItemKind::Knife,
+    ItemKind::Pack,
+    ItemKind::Tent,
+    ItemKind::Bedroll,
+    ItemKind::CookingPan,
+    ItemKind::Waterskin,
+    ItemKind::FlintAndSteel,
+    ItemKind::Herb,
+    ItemKind::Twig,
+    ItemKind::Stick,
+    ItemKind::Firewood,
+    ItemKind::GrassBlade,
+    ItemKind::Stone,
+    ItemKind::MossPatch,
+    ItemKind::Mud,
+    ItemKind::Ration,
+];
+
 impl ItemKind {
-    pub fn save_key(self) -> &'static str {
+    /// Single source of truth for per-kind metadata. The match is
+    /// exhaustive — adding a new `ItemKind` variant is a compile error
+    /// until this gains an arm.
+    pub fn def(self) -> ItemDef {
         match self {
-            ItemKind::Axe => "axe",
-            ItemKind::Knife => "knife",
-            ItemKind::Pack => "pack",
-            ItemKind::Tent => "tent",
-            ItemKind::Bedroll => "bedroll",
-            ItemKind::CookingPan => "cooking_pan",
-            ItemKind::Waterskin => "waterskin",
-            ItemKind::FlintAndSteel => "flint_and_steel",
-            ItemKind::Herb => "herb",
-            ItemKind::Twig => "twig",
-            ItemKind::Stick => "stick",
-            ItemKind::Firewood => "firewood",
-            ItemKind::GrassBlade => "grass_blade",
-            ItemKind::Stone => "stone",
-            ItemKind::MossPatch => "moss_patch",
-            ItemKind::Mud => "mud",
-            ItemKind::Ration => "ration",
+            ItemKind::Axe => ItemDef {
+                save_key: "axe",
+                name: "axe",
+                is_fungible: false,
+                glyph: b'P',
+                color: [180, 180, 200],
+            },
+            ItemKind::Knife => ItemDef {
+                save_key: "knife",
+                name: "knife",
+                is_fungible: false,
+                glyph: b'-',
+                color: [180, 180, 200],
+            },
+            ItemKind::Pack => ItemDef {
+                save_key: "pack",
+                name: "pack",
+                is_fungible: false,
+                glyph: b'[',
+                color: [130, 90, 50],
+            },
+            ItemKind::Tent => ItemDef {
+                save_key: "tent",
+                name: "tent",
+                is_fungible: false,
+                glyph: b'A',
+                color: [200, 180, 140],
+            },
+            ItemKind::Bedroll => ItemDef {
+                save_key: "bedroll",
+                name: "bedroll",
+                is_fungible: false,
+                glyph: b'=',
+                color: [220, 200, 160],
+            },
+            ItemKind::CookingPan => ItemDef {
+                save_key: "cooking_pan",
+                name: "cooking pan",
+                is_fungible: false,
+                glyph: b'O',
+                color: [80, 80, 90],
+            },
+            ItemKind::Waterskin => ItemDef {
+                save_key: "waterskin",
+                name: "waterskin",
+                is_fungible: false,
+                glyph: b'u',
+                color: [100, 140, 200],
+            },
+            ItemKind::FlintAndSteel => ItemDef {
+                save_key: "flint_and_steel",
+                name: "flint and steel",
+                is_fungible: false,
+                glyph: b'!',
+                color: [230, 140, 60],
+            },
+            ItemKind::Herb => ItemDef {
+                save_key: "herb",
+                name: "herb",
+                is_fungible: false,
+                glyph: b'*',
+                color: [80, 160, 70],
+            },
+            ItemKind::Twig => ItemDef {
+                save_key: "twig",
+                name: "twig",
+                is_fungible: true,
+                glyph: b',',
+                color: [200, 170, 110],
+            },
+            ItemKind::Stick => ItemDef {
+                save_key: "stick",
+                name: "stick",
+                is_fungible: true,
+                glyph: b'/',
+                color: [200, 170, 110],
+            },
+            ItemKind::Firewood => ItemDef {
+                save_key: "firewood",
+                name: "firewood",
+                is_fungible: true,
+                glyph: b'=',
+                color: [110, 80, 50],
+            },
+            ItemKind::GrassBlade => ItemDef {
+                save_key: "grass_blade",
+                name: "grass blade",
+                is_fungible: true,
+                glyph: b'"',
+                color: [80, 160, 70],
+            },
+            ItemKind::Stone => ItemDef {
+                save_key: "stone",
+                name: "stone",
+                is_fungible: true,
+                glyph: b'*',
+                color: [150, 150, 150],
+            },
+            ItemKind::MossPatch => ItemDef {
+                save_key: "moss_patch",
+                name: "moss patch",
+                is_fungible: true,
+                glyph: b'%',
+                color: [50, 100, 50],
+            },
+            ItemKind::Mud => ItemDef {
+                save_key: "mud",
+                name: "mud",
+                is_fungible: true,
+                glyph: b'%',
+                color: [110, 80, 50],
+            },
+            ItemKind::Ration => ItemDef {
+                save_key: "ration",
+                name: "ration",
+                is_fungible: true,
+                glyph: b'%',
+                color: [220, 200, 160],
+            },
         }
     }
 
+    pub fn save_key(self) -> &'static str {
+        self.def().save_key
+    }
+
     pub fn from_save_key(s: &str) -> Option<Self> {
-        Some(match s {
-            "axe" => ItemKind::Axe,
-            "knife" => ItemKind::Knife,
-            "pack" => ItemKind::Pack,
-            "tent" => ItemKind::Tent,
-            "bedroll" => ItemKind::Bedroll,
-            "cooking_pan" => ItemKind::CookingPan,
-            "waterskin" => ItemKind::Waterskin,
-            "flint_and_steel" => ItemKind::FlintAndSteel,
-            "herb" => ItemKind::Herb,
-            "twig" => ItemKind::Twig,
-            "stick" => ItemKind::Stick,
-            "firewood" => ItemKind::Firewood,
-            "grass_blade" => ItemKind::GrassBlade,
-            "stone" => ItemKind::Stone,
-            "moss_patch" => ItemKind::MossPatch,
-            "mud" => ItemKind::Mud,
-            "ration" => ItemKind::Ration,
-            _ => return None,
-        })
+        ALL_KINDS.iter().copied().find(|k| k.def().save_key == s)
     }
 
     pub fn is_fungible(self) -> bool {
-        matches!(
-            self,
-            ItemKind::Twig
-                | ItemKind::Stick
-                | ItemKind::Firewood
-                | ItemKind::GrassBlade
-                | ItemKind::Stone
-                | ItemKind::MossPatch
-                | ItemKind::Mud
-                | ItemKind::Ration
-        )
+        self.def().is_fungible
     }
 
     #[allow(dead_code)] // used by the command-menu (phase 7) and HUD inventory panel
     pub fn name(self) -> &'static str {
-        match self {
-            ItemKind::Axe => "axe",
-            ItemKind::Knife => "knife",
-            ItemKind::Pack => "pack",
-            ItemKind::Tent => "tent",
-            ItemKind::Bedroll => "bedroll",
-            ItemKind::CookingPan => "cooking pan",
-            ItemKind::Waterskin => "waterskin",
-            ItemKind::FlintAndSteel => "flint and steel",
-            ItemKind::Herb => "herb",
-            ItemKind::Twig => "twig",
-            ItemKind::Stick => "stick",
-            ItemKind::Firewood => "firewood",
-            ItemKind::GrassBlade => "grass blade",
-            ItemKind::Stone => "stone",
-            ItemKind::MossPatch => "moss patch",
-            ItemKind::Mud => "mud",
-            ItemKind::Ration => "ration",
-        }
+        self.def().name
     }
 
-    /// Glyph + RGB foreground color for ground rendering. Background uses the
-    /// cell's terrain background so items sit "on" the floor visually.
+    /// Glyph + RGB foreground color for ground rendering. Background uses
+    /// the cell's terrain background so items sit "on" the floor visually.
     pub fn glyph_color(self) -> (u8, [u8; 3]) {
-        match self {
-            ItemKind::Twig => (b',', [200, 170, 110]),
-            ItemKind::Stick => (b'/', [200, 170, 110]),
-            ItemKind::Firewood => (b'=', [110, 80, 50]),
-            ItemKind::GrassBlade => (b'"', [80, 160, 70]),
-            ItemKind::Stone => (b'*', [150, 150, 150]),
-            ItemKind::MossPatch => (b'%', [50, 100, 50]),
-            ItemKind::Mud => (b'%', [110, 80, 50]),
-            ItemKind::Ration => (b'%', [220, 200, 160]),
-            ItemKind::Axe => (b'P', [180, 180, 200]),
-            ItemKind::Knife => (b'-', [180, 180, 200]),
-            ItemKind::Pack => (b'[', [130, 90, 50]),
-            ItemKind::Waterskin => (b'u', [100, 140, 200]),
-            ItemKind::FlintAndSteel => (b'!', [230, 140, 60]),
-            ItemKind::Tent => (b'A', [200, 180, 140]),
-            ItemKind::Bedroll => (b'=', [220, 200, 160]),
-            ItemKind::CookingPan => (b'O', [80, 80, 90]),
-            ItemKind::Herb => (b'*', [80, 160, 70]),
-        }
+        let d = self.def();
+        (d.glyph, d.color)
     }
 }
 
@@ -420,29 +498,9 @@ pub fn starting_pack() -> Pack {
 mod tests {
     use super::*;
 
-    const ALL_KINDS: &[ItemKind] = &[
-        ItemKind::Axe,
-        ItemKind::Knife,
-        ItemKind::Pack,
-        ItemKind::Tent,
-        ItemKind::Bedroll,
-        ItemKind::CookingPan,
-        ItemKind::Waterskin,
-        ItemKind::FlintAndSteel,
-        ItemKind::Herb,
-        ItemKind::Twig,
-        ItemKind::Stick,
-        ItemKind::Firewood,
-        ItemKind::GrassBlade,
-        ItemKind::Stone,
-        ItemKind::MossPatch,
-        ItemKind::Mud,
-        ItemKind::Ration,
-    ];
-
     #[test]
     fn save_key_round_trip_for_every_kind() {
-        for &k in ALL_KINDS {
+        for &k in super::ALL_KINDS {
             let key = k.save_key();
             assert_eq!(
                 ItemKind::from_save_key(key),

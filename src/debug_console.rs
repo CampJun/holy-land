@@ -163,27 +163,7 @@ pub fn apply_debug_command(world: &mut World, cmd: DebugCommand) {
 
         DebugCommand::SetNeed(kind, value) => {
             let mut n = world.player_needs();
-            // Reset the matching sub-point accumulator too so the next
-            // tick starts fresh from the explicit value rather than
-            // immediately decrementing past a stale fractional.
-            match kind {
-                NeedKind::Thirst => {
-                    n.thirst = value;
-                    n.thirst_acc_secs = 0;
-                }
-                NeedKind::Hunger => {
-                    n.hunger = value;
-                    n.hunger_acc_secs = 0;
-                }
-                NeedKind::Sleep => {
-                    n.sleep = value;
-                    n.sleep_acc_secs = 0;
-                }
-                NeedKind::Warmth => {
-                    n.warmth = value;
-                    n.warmth_acc_secs = 0;
-                }
-            }
+            n.set(kind, value);
             world.set_player_needs(n);
             crate::log_info!("[debug] need {:?} = {}", kind, value);
         }
