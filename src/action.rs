@@ -28,6 +28,9 @@ const FIRE_MIN_TINDER: u32 = 1;
 const FIRE_MIN_KINDLING: u32 = 3;
 const FIRE_MIN_FUEL: u32 = 2;
 const FIRE_FUEL_SECONDS_PER_LIGHT: u32 = 3600;
+// FeedFire (phase 12): half the per-light burn since you're skipping
+// the tinder+kindling ignition synergy — just tossing a stick on.
+const FIRE_FUEL_SECONDS_PER_FEED: u32 = 1800;
 
 // Chop Tree (verb: ChopTree).
 const FELLED_FIREWOOD_MIN: u16 = 3;
@@ -47,6 +50,7 @@ pub enum ActionId {
     UnrollBedroll,
     SetupCamp,
     StartFire,
+    FeedFire,
     Sleep,
     Fishing,
 }
@@ -71,6 +75,7 @@ impl ActionId {
             // surfaced cost is the sum so the player sees the total.
             ActionId::SetupCamp => Self::PitchTent.base_cost() + Self::UnrollBedroll.base_cost(),
             ActionId::StartFire => 60,
+            ActionId::FeedFire => 15,
             ActionId::ChopTree => 120,
             ActionId::PickHerb => 10,
             // Sleep jumps the clock; the "60s" cost surfacing isn't
@@ -98,6 +103,7 @@ impl ActionId {
             ActionId::UnrollBedroll => "unroll_bedroll",
             ActionId::SetupCamp => "setup_camp",
             ActionId::StartFire => "start_fire",
+            ActionId::FeedFire => "feed_fire",
             ActionId::Sleep => "sleep",
             ActionId::Fishing => "fishing",
         }
@@ -117,6 +123,7 @@ impl ActionId {
             "unroll_bedroll" => ActionId::UnrollBedroll,
             "setup_camp" => ActionId::SetupCamp,
             "start_fire" => ActionId::StartFire,
+            "feed_fire" => ActionId::FeedFire,
             "sleep" => ActionId::Sleep,
             "fishing" => ActionId::Fishing,
             _ => return None,
@@ -195,6 +202,11 @@ pub const ALL_ACTIONS: &[ContextAction] = &[
         description: "Strike flint and steel over gathered kindling.",
     },
     ContextAction {
+        id: ActionId::FeedFire,
+        name: "Feed fire",
+        description: "Add a piece of firewood to a lit fire here.",
+    },
+    ContextAction {
         id: ActionId::Sleep,
         name: "Sleep",
         description: "Sleep until dawn or for 8 game-hours.",
@@ -261,6 +273,7 @@ pub fn evaluate(world: &World, id: ActionId) -> Availability {
             "need tent + bedroll in pack",
         ),
         ActionId::StartFire => eval_start_fire(world),
+        ActionId::FeedFire => eval_feed_fire(world),
         ActionId::Sleep => Availability::Unavailable {
             reason: "phase 16: sleep",
         },
@@ -340,6 +353,35 @@ fn eval_start_fire(world: &World) -> Availability {
     }
     Availability::Available {
         cost_game_seconds: ActionId::StartFire.base_cost(),
+    }
+}
+
+fn player_cell_has_lit_fire(world: &World) -> bool {
+    let p = world.player_pos();
+    world
+        .cell_at(p.x as i64, p.y as i64)
+        .map_or(false, |c| {
+            c.items
+                .iter()
+                .any(|i| matches!(i.metadata, ItemMetadata::Lit { .. }))
+        })
+}
+
+fn eval_feed_fire(world: &World) -> Availability {
+    if !player_cell_has_lit_fire(world) {
+        return Availability::Unavailable {
+            reason: "no fire here to feed",
+        };
+    }
+    // count_fire_materials already skips lit-fire fuel, so this won't
+    // falsely count the burning Firewood as a feedable reserve.
+    if count_fire_materials(world).fuel < 1 {
+        return Availability::Unavailable {
+            reason: "no firewood within reach",
+        };
+    }
+    Availability::Available {
+        cost_game_seconds: ActionId::FeedFire.base_cost(),
     }
 }
 
@@ -439,6 +481,7 @@ pub fn execute(world: &mut World, id: ActionId) -> ExecuteOutcome {
             ExecuteOutcome::Done("setting up camp...".to_string())
         }
         ActionId::StartFire => execute_start_fire(world),
+        ActionId::FeedFire => execute_feed_fire(world),
         ActionId::ChopTree => execute_chop_tree(world),
         ActionId::PickHerb => execute_pick_herb(world),
         ActionId::DrinkFromStream => execute_drink_from_stream(world),
@@ -516,6 +559,39 @@ fn execute_start_fire(world: &mut World) -> ExecuteOutcome {
 
     world.spend_action_time(ActionId::StartFire.base_cost());
     ExecuteOutcome::Done(msg)
+}
+
+/// Phase-12 instant verb. Requires a lit fire on the player's cell and
+/// at least one firewood in pack-or-3x3. Consumes one firewood and adds
+/// FIRE_FUEL_SECONDS_PER_FEED to the lit fire's remaining burn. No
+/// skill check (this isn't a Fire Making test) and no cap on stacked
+/// fuel time — stockpile-driven long fires are fine for slice 1.
+fn execute_feed_fire(world: &mut World) -> ExecuteOutcome {
+    // Defensive re-checks: the menu's evaluate should have gated this,
+    // but a debug command could have removed state between menu-open
+    // and confirm.
+    if !player_cell_has_lit_fire(world) {
+        return ExecuteOutcome::Done("no fire here to feed".to_string());
+    }
+    if !consume_one_fire_material(world, FireMaterial::Fuel) {
+        return ExecuteOutcome::Done("no firewood within reach".to_string());
+    }
+
+    // Bump the lit fire's remaining burn. There can be more than one
+    // Firewood on the cell (the unburnt reserve from a chop pile), so
+    // explicitly target the one with Lit metadata.
+    let pos = world.player_pos();
+    if let Some(cell) = world.cell_at_mut(pos.x as i64, pos.y as i64) {
+        for item in cell.items.iter_mut() {
+            if let ItemMetadata::Lit { fuel_seconds } = &mut item.metadata {
+                *fuel_seconds = fuel_seconds.saturating_add(FIRE_FUEL_SECONDS_PER_FEED);
+                break;
+            }
+        }
+    }
+
+    world.spend_action_time(ActionId::FeedFire.base_cost());
+    ExecuteOutcome::Done("fed the fire (+30m burn)".to_string())
 }
 
 #[derive(Clone, Copy)]
@@ -940,6 +1016,7 @@ mod tests {
             ActionId::UnrollBedroll,
             ActionId::SetupCamp,
             ActionId::StartFire,
+            ActionId::FeedFire,
             ActionId::ChopTree,
             ActionId::PickHerb,
         ];
@@ -1204,6 +1281,98 @@ mod tests {
             .map(|i| i.count as u32)
             .sum();
         assert!(post_twigs < 3, "at least 1 twig consumed");
+    }
+
+    #[test]
+    fn feed_fire_consumes_one_firewood_and_extends_burn() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Clean the 3x3 around the player so chunkgen debris doesn't
+        // bleed firewood into the pack/cells scan.
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                if let Some(c) = world.cell_at_mut((20 + dx) as i64, (15 + dy) as i64) {
+                    c.items.clear();
+                }
+            }
+        }
+        // Place a lit fire on the player's cell plus a feedable stack of
+        // 2 firewood on top.
+        let pos = world.player_pos();
+        if let Some(c) = world.cell_at_mut(pos.x as i64, pos.y as i64) {
+            c.items.push(ItemInstance::unique(
+                ItemKind::Firewood,
+                500,
+                None,
+                ItemMetadata::Lit { fuel_seconds: 600 },
+            ));
+            c.items.push(ItemInstance::stack(
+                ItemKind::Firewood,
+                2,
+                500,
+                None,
+                ItemMetadata::None,
+            ));
+        }
+
+        // Evaluator should report available.
+        match evaluate(&world, ActionId::FeedFire) {
+            Availability::Available { cost_game_seconds } => {
+                assert_eq!(cost_game_seconds, ActionId::FeedFire.base_cost());
+            }
+            other => panic!("expected Available, got {:?}", other),
+        }
+
+        let outcome = execute(&mut world, ActionId::FeedFire);
+        assert!(matches!(outcome, ExecuteOutcome::Done(_)));
+
+        let cell = world.cell_at(pos.x as i64, pos.y as i64).unwrap();
+        // Lit fire's fuel_seconds bumped by 1800.
+        let lit_secs = cell
+            .items
+            .iter()
+            .find_map(|i| match i.metadata {
+                ItemMetadata::Lit { fuel_seconds } => Some(fuel_seconds),
+                _ => None,
+            })
+            .expect("lit fire still present");
+        // The world's per-second fire tick fires during spend_action_time,
+        // so the lit fire also burns down by base_cost during the action.
+        // Net: starting 600s + FIRE_FUEL_SECONDS_PER_FEED bump - base_cost burn.
+        assert_eq!(
+            lit_secs,
+            600 + FIRE_FUEL_SECONDS_PER_FEED - ActionId::FeedFire.base_cost()
+        );
+        // Reserve firewood stack went 2 -> 1.
+        let reserve: u32 = cell
+            .items
+            .iter()
+            .filter(|i| i.kind == ItemKind::Firewood && !matches!(i.metadata, ItemMetadata::Lit { .. }))
+            .map(|i| i.count as u32)
+            .sum();
+        assert_eq!(reserve, 1);
+    }
+
+    #[test]
+    fn feed_fire_unavailable_without_lit_fire_on_cell() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Even with firewood handy, missing the lit fire blocks the verb.
+        let pos = world.player_pos();
+        if let Some(c) = world.cell_at_mut(pos.x as i64, pos.y as i64) {
+            c.items.clear();
+            c.items.push(ItemInstance::stack(
+                ItemKind::Firewood,
+                3,
+                500,
+                None,
+                ItemMetadata::None,
+            ));
+        }
+        match evaluate(&world, ActionId::FeedFire) {
+            Availability::Unavailable { reason } => {
+                assert_eq!(reason, "no fire here to feed");
+            }
+            other => panic!("expected Unavailable, got {:?}", other),
+        }
     }
 
     #[test]
