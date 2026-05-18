@@ -638,8 +638,12 @@ mod tests {
 
     #[test]
     fn pickup_unavailable_on_empty_cell() {
-        let world = World::new(CHUNK_W, CHUNK_H);
-        // Spawn cell has no items (debris is in adjacent cells).
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Force the spawn cell empty so the assertion isolates the
+        // empty-cell case from whatever chunkgen rolled.
+        if let Some(c) = world.cell_at_mut(20, 15) {
+            c.items.clear();
+        }
         let avail = evaluate(&world, ActionId::Pickup);
         assert!(matches!(avail, Availability::Unavailable { reason: "nothing here" }));
     }
@@ -822,17 +826,19 @@ mod tests {
 
     #[test]
     fn start_fire_unavailable_without_materials() {
-        let world = World::new(CHUNK_W, CHUNK_H);
-        // Spawn cell has no debris adjacent (debris is east/south/west of
-        // spawn but in cells that are not all 3x3 around player). Actually
-        // the seeded debris is at (21,15), (20,16), (19,15) — these ARE
-        // in the 3x3 around spawn (20,15). So we do have some materials.
-        // But not the full 1 tinder + 3 kindling + 2 fuel.
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Clear the 3x3 around spawn so the test isolates the missing-
+        // materials case from whatever chunkgen rolled.
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                if let Some(c) = world.cell_at_mut((20 + dx) as i64, (15 + dy) as i64) {
+                    c.items.clear();
+                }
+            }
+        }
         match eval_start_fire(&world) {
             Availability::Unavailable { reason } => {
-                // Some non-empty reason; the exact one depends on what's
-                // missing first per the eval's order (tinder, kindling,
-                // fuel).
+                // Should be the first-failing material check.
                 assert!(!reason.is_empty());
             }
             other => panic!("expected Unavailable, got {:?}", other),
@@ -879,13 +885,20 @@ mod tests {
     #[test]
     fn execute_start_fire_success_places_lit_fire_and_awards_xp() {
         let mut world = World::new(CHUNK_W, CHUNK_H);
-        // Force a roll outcome: skill check uses world.rng.d100(); set
-        // the RNG state to a known seed.
         world.rng = crate::skill::Rng::from_state(1);
 
+        // Clear the entire 3x3 around the player so chunkgen rolls
+        // don't add extra materials and confuse the post-execute
+        // counts. Then fill the spawn cell with exactly the kit.
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                if let Some(c) = world.cell_at_mut((20 + dx) as i64, (15 + dy) as i64) {
+                    c.items.clear();
+                }
+            }
+        }
         let pos = world.player_pos();
         if let Some(c) = world.cell_at_mut(pos.x as i64, pos.y as i64) {
-            c.items.clear();
             c.items.push(ItemInstance::stack(
                 ItemKind::Twig,
                 3,

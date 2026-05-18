@@ -1,4 +1,5 @@
 mod action;
+mod chunkgen;
 #[cfg(not(target_arch = "arm"))]
 mod debug_console;
 mod fov;
@@ -30,7 +31,7 @@ use save::{
 };
 use skill::{Rng, Skill, SkillKind, Skills};
 use world::{
-    brightness_at, dawns_elapsed, Position, TerrainKind, ViewMode, World,
+    brightness_at, dawns_elapsed, Position, ViewMode, World,
     MULTI_TURN_GAME_SEC_PER_FRAME,
 };
 
@@ -545,11 +546,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for vx in 0..WORLD_W as i32 {
                 let wx = cam_x + vx as i64;
                 let wy = cam_y + vy as i64;
-                // Base terrain glyph.
-                let (mut glyph, mut fg, bg) = match world.tile_at(wx, wy) {
-                    TerrainKind::Floor => (b'.', palette.floor_fg, palette.floor_bg),
-                    TerrainKind::Wall => (b'#', palette.wall_fg, palette.wall_bg),
-                };
+                // Base terrain glyph via TerrainDef (one source of truth
+                // for glyph + fg + bg per kind; see world.rs).
+                let terrain_def = world.tile_at(wx, wy).def();
+                let mut glyph = terrain_def.glyph;
+                let mut fg = Color::RGB(terrain_def.fg[0], terrain_def.fg[1], terrain_def.fg[2]);
+                let bg = Color::RGB(terrain_def.bg[0], terrain_def.bg[1], terrain_def.bg[2]);
                 let cell_state = world.cell_at(wx, wy);
                 let visible = cell_state.map(|c| c.visible).unwrap_or(false);
                 let explored = cell_state.map(|c| c.explored).unwrap_or(false);
@@ -1232,10 +1234,6 @@ fn pace_frame(frame_start: Instant, elapsed: Duration) -> Duration {
 struct Palette {
     letterbox: Color,
     player_fg: Color,
-    floor_fg: Color,
-    floor_bg: Color,
-    wall_fg: Color,
-    wall_bg: Color,
     hud_fg: Color,
     hud_bg: Color,
     need_critical_fg: Color,
@@ -1250,10 +1248,6 @@ impl Default for Palette {
         Self {
             letterbox: Color::RGB(8, 6, 4),
             player_fg: Color::RGB(240, 232, 200),
-            floor_fg: Color::RGB(70, 60, 45),
-            floor_bg: Color::RGB(20, 17, 13),
-            wall_fg: Color::RGB(140, 110, 75),
-            wall_bg: Color::RGB(35, 28, 20),
             hud_fg: Color::RGB(190, 205, 160),
             hud_bg: Color::RGB(20, 17, 13),
             need_critical_fg: Color::RGB(220, 110, 90),

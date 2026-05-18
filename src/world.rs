@@ -18,7 +18,7 @@ use hecs::{Entity, World as Ecs};
 use serde::{Deserialize, Serialize};
 
 use crate::action::ActionId;
-use crate::items::{starting_pack, ItemInstance, ItemKind, ItemMetadata, Pack};
+use crate::items::{starting_pack, ItemInstance, ItemMetadata, Pack};
 use crate::needs::{Needs, NeedsEnv};
 use crate::skill::{Rng, Skills};
 
@@ -146,10 +146,119 @@ pub struct ChunkCoord {
     pub cy: i32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TerrainKind {
-    Floor,
+    /// Forest-floor cell: walkable, no sight blocking. The default
+    /// surface for a phase-11 forest chunk.
+    Grass,
+    /// Open dirt patch: walkable, no sight blocking. Carved by trampling
+    /// in slice 2+; for slice 1 it shows up as small clearings inside
+    /// tree clusters.
+    BareDirt,
+    /// Sandy ring around the pond. Walkable; no sight blocking.
+    SandShore,
+    /// Mature tree: NOT walkable; blocks sight. Yields firewood when
+    /// chopped (phase 11b's ChopTree verb).
+    TreeTrunk,
+    /// Flowing stream. NOT walkable in slice 1. Drinkable/fillable from
+    /// adjacent cells (phase 11b verbs).
+    StreamWater,
+    /// Standing pond water. NOT walkable in slice 1. Drinkable + fishable
+    /// from adjacent cells.
+    PondWater,
+    /// Out-of-chunk default. NOT walkable; blocks sight.
     Wall,
+}
+
+pub struct TerrainDef {
+    /// Stable identifier for terrain-mutation save round-trip. Consumed
+    /// when phase 11b's ChopTree verb starts mutating terrain (tree ->
+    /// grass) and needs to persist the change.
+    #[allow(dead_code)] // wired by phase 11b's TerrainMutationSave
+    pub save_key: &'static str,
+    /// Human-readable name for the here-line ("you stand on grass").
+    #[allow(dead_code)] // wired by phase 11b's terrain-underfoot HUD
+    pub name: &'static str,
+    pub glyph: u8,
+    pub fg: [u8; 3],
+    pub bg: [u8; 3],
+    pub walkable: bool,
+    pub blocks_sight: bool,
+}
+
+impl TerrainKind {
+    /// Single source of truth for per-terrain rendering + game-rules
+    /// metadata. Adding a new terrain variant is a one-stop edit: add
+    /// the enum arm, then add an arm here. Exhaustive-match enforces it.
+    pub fn def(self) -> TerrainDef {
+        match self {
+            TerrainKind::Grass => TerrainDef {
+                save_key: "grass",
+                name: "grass",
+                glyph: b'.',
+                fg: [60, 110, 60],
+                bg: [15, 25, 15],
+                walkable: true,
+                blocks_sight: false,
+            },
+            TerrainKind::BareDirt => TerrainDef {
+                save_key: "bare_dirt",
+                name: "dirt",
+                glyph: b'.',
+                fg: [120, 90, 60],
+                bg: [20, 17, 13],
+                walkable: true,
+                blocks_sight: false,
+            },
+            TerrainKind::SandShore => TerrainDef {
+                save_key: "sand_shore",
+                name: "sand",
+                glyph: b'.',
+                fg: [200, 180, 120],
+                bg: [40, 35, 25],
+                walkable: true,
+                blocks_sight: false,
+            },
+            TerrainKind::TreeTrunk => TerrainDef {
+                save_key: "tree_trunk",
+                name: "tree",
+                // CP437 0x06 = ♠ (BLACK SPADE SUIT) — reads as a leafy
+                // canopy in monochrome glyph fonts.
+                glyph: 0x06,
+                fg: [70, 130, 50],
+                bg: [15, 25, 15],
+                walkable: false,
+                blocks_sight: true,
+            },
+            TerrainKind::StreamWater => TerrainDef {
+                save_key: "stream_water",
+                name: "stream",
+                glyph: b'~',
+                fg: [110, 170, 220],
+                bg: [25, 40, 60],
+                walkable: false,
+                blocks_sight: false,
+            },
+            TerrainKind::PondWater => TerrainDef {
+                save_key: "pond_water",
+                name: "pond",
+                glyph: b'~',
+                fg: [70, 130, 200],
+                bg: [20, 35, 55],
+                walkable: false,
+                blocks_sight: false,
+            },
+            TerrainKind::Wall => TerrainDef {
+                save_key: "wall",
+                name: "wall",
+                glyph: b'#',
+                fg: [140, 110, 75],
+                bg: [35, 28, 20],
+                walkable: false,
+                blocks_sight: true,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -165,17 +274,9 @@ pub struct CellState {
 }
 
 impl CellState {
-    fn floor() -> Self {
+    pub fn with_terrain(terrain: TerrainKind) -> Self {
         Self {
-            terrain: TerrainKind::Floor,
-            items: Vec::new(),
-            visible: false,
-            explored: false,
-        }
-    }
-    fn wall() -> Self {
-        Self {
-            terrain: TerrainKind::Wall,
+            terrain,
             items: Vec::new(),
             visible: false,
             explored: false,
@@ -299,7 +400,10 @@ impl World {
 
         let mut chunks = HashMap::new();
         let origin = ChunkCoord { cx: 0, cy: 0 };
-        chunks.insert(origin, Box::new(generate_chunk_phase3(origin)));
+        chunks.insert(
+            origin,
+            Box::new(crate::chunkgen::generate_chunk(origin, DEFAULT_SEED)),
+        );
 
         let mut ecs = Ecs::new();
         let spawn = Position {
@@ -328,13 +432,6 @@ impl World {
             active_action: None,
             rng: Rng::from_world_seed(DEFAULT_SEED),
         };
-        seed_phase3_debris(&mut world);
-        // The seeding marked the chunk dirty (via cell_at_mut); reset so a
-        // fresh game without modifications doesn't unnecessarily persist
-        // pristine debris.
-        if let Some(c) = world.chunks.get_mut(&origin) {
-            c.dirty = false;
-        }
         // First-frame FOV so the renderer doesn't draw a black screen on
         // the very first paint.
         world.recompute_fov();
@@ -397,7 +494,7 @@ impl World {
         let pos = self.player_pos();
         let nx = pos.x + dx;
         let ny = pos.y + dy;
-        if matches!(self.tile_at(nx as i64, ny as i64), TerrainKind::Floor) {
+        if self.tile_at(nx as i64, ny as i64).def().walkable {
             self.set_player_pos(Position { x: nx, y: ny });
             self.spend_action_time(COST_MOVE_TILE);
             self.recompute_fov();
@@ -654,7 +751,7 @@ impl World {
             for dx in -radius..=radius {
                 let wx = origin.x as i64 + dx as i64;
                 let wy = origin.y as i64 + dy as i64;
-                if matches!(self.tile_at(wx, wy), TerrainKind::Wall) {
+                if self.tile_at(wx, wy).def().blocks_sight {
                     blockers[blocker_idx(dx, dy)] = true;
                 }
             }
@@ -827,76 +924,10 @@ impl World {
     }
 }
 
-fn generate_chunk_phase3(coord: ChunkCoord) -> Chunk {
-    // Slice-1 placeholder: perimeter wall, floor inside. Phase 11 swaps in
-    // the authored stream/pond skeleton + seeded forest population.
-    let mut cells = Vec::with_capacity((CHUNK_W * CHUNK_H) as usize);
-    for y in 0..CHUNK_H {
-        for x in 0..CHUNK_W {
-            let is_edge = x == 0 || y == 0 || x == CHUNK_W - 1 || y == CHUNK_H - 1;
-            cells.push(if is_edge {
-                CellState::wall()
-            } else {
-                CellState::floor()
-            });
-        }
-    }
-    Chunk {
-        coord,
-        cells,
-        dirty: false,
-    }
-}
-
-// TODO(phase-11): remove this; replaced by chunkgen.rs's seeded debris table.
-fn seed_phase3_debris(world: &mut World) {
-    let spawn = world.player_pos();
-    // East of player: 3 twigs + 1 stone.
-    if let Some(c) = world.cell_at_mut((spawn.x + 1) as i64, spawn.y as i64) {
-        c.items
-            .push(ItemInstance::stack(ItemKind::Twig, 3, 5, None, ItemMetadata::None));
-        c.items.push(ItemInstance::stack(
-            ItemKind::Stone,
-            1,
-            200,
-            None,
-            ItemMetadata::None,
-        ));
-    }
-    // South of player: 3 sticks + 1 grass blade. Three sticks matches
-    // the phase-10 Fire Making kindling minimum so a fresh game can
-    // gather enough kindling without leaving the 3x3 around spawn.
-    if let Some(c) = world.cell_at_mut(spawn.x as i64, (spawn.y + 1) as i64) {
-        c.items.push(ItemInstance::stack(
-            ItemKind::Stick,
-            3,
-            50,
-            None,
-            ItemMetadata::None,
-        ));
-        c.items.push(ItemInstance::stack(
-            ItemKind::GrassBlade,
-            1,
-            2,
-            None,
-            ItemMetadata::None,
-        ));
-    }
-    // West of player: 1 moss patch.
-    if let Some(c) = world.cell_at_mut((spawn.x - 1) as i64, spawn.y as i64) {
-        c.items.push(ItemInstance::stack(
-            ItemKind::MossPatch,
-            1,
-            10,
-            None,
-            ItemMetadata::None,
-        ));
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::items::ItemKind;
 
     #[test]
     fn player_spawns_at_center() {
@@ -905,15 +936,18 @@ mod tests {
     }
 
     #[test]
-    fn walls_block_movement() {
+    fn off_map_walk_blocked_by_oob_wall() {
+        // Cell (0, 0) is in-chunk grass on the phase-11 forest; the
+        // out-of-bounds Wall guard sits at (-1, *) and (*, -1).
         let mut world = World::new(CHUNK_W, CHUNK_H);
-        world.set_player_pos(Position { x: 1, y: 1 });
-        // Step left into the west wall: blocked.
+        world.set_player_pos(Position { x: 0, y: 0 });
+        // Step left into (-1, 0): blocked by Wall (no chunk loaded
+        // outside (0, 0) yet).
         world.try_move_player(-1, 0);
-        assert_eq!(world.player_pos(), Position { x: 1, y: 1 });
-        // Step right onto floor: moves.
+        assert_eq!(world.player_pos(), Position { x: 0, y: 0 });
+        // Step right onto walkable terrain succeeds.
         world.try_move_player(1, 0);
-        assert_eq!(world.player_pos(), Position { x: 2, y: 1 });
+        assert_eq!(world.player_pos().x, 1);
     }
 
     #[test]
@@ -927,43 +961,39 @@ mod tests {
     }
 
     #[test]
-    fn chunk_zero_zero_initialized_with_perimeter_wall() {
+    fn chunk_zero_zero_has_walkable_grass_at_spawn() {
         let world = World::new(CHUNK_W, CHUNK_H);
-        // Inside is Floor.
-        assert_eq!(world.tile_at(5, 5), TerrainKind::Floor);
-        assert_eq!(world.tile_at(20, 15), TerrainKind::Floor);
-        // Edges are Wall.
-        assert_eq!(world.tile_at(0, 0), TerrainKind::Wall);
-        assert_eq!(world.tile_at(CHUNK_W as i64 - 1, 0), TerrainKind::Wall);
-        assert_eq!(world.tile_at(0, CHUNK_H as i64 - 1), TerrainKind::Wall);
-    }
-
-    #[test]
-    fn phase3_seeded_debris_is_findable() {
-        let world = World::new(CHUNK_W, CHUNK_H);
-        let east = world.cell_at(21, 15).expect("(21, 15) in chunk");
-        assert!(east.items.iter().any(|i| i.kind == ItemKind::Twig));
-        assert!(east.items.iter().any(|i| i.kind == ItemKind::Stone));
-        let south = world.cell_at(20, 16).expect("(20, 16) in chunk");
-        assert!(south.items.iter().any(|i| i.kind == ItemKind::Stick));
-        assert!(south.items.iter().any(|i| i.kind == ItemKind::GrassBlade));
-        let west = world.cell_at(19, 15).expect("(19, 15) in chunk");
-        assert!(west.items.iter().any(|i| i.kind == ItemKind::MossPatch));
+        // Spawn cell must be walkable Grass (chunkgen carves around the
+        // skeleton features so the player never starts inside water or
+        // a tree).
+        let spawn = world.tile_at(20, 15);
+        assert_eq!(spawn, TerrainKind::Grass);
+        assert!(spawn.def().walkable);
     }
 
     #[test]
     fn pickup_all_drains_cell_and_fills_pack() {
         let mut world = World::new(CHUNK_W, CHUNK_H);
-        // East of spawn: 3 twigs (5g each) + 1 stone (200g) = 215g.
-        world.try_move_player(1, 0);
-        assert_eq!(world.player_pos(), Position { x: 21, y: 15 });
-
+        // Build a deterministic scenario regardless of what chunkgen
+        // rolled: clear the cell, drop 3 twigs (5g each) + 1 stone (200g).
+        if let Some(c) = world.cell_at_mut(21, 15) {
+            c.items.clear();
+            c.items
+                .push(ItemInstance::stack(ItemKind::Twig, 3, 5, None, ItemMetadata::None));
+            c.items.push(ItemInstance::stack(
+                ItemKind::Stone,
+                1,
+                200,
+                None,
+                ItemMetadata::None,
+            ));
+        }
+        world.set_player_pos(Position { x: 21, y: 15 });
         let before = world.player_pack().total_weight_g();
         let picked = world.try_pickup_all_at_player();
         assert_eq!(picked, 2);
         let after = world.player_pack().total_weight_g();
         assert_eq!(after - before, 3 * 5 + 200);
-
         let cell = world.cell_at(21, 15).expect("cell exists");
         assert!(cell.items.is_empty());
     }
@@ -997,22 +1027,22 @@ mod tests {
     #[test]
     fn stackables_merge_in_pack_across_pickups() {
         let mut world = World::new(CHUNK_W, CHUNK_H);
-        // Drop a second twig pile west of spawn so we can pick up twigs twice.
-        let pos = world.player_pos();
-        if let Some(c) = world.cell_at_mut((pos.x - 1) as i64, pos.y as i64) {
-            // Replace the moss with twigs so the test is purely about twig
-            // stacking, not unrelated items.
+        // Two manually-set cells of twigs (3 east, 2 west of spawn). The
+        // test asserts that picking up both merges into one pack stack.
+        if let Some(c) = world.cell_at_mut(21, 15) {
+            c.items.clear();
+            c.items
+                .push(ItemInstance::stack(ItemKind::Twig, 3, 5, None, ItemMetadata::None));
+        }
+        if let Some(c) = world.cell_at_mut(19, 15) {
             c.items.clear();
             c.items
                 .push(ItemInstance::stack(ItemKind::Twig, 2, 5, None, ItemMetadata::None));
         }
 
-        // Pick up the east twigs (3) + stone.
-        world.try_move_player(1, 0);
+        world.set_player_pos(Position { x: 21, y: 15 });
         world.try_pickup_all_at_player();
-        // Walk back west two steps and pick up 2 more twigs.
-        world.try_move_player(-1, 0);
-        world.try_move_player(-1, 0);
+        world.set_player_pos(Position { x: 19, y: 15 });
         world.try_pickup_all_at_player();
 
         let pack = world.player_pack();
@@ -1162,7 +1192,11 @@ mod tests {
     #[test]
     fn pickup_advances_clock_only_when_something_picked_up() {
         let mut world = World::new(CHUNK_W, CHUNK_H);
-        // Empty cell: spawn cell has no items.
+        // Force the spawn cell empty so the no-pickup case is reliable
+        // regardless of what chunkgen rolled into it.
+        if let Some(c) = world.cell_at_mut(20, 15) {
+            c.items.clear();
+        }
         let before = world.clock_seconds;
         world.try_pickup_all_at_player();
         assert_eq!(
@@ -1170,12 +1204,18 @@ mod tests {
             "empty pickup must not burn time"
         );
 
-        // Walk east (5 sec) into seeded debris, then pick up (3 sec).
-        world.try_move_player(1, 0);
-        let after_move = world.clock_seconds;
-        assert_eq!(after_move - before, 5);
+        // Put one item next to the player and pick it up.
+        if let Some(c) = world.cell_at_mut(20, 15) {
+            c.items.push(ItemInstance::stack(
+                ItemKind::Twig,
+                1,
+                5,
+                None,
+                ItemMetadata::None,
+            ));
+        }
         world.try_pickup_all_at_player();
-        assert_eq!(world.clock_seconds - after_move, 3);
+        assert_eq!(world.clock_seconds - before, 3);
     }
 
     #[test]

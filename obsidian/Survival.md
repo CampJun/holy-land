@@ -24,8 +24,6 @@ kanban-plugin: board
 	Pan-on-fire cooks raw→cooked. Three herb uses: eat raw, brew tea, season cooked food.
 - [ ] [[Survival - Fishing]]
 	Slice-1 fishing: skill-less, flat 20%, 600 game-sec/attempt. Skill comes in slice 2.
-- [ ] [[Survival - Tile generation slice 1]]
-	40×30 single forest tile: authored stream+pond skeleton + seeded trees/herbs/debris.
 - [ ] [[Survival - Save schema v2]]
 	Schema bump for the redesign. Friendly-reject v1 saves.
 
@@ -47,6 +45,8 @@ kanban-plugin: board
 	Recursive shadowcasting; radius 20 day / 3 night; explored cells dim-rendered after leaving FOV; explored bits round-trip through save. Tree-blocker integration arrives with phase 11 tile gen; fire-as-light-source with phase 13 alongside warmth. **Phase 6 shipped.**
 - [ ] [[Survival - Skill system URW]]
 	0–100 percentile skills; `1d100 ≤ skill + mods` clamped [5,95]; +1 fail, +5 success; daily 20 XP cap that resets at 06:00 dawn; level-up when daily_xp ≥ (5 + value/5). xorshift32 RNG state persists across save to prevent save-scumming. **Phase 10 shipped.** Slice-2 adds Fishing/Cookery/Foraging against the same chassis.
+- [ ] [[Survival - Tile generation slice 1]]
+	TerrainKind expanded Grass / BareDirt / SandShore / TreeTrunk / StreamWater / PondWater / Wall. TerrainDef table per STYLE.md §3.5. Authored skeleton: stream from N edge into ellipse pond at (28, 22). Seeded population: 10-20 outer-ring trees + 3-5 herb patches + per-grass-cell debris (twigs/sticks/firewood/grass/stone/moss/mud). Deterministic per (world_seed, chunk_coord). Chunkgen handles slice-2 multi-chunk expansion. **Phase 11 shipped.** Remaining: ChopTree / PickHerb / DrinkFromStream / FillWaterskin verbs (phase 11b).
 - [ ] [[Survival - Fire Making]] — phase 13 wires the lit-fire warmth + FOV light source
 	StartFire verb: requires flint+steel in pack + 1 tinder/3 kindling/2 fuel within 3x3 cells or inventory. 60-sec attempt cost. Starting Fire Making 15% + flint+steel +30% = 45% effective success. Success consumes 1+2+1 of the reserve and drops a `Firewood` item with `ItemMetadata::Lit { fuel_seconds: 3600 }` on the player's cell. Failure burns the tinder only. World ticks lit fires per game-second; extinguishes at 0 fuel. **Phase 10 shipped.** Remaining: warmth integration (phase 13), fire-as-light-source (phase 13), "feed fire" verb (phase 12).
 

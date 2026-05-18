@@ -209,17 +209,19 @@ Verbs that use the skill route through `skill::skill_check_with_roll(value, mods
 
 ### 3.5 …`TerrainKind`
 1. Add variant to `TerrainKind` enum (world.rs).
-2. Update `generate_chunk_phase3` (will be replaced by `chunkgen.rs` in
-   phase 11; for now, add the new terrain to chunk gen) (world.rs).
-3. Add render glyph/color pair in `main.rs` render loop.
-4. Update `try_move_player` if the terrain is walkable.
-5. Update `recompute_fov` if the terrain blocks sight.
-6. (Optional) Add contextual verbs in `action.rs` evaluate that need
-   this terrain adjacent (e.g. DrinkFromStream).
-7. Add a movement / FOV test in `world::tests`.
+2. Add an arm to `TerrainKind::def()` (world.rs) — save_key, name,
+   glyph, fg, bg, walkable, blocks_sight. The exhaustive match
+   enforces this.
+3. Update `chunkgen.rs` if the new terrain should spawn naturally.
+4. (Optional) Add contextual verbs in `action.rs` evaluate that
+   need this terrain adjacent (e.g. DrinkFromStream).
+5. Add a movement / FOV / gen test in `world::tests` or
+   `chunkgen::tests`.
 
-When phase 11 lands, expect this list to consolidate via a `TerrainDef`
-table analogous to `ItemDef`.
+Render + walkability + sight-blocking all read from `def()`, so no
+edits to main.rs or world.rs's try_move_player / recompute_fov are
+needed for normal cases. Phase 11 collapsed what used to be 8+ edits
+into 2 — the `TerrainDef` table is the same pattern as `ItemDef`.
 
 ### 3.6 …debug command
 1. Add variant to `DebugCommand` enum (debug_console.rs).
