@@ -15,7 +15,7 @@ use sdl2::surface::Surface;
 use input::{Action, Input};
 use render::{draw_glyph, load_atlas, CELL_SIZE};
 use save::{MetaSave, RunSave, SaveHeader};
-use world::{Inventory, Item, Position, Region, Tile, World};
+use world::{Inventory, Item, Position, Region, Tile, World, SHRINE_PRICE};
 
 const WORLD_W: u32 = 40;
 const WORLD_H: u32 = 30;
@@ -42,6 +42,48 @@ struct Dialogue {
     speaker: &'static str,
     pages: Vec<&'static str>,
     page: usize,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum VendorChoice {
+    SellReeds,
+    BuyShrine,
+    Leave,
+}
+
+struct VendorMenu {
+    options: Vec<(VendorChoice, String)>,
+    selected: usize,
+}
+
+impl VendorMenu {
+    fn build(world: &World, meta: &MetaSave) -> Self {
+        let mut options: Vec<(VendorChoice, String)> = Vec::new();
+        let reeds = world.reed_count();
+        if reeds > 0 {
+            options.push((
+                VendorChoice::SellReeds,
+                format!("Sell reeds (x{}) -> {}*", reeds, reeds as u64),
+            ));
+        }
+        if !meta.shrine_unlocked {
+            let label = if meta.demon_currency >= SHRINE_PRICE {
+                format!("Buy shrine ({}*)", SHRINE_PRICE)
+            } else {
+                format!(
+                    "Buy shrine ({}* — need {} more)",
+                    SHRINE_PRICE,
+                    SHRINE_PRICE - meta.demon_currency
+                )
+            };
+            options.push((VendorChoice::BuyShrine, label));
+        }
+        options.push((VendorChoice::Leave, "Leave".to_string()));
+        Self {
+            options,
+            selected: 0,
+        }
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -99,6 +141,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut input = Input::new();
     let mut world = World::new(WORLD_W, WORLD_H);
     world.oasis_intro_complete = meta.oasis_intro_complete;
+    if meta.shrine_unlocked {
+        world.apply_shrine_unlock();
+    }
     let mut loaded_run_header: Option<SaveHeader> = None;
 
     if let Ok(run) = save::load_run(&save_dir.join(RUN_FILE)) {
@@ -108,11 +153,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         loaded_run_header = Some(run.header.clone());
         let restored_region = Region::from_save_key(&run.region).unwrap_or(Region::Oasis);
-        world.region = restored_region;
-        world.set_player_pos(Position {
+        let restored_pos = Position {
             x: run.player_x,
             y: run.player_y,
-        });
+        };
         // Build the inventory from the new field. If a pre-inventory save is
         // mid-quest (no inventory data yet, intro not finished), seed from the
         // legacy `reeds_harvested` counter so the player keeps their progress.
@@ -120,7 +164,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if inventory.is_empty() && !meta.oasis_intro_complete && run.reeds_harvested > 0 {
             inventory.add(Item::Reed, run.reeds_harvested as u32);
         }
+        // Order matters: lay the oasis state and ground items down first, then
+        // enter_region performs the player move and runs auto-pickup at the
+        // landing tile against the restored ground items.
         world.restore_oasis_state(&run.harvested_reeds, meta.oasis_intro_complete, inventory);
+        let ground_items: Vec<(String, u32, i32, i32)> = run
+            .ground_items
+            .iter()
+            .map(|g| (g.kind.clone(), g.count, g.x, g.y))
+            .collect();
+        world.restore_ground_items(&ground_items);
+        world.enter_region(restored_region, restored_pos);
     }
 
     let palette = Palette::default();
@@ -146,6 +200,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))
     };
     let mut inventory_open = false;
+    let mut vendor: Option<VendorMenu> = None;
     let mut prev_frame: Option<Instant> = None;
 
     'main: loop {
@@ -167,6 +222,73 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         input.poll_gamepad();
 
         for action in input.drain() {
+            if let Some(menu) = vendor.as_mut() {
+                let count = menu.options.len();
+                match action {
+                    Action::Up => {
+                        if count > 0 {
+                            menu.selected = (menu.selected + count - 1) % count;
+                        }
+                    }
+                    Action::Down => {
+                        if count > 0 {
+                            menu.selected = (menu.selected + 1) % count;
+                        }
+                    }
+                    Action::A => {
+                        let (choice, _) = menu.options[menu.selected];
+                        match choice {
+                            VendorChoice::SellReeds => {
+                                let reeds = world.reed_count();
+                                if reeds > 0 {
+                                    world.consume_reeds(reeds);
+                                    meta.demon_currency =
+                                        meta.demon_currency.saturating_add(reeds as u64);
+                                }
+                                vendor = Some(VendorMenu::build(&world, &meta));
+                                save_game(
+                                    &save_dir,
+                                    &mut meta,
+                                    &world,
+                                    &mut prev_meta_header,
+                                    &mut prev_run_header,
+                                );
+                            }
+                            VendorChoice::BuyShrine => {
+                                if !meta.shrine_unlocked
+                                    && meta.demon_currency >= SHRINE_PRICE
+                                {
+                                    meta.demon_currency -= SHRINE_PRICE;
+                                    meta.shrine_unlocked = true;
+                                    world.apply_shrine_unlock();
+                                    vendor = None;
+                                    dialogue = Some(Dialogue::new(
+                                        "Oasis Keeper",
+                                        vec!["The shrine stands. The hand of the holy will steady you."],
+                                    ));
+                                    save_game(
+                                        &save_dir,
+                                        &mut meta,
+                                        &world,
+                                        &mut prev_meta_header,
+                                        &mut prev_run_header,
+                                    );
+                                } else {
+                                    // Insufficient funds — rebuild so the
+                                    // updated "need N more" label refreshes.
+                                    vendor = Some(VendorMenu::build(&world, &meta));
+                                }
+                            }
+                            VendorChoice::Leave => vendor = None,
+                        }
+                    }
+                    Action::B => vendor = None,
+                    Action::Start => break 'main,
+                    _ => {}
+                }
+                continue;
+            }
+
             if inventory_open {
                 match action {
                     Action::Y | Action::B => inventory_open = false,
@@ -206,7 +328,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Action::Down => world.try_move_player(0, 1),
                 Action::Left => world.try_move_player(-1, 0),
                 Action::Right => world.try_move_player(1, 0),
-                Action::A => handle_interaction(&mut world, &mut meta, &mut dialogue),
+                Action::A => {
+                    match handle_interaction(&mut world, &mut meta, &mut dialogue) {
+                        InteractionResult::OpenVendor => {
+                            vendor = Some(VendorMenu::build(&world, &meta));
+                        }
+                        InteractionResult::None => {}
+                    }
+                }
                 Action::Y => {
                     inventory_open = true;
                     world_action = false;
@@ -235,6 +364,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 world.tick_wilderness();
             }
+            if world.player_is_dead() {
+                world.respawn_to_oasis();
+                dialogue = Some(Dialogue::new(
+                    "Defeat",
+                    vec!["You fell. You wake at the oasis."],
+                ));
+            }
+            meta.demon_currency = meta
+                .demon_currency
+                .saturating_add(world.take_essence_gained());
+            // Any wilderness <-> oasis crossing — safe return, death respawn,
+            // or step-in portal — is a checkpoint. Auto-save so currency and
+            // run state don't evaporate on crash or quit-without-save.
+            if pre_region != world.region {
+                save_game(
+                    &save_dir,
+                    &mut meta,
+                    &world,
+                    &mut prev_meta_header,
+                    &mut prev_run_header,
+                );
+            }
         }
 
         // Camera in world coords. While the world fits the viewport we anchor
@@ -249,7 +400,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let pwy = player.y as i64;
         let in_oasis = world.region == Region::Oasis;
         let keeper = world.keeper_pos();
-        let ui_cells = build_ui_cells(&world, dialogue.as_ref(), inventory_open, &palette);
+        let demon_positions: Vec<Position> = if in_oasis {
+            Vec::new()
+        } else {
+            world.demon_positions()
+        };
+        let ground_items: Vec<(Position, Item, u32)> = if in_oasis {
+            Vec::new()
+        } else {
+            world.ground_items()
+        };
+        let ui_cells = build_ui_cells(
+            &world,
+            dialogue.as_ref(),
+            inventory_open,
+            vendor.as_ref(),
+            meta.demon_currency,
+            &palette,
+        );
 
         let draw_start = Instant::now();
         let mut changed_cells = 0;
@@ -266,6 +434,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Tile::Floor => (b'.', palette.floor_fg, palette.floor_bg),
                     Tile::Wall => (b'#', palette.wall_fg, palette.wall_bg),
                     Tile::Portal => (portal_glyph, palette.portal_fg, palette.floor_bg),
+                    Tile::Shrine => (b'^', palette.shrine_fg, palette.wall_bg),
                 };
                 if wx == pwx && wy == pwy {
                     glyph = b'@';
@@ -273,6 +442,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else if in_oasis && wx == keeper.x as i64 && wy == keeper.y as i64 {
                     glyph = b'&';
                     fg = palette.keeper_fg;
+                } else if !in_oasis
+                    && demon_positions
+                        .iter()
+                        .any(|p| p.x as i64 == wx && p.y as i64 == wy)
+                {
+                    glyph = b'd';
+                    fg = palette.demon_fg;
+                } else if let Some((_, item, _)) = ground_items
+                    .iter()
+                    .find(|(p, _, _)| p.x as i64 == wx && p.y as i64 == wy)
+                {
+                    glyph = item.glyph();
+                    fg = item_fg(*item, &palette);
                 } else if in_oasis && world.is_unharvested_reed_at(wx as i32, wy as i32) {
                     glyph = b'"';
                     fg = palette.reed_fg;
@@ -359,13 +541,20 @@ impl Dialogue {
     }
 }
 
-fn handle_interaction(world: &mut World, meta: &mut MetaSave, dialogue: &mut Option<Dialogue>) {
+enum InteractionResult {
+    None,
+    OpenVendor,
+}
+
+fn handle_interaction(
+    world: &mut World,
+    meta: &mut MetaSave,
+    dialogue: &mut Option<Dialogue>,
+) -> InteractionResult {
     if world.player_is_adjacent_to_keeper() {
         if world.oasis_intro_complete {
-            *dialogue = Some(Dialogue::new(
-                "Oasis Keeper",
-                vec!["Small work keeps a place alive."],
-            ));
+            // Intro done — talking to the keeper is a vendor flow now.
+            return InteractionResult::OpenVendor;
         } else if world.reed_count() >= REEDS_REQUIRED {
             world.consume_reeds(REEDS_REQUIRED);
             complete_starter_oasis(world, meta);
@@ -382,6 +571,7 @@ fn handle_interaction(world: &mut World, meta: &mut MetaSave, dialogue: &mut Opt
     } else if world.try_harvest_reed_near_player() {
         *dialogue = Some(Dialogue::new("Reeds", vec!["You cut a bundle of reeds."]));
     }
+    InteractionResult::None
 }
 
 fn complete_starter_oasis(world: &mut World, meta: &mut MetaSave) {
@@ -423,6 +613,11 @@ fn save_game(
     run.harvested_reeds = world.harvested_reeds();
     run.inventory = world.inventory.to_save();
     run.region = world.region.save_key().to_string();
+    run.ground_items = world
+        .ground_items_save()
+        .into_iter()
+        .map(|(kind, count, x, y)| save::GroundItemSave { kind, count, x, y })
+        .collect();
     if let Err(e) = save::save_atomic(&save_dir.join(RUN_FILE), &run) {
         eprintln!("run save failed: {}", e);
     } else {
@@ -435,6 +630,8 @@ fn build_ui_cells(
     world: &World,
     dialogue: Option<&Dialogue>,
     inventory_open: bool,
+    vendor: Option<&VendorMenu>,
+    demon_currency: u64,
     palette: &Palette,
 ) -> Vec<Option<Cell>> {
     let mut cells = vec![None; (WORLD_W * WORLD_H) as usize];
@@ -449,9 +646,19 @@ fn build_ui_cells(
         Region::Wilderness => "Wilderness",
     };
     put_text(&mut cells, 1, 1, region_label, palette.hud_fg, palette.hud_bg);
+    let hp = world.player_hp();
+    let hp_text = format!("HP {}/{}", hp.current, hp.max);
+    put_text(&mut cells, 13, 1, &hp_text, palette.player_fg, palette.hud_bg);
+    let essence_text = format!("Essence {}", demon_currency);
+    put_text(&mut cells, 1, 2, &essence_text, palette.essence_fg, palette.hud_bg);
 
     if inventory_open {
         draw_inventory_panel(&mut cells, world, palette);
+        return cells;
+    }
+
+    if let Some(menu) = vendor {
+        draw_vendor_panel(&mut cells, menu, palette);
         return cells;
     }
 
@@ -546,6 +753,52 @@ fn item_fg(item: Item, palette: &Palette) -> Color {
     match item {
         Item::Reed => palette.reed_fg,
     }
+}
+
+fn draw_vendor_panel(cells: &mut [Option<Cell>], menu: &VendorMenu, palette: &Palette) {
+    let x = 6;
+    let y = 6;
+    let w = 28;
+    let h = 16;
+    draw_panel(cells, x, y, w, h, palette.panel_fg, palette.panel_bg);
+    put_text(
+        cells,
+        x + 2,
+        y + 1,
+        "Oasis Keeper",
+        palette.keeper_fg,
+        palette.panel_bg,
+    );
+    let list_x = x + 2;
+    let list_y = y + 3;
+    for (row, (_, label)) in menu.options.iter().enumerate() {
+        let row_y = list_y + row as i32;
+        let cursor = if row == menu.selected { b'>' } else { b' ' };
+        put_cell(
+            cells,
+            list_x,
+            row_y,
+            Cell {
+                glyph: cursor,
+                fg: palette.keeper_fg,
+                bg: palette.panel_bg,
+            },
+        );
+        let fg = if row == menu.selected {
+            palette.panel_fg
+        } else {
+            palette.hud_fg
+        };
+        put_text(cells, list_x + 2, row_y, label, fg, palette.panel_bg);
+    }
+    put_text(
+        cells,
+        x + 2,
+        y + h - 2,
+        "A select / B leave",
+        palette.hud_fg,
+        palette.panel_bg,
+    );
 }
 
 fn draw_panel(
@@ -672,6 +925,9 @@ struct Palette {
     wall_fg: Color,
     wall_bg: Color,
     portal_fg: Color,
+    demon_fg: Color,
+    essence_fg: Color,
+    shrine_fg: Color,
     hud_fg: Color,
     hud_bg: Color,
     panel_fg: Color,
@@ -690,6 +946,9 @@ impl Default for Palette {
             wall_fg: Color::RGB(140, 110, 75),
             wall_bg: Color::RGB(35, 28, 20),
             portal_fg: Color::RGB(230, 200, 120),
+            demon_fg: Color::RGB(220, 80, 90),
+            essence_fg: Color::RGB(210, 170, 95),
+            shrine_fg: Color::RGB(245, 235, 180),
             hud_fg: Color::RGB(190, 205, 160),
             hud_bg: Color::RGB(20, 17, 13),
             panel_fg: Color::RGB(218, 205, 170),

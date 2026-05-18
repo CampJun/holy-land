@@ -61,6 +61,8 @@ pub struct MetaSave {
     pub unlocks: Vec<String>,
     #[serde(default)]
     pub oasis_intro_complete: bool,
+    #[serde(default)]
+    pub shrine_unlocked: bool,
 }
 
 impl MetaSave {
@@ -72,8 +74,17 @@ impl MetaSave {
             deity_affinity: BTreeMap::new(),
             unlocks: Vec::new(),
             oasis_intro_complete: false,
+            shrine_unlocked: false,
         }
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GroundItemSave {
+    pub kind: String,
+    pub count: u32,
+    pub x: i32,
+    pub y: i32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -94,6 +105,8 @@ pub struct RunSave {
     pub inventory: BTreeMap<String, u32>,
     #[serde(default = "default_region")]
     pub region: String,
+    #[serde(default)]
+    pub ground_items: Vec<GroundItemSave>,
 }
 
 fn default_region() -> String {
@@ -110,6 +123,7 @@ impl RunSave {
             harvested_reeds: Vec::new(),
             inventory: BTreeMap::new(),
             region: default_region(),
+            ground_items: Vec::new(),
         }
     }
 }
@@ -220,6 +234,12 @@ mod tests {
             harvested_reeds: vec![[8, 5], [9, 5]],
             inventory,
             region: "wilderness".to_string(),
+            ground_items: vec![GroundItemSave {
+                kind: "reed".to_string(),
+                count: 2,
+                x: 12,
+                y: 14,
+            }],
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
@@ -228,6 +248,11 @@ mod tests {
         assert_eq!(loaded.harvested_reeds, vec![[8, 5], [9, 5]]);
         assert_eq!(loaded.inventory.get("reed"), Some(&2));
         assert_eq!(loaded.region, "wilderness");
+        assert_eq!(loaded.ground_items.len(), 1);
+        assert_eq!(loaded.ground_items[0].kind, "reed");
+        assert_eq!(loaded.ground_items[0].count, 2);
+        assert_eq!(loaded.ground_items[0].x, 12);
+        assert_eq!(loaded.ground_items[0].y, 14);
 
         fs::remove_dir_all(&dir).ok();
     }
