@@ -84,6 +84,31 @@ pub struct RunSave {
     pub pack: PackSave,
     #[serde(default)]
     pub cell_items: Vec<CellItemsSave>,
+    // Phase 4 (additive):
+    #[serde(default)]
+    pub clock_seconds: u64,
+    #[serde(default)]
+    pub needs: NeedsSave,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct NeedsSave {
+    #[serde(default)]
+    pub thirst: u8,
+    #[serde(default)]
+    pub hunger: u8,
+    #[serde(default)]
+    pub sleep: u8,
+    #[serde(default)]
+    pub warmth: u8,
+    #[serde(default)]
+    pub thirst_acc_secs: u32,
+    #[serde(default)]
+    pub hunger_acc_secs: u32,
+    #[serde(default)]
+    pub sleep_acc_secs: u32,
+    #[serde(default)]
+    pub warmth_acc_secs: u32,
 }
 
 impl RunSave {
@@ -94,6 +119,8 @@ impl RunSave {
             player_y: 0,
             pack: PackSave::default(),
             cell_items: Vec::new(),
+            clock_seconds: 0,
+            needs: NeedsSave::default(),
         }
     }
 }
@@ -239,6 +266,17 @@ mod tests {
             player_y: 7,
             pack: PackSave::default(),
             cell_items: Vec::new(),
+            clock_seconds: 50_400,
+            needs: NeedsSave {
+                thirst: 75,
+                hunger: 75,
+                sleep: 75,
+                warmth: 100,
+                thirst_acc_secs: 0,
+                hunger_acc_secs: 0,
+                sleep_acc_secs: 0,
+                warmth_acc_secs: 0,
+            },
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
@@ -247,6 +285,8 @@ mod tests {
         assert_eq!(loaded.pack.capacity_g, 0);
         assert!(loaded.pack.contents.is_empty());
         assert!(loaded.cell_items.is_empty());
+        assert_eq!(loaded.clock_seconds, 50_400);
+        assert_eq!(loaded.needs.warmth, 100);
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -301,6 +341,8 @@ mod tests {
             player_y: 15,
             pack,
             cell_items,
+            clock_seconds: 0,
+            needs: NeedsSave::default(),
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
@@ -349,6 +391,10 @@ mod tests {
         assert_eq!(loaded.pack.capacity_g, 0);
         assert!(loaded.pack.contents.is_empty());
         assert!(loaded.cell_items.is_empty());
+        // Phase-4 fields must default safely on legacy saves too.
+        assert_eq!(loaded.clock_seconds, 0);
+        assert_eq!(loaded.needs.thirst, 0);
+        assert_eq!(loaded.needs.warmth, 0);
 
         fs::remove_dir_all(&dir).ok();
     }

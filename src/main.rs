@@ -1,5 +1,6 @@
 mod input;
 mod items;
+mod needs;
 mod platform;
 mod render;
 mod save;
@@ -15,8 +16,9 @@ use sdl2::surface::Surface;
 
 use input::{Action, Input};
 use items::{ItemInstance, Pack};
+use needs::Needs;
 use render::{draw_glyph, load_atlas, CELL_SIZE};
-use save::{CellItemsSave, MetaSave, RunSave, SaveHeader};
+use save::{CellItemsSave, MetaSave, NeedsSave, RunSave, SaveHeader};
 use world::{Position, TerrainKind, World};
 
 const WORLD_W: u32 = 40;
@@ -97,11 +99,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Ok(run) = save::load_run(&save_dir.join(RUN_FILE)) {
         eprintln!(
-            "loaded run save (player at {},{}, pack {}g, {} non-empty cells)",
+            "loaded run save (player at {},{}, pack {}g, {} non-empty cells, clock {}s)",
             run.player_x,
             run.player_y,
             run.pack.capacity_g,
-            run.cell_items.len()
+            run.cell_items.len(),
+            run.clock_seconds,
         );
         prev_run_header = Some(run.header.clone());
         world.set_player_pos(Position {
@@ -127,6 +130,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .collect();
             world.restore_cell_items(snapshot);
+        }
+        // Phase-4 clock + needs. Legacy saves (pre-phase-4) write zeros for
+        // these defaults; treat zeros as "no data, keep starting state".
+        if run.clock_seconds > 0 {
+            world.clock_seconds = run.clock_seconds;
+        }
+        if run.needs.warmth > 0
+            || run.needs.thirst > 0
+            || run.needs.hunger > 0
+            || run.needs.sleep > 0
+        {
+            world.set_player_needs(Needs {
+                thirst: run.needs.thirst,
+                hunger: run.needs.hunger,
+                sleep: run.needs.sleep,
+                warmth: run.needs.warmth,
+                thirst_acc_secs: run.needs.thirst_acc_secs,
+                hunger_acc_secs: run.needs.hunger_acc_secs,
+                sleep_acc_secs: run.needs.sleep_acc_secs,
+                warmth_acc_secs: run.needs.warmth_acc_secs,
+            });
         }
     }
 
@@ -197,7 +221,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let p = world.player_pack();
             (p.total_weight_g(), p.capacity_g)
         };
-        let ui_cells = build_ui_cells(&palette, pack_weight_g, pack_capacity_g);
+        let needs = world.player_needs();
+        let (clock_h, clock_m) = world.clock_hm();
+        let day = world.day_count();
+        let is_night = world.is_night();
+        let ui_cells = build_ui_cells(
+            &palette,
+            pack_weight_g,
+            pack_capacity_g,
+            needs,
+            day,
+            clock_h,
+            clock_m,
+            is_night,
+        );
 
         let draw_start = Instant::now();
         let mut changed_cells = 0;
@@ -321,6 +358,18 @@ fn save_game(
             items: items.iter().map(|i| i.to_save()).collect(),
         })
         .collect();
+    run.clock_seconds = world.clock_seconds;
+    let n = world.player_needs();
+    run.needs = NeedsSave {
+        thirst: n.thirst,
+        hunger: n.hunger,
+        sleep: n.sleep,
+        warmth: n.warmth,
+        thirst_acc_secs: n.thirst_acc_secs,
+        hunger_acc_secs: n.hunger_acc_secs,
+        sleep_acc_secs: n.sleep_acc_secs,
+        warmth_acc_secs: n.warmth_acc_secs,
+    };
     if let Err(e) = save::save_atomic(&save_dir.join(RUN_FILE), &run) {
         eprintln!("run save failed: {}", e);
     } else {
@@ -335,9 +384,23 @@ fn save_game(
     }
 }
 
-fn build_ui_cells(palette: &Palette, pack_weight_g: u32, pack_capacity_g: u32) -> Vec<Option<Cell>> {
+#[allow(clippy::too_many_arguments)]
+fn build_ui_cells(
+    palette: &Palette,
+    pack_weight_g: u32,
+    pack_capacity_g: u32,
+    needs: Needs,
+    day: u64,
+    clock_h: u8,
+    clock_m: u8,
+    is_night: bool,
+) -> Vec<Option<Cell>> {
     let mut cells = vec![None; (WORLD_W * WORLD_H) as usize];
-    put_text(&mut cells, 1, 1, "Survival", palette.hud_fg, palette.hud_bg);
+
+    // Row 1: "Day N  HH:MM (day/night)"      "Pack X.X / X.X kg"
+    let suffix = if is_night { "night" } else { "day" };
+    let left = format!("Day {} {:02}:{:02} {}", day, clock_h, clock_m, suffix);
+    put_text(&mut cells, 1, 1, &left, palette.hud_fg, palette.hud_bg);
     let weight = format!(
         "Pack {:.1} / {:.1} kg",
         pack_weight_g as f32 / 1000.0,
@@ -345,6 +408,20 @@ fn build_ui_cells(palette: &Palette, pack_weight_g: u32, pack_capacity_g: u32) -
     );
     let weight_x = WORLD_W as i32 - weight.len() as i32 - 1;
     put_text(&mut cells, weight_x, 1, &weight, palette.hud_fg, palette.hud_bg);
+
+    // Row 2: four need meters with a critical-color shift.
+    let meters = format!(
+        "Thirst {:3}  Hunger {:3}  Sleep {:3}  Warmth {:3}",
+        needs.thirst, needs.hunger, needs.sleep, needs.warmth
+    );
+    let critical = needs.thirst.min(needs.hunger).min(needs.sleep).min(needs.warmth) < 25;
+    let fg = if critical {
+        palette.need_critical_fg
+    } else {
+        palette.hud_fg
+    };
+    put_text(&mut cells, 1, 2, &meters, fg, palette.hud_bg);
+
     cells
 }
 
@@ -418,6 +495,7 @@ struct Palette {
     wall_bg: Color,
     hud_fg: Color,
     hud_bg: Color,
+    need_critical_fg: Color,
 }
 
 impl Default for Palette {
@@ -431,6 +509,7 @@ impl Default for Palette {
             wall_bg: Color::RGB(35, 28, 20),
             hud_fg: Color::RGB(190, 205, 160),
             hud_bg: Color::RGB(20, 17, 13),
+            need_critical_fg: Color::RGB(220, 110, 90),
         }
     }
 }

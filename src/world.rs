@@ -18,6 +18,7 @@ use hecs::{Entity, World as Ecs};
 use serde::{Deserialize, Serialize};
 
 use crate::items::{starting_pack, ItemInstance, ItemKind, ItemMetadata, Pack};
+use crate::needs::{Needs, NeedsEnv};
 
 pub const CHUNK_W: u32 = 40;
 pub const CHUNK_H: u32 = 30;
@@ -26,6 +27,18 @@ pub const CHUNK_H: u32 = 30;
 // because debris is a fixed test fixture, but the field is wired through so
 // `generate_chunk` can become seed-driven without a struct change.
 const DEFAULT_SEED: u64 = 0xC0FFEE_F00D_u64;
+
+/// Player spawns at 14:00 game-time per master plan (6 hours of daylight
+/// before dusk at 20:00). Seconds since midnight: 14 × 3600 = 50_400.
+pub const STARTING_CLOCK_SECONDS: u64 = 14 * 3600;
+pub const DAY_LENGTH_SECONDS: u64 = 24 * 3600;
+pub const DAWN_HOUR: u64 = 6;
+pub const DUSK_HOUR: u64 = 20;
+
+/// Action costs in game-seconds. Read by the move/pickup verbs in this
+/// module and exposed for phase-7's command-menu cost surfacing.
+pub const COST_MOVE_TILE: u32 = 5;
+pub const COST_PICKUP: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ChunkCoord {
@@ -88,6 +101,10 @@ pub struct World {
     pub chunks: HashMap<ChunkCoord, Box<Chunk>>,
     #[allow(dead_code)] // consumed by chunkgen.rs in phase 11 (seeded gen)
     pub seed: u64,
+    /// Game-time clock in seconds since "game start" (not real-time). Wraps
+    /// the 24-hour day for time-of-day queries via div/mod with
+    /// DAY_LENGTH_SECONDS.
+    pub clock_seconds: u64,
     pub ecs: Ecs,
     pub player: Entity,
 }
@@ -119,11 +136,13 @@ impl World {
                 bg: [20, 17, 13, 255],
             },
             starting_pack(),
+            Needs::starting(),
         ));
 
         let mut world = Self {
             chunks,
             seed: DEFAULT_SEED,
+            clock_seconds: STARTING_CLOCK_SECONDS,
             ecs,
             player,
         };
@@ -195,7 +214,68 @@ impl World {
         let ny = pos.y + dy;
         if matches!(self.tile_at(nx as i64, ny as i64), TerrainKind::Floor) {
             self.set_player_pos(Position { x: nx, y: ny });
+            self.spend_action_time(COST_MOVE_TILE);
         }
+    }
+
+    pub fn player_needs(&self) -> Needs {
+        *self
+            .ecs
+            .get::<&Needs>(self.player)
+            .expect("player has Needs")
+    }
+
+    pub fn set_player_needs(&mut self, needs: Needs) {
+        *self
+            .ecs
+            .get::<&mut Needs>(self.player)
+            .expect("player has Needs") = needs;
+    }
+
+    /// True if the in-game clock is between dusk and dawn.
+    pub fn is_night(&self) -> bool {
+        let time_of_day = self.clock_seconds % DAY_LENGTH_SECONDS;
+        let hour = time_of_day / 3600;
+        hour < DAWN_HOUR || hour >= DUSK_HOUR
+    }
+
+    /// (hours, minutes) clock display.
+    pub fn clock_hm(&self) -> (u8, u8) {
+        let tod = self.clock_seconds % DAY_LENGTH_SECONDS;
+        let h = (tod / 3600) as u8;
+        let m = ((tod % 3600) / 60) as u8;
+        (h, m)
+    }
+
+    pub fn day_count(&self) -> u64 {
+        // Day 1 = the spawn day. Player spawns at 14:00 of day 1, so days
+        // increment at each midnight crossing.
+        self.clock_seconds / DAY_LENGTH_SECONDS + 1
+    }
+
+    fn needs_env(&self) -> NeedsEnv {
+        NeedsEnv {
+            is_night: self.is_night(),
+            // Fire/tent/bedroll entities don't exist yet (phase 9-10).
+            // Wire them in once those phases land.
+            adjacent_fire: false,
+            inside_tent: false,
+            in_bedroll: false,
+        }
+    }
+
+    /// Advance the game-time clock by an action's cost and apply needs
+    /// decay. Cost is amplified by any active need penalty (worst-need
+    /// wins, +20% / +50%).
+    pub fn spend_action_time(&mut self, base_cost: u32) {
+        let needs = self.player_needs();
+        let penalty_pct = needs.action_cost_penalty_pct();
+        let elapsed = base_cost.saturating_add(base_cost * penalty_pct / 100);
+        self.clock_seconds = self.clock_seconds.saturating_add(elapsed as u64);
+        let env = self.needs_env();
+        let mut needs = self.player_needs();
+        needs.tick(elapsed, env);
+        self.set_player_needs(needs);
     }
 
     pub fn player_pack(&self) -> hecs::Ref<'_, Pack> {
@@ -247,6 +327,13 @@ impl World {
             if let Some(c) = self.cell_at_mut(wx, wy) {
                 c.items = rejects;
             }
+        }
+
+        // Time only advances if at least one stack was picked up. Bouncing
+        // off a full pack with nothing picked doesn't burn the player's
+        // game-clock; phase 7 will surface the same logic via the menu.
+        if picked > 0 {
+            self.spend_action_time(COST_PICKUP);
         }
 
         picked
@@ -485,6 +572,63 @@ mod tests {
             .collect();
         assert_eq!(twig_stacks.len(), 1, "twigs must merge into a single stack");
         assert_eq!(twig_stacks[0].count, 5);
+    }
+
+    #[test]
+    fn clock_starts_at_14_00_and_advances_per_action() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        assert_eq!(world.clock_seconds, STARTING_CLOCK_SECONDS);
+        assert_eq!(world.clock_hm(), (14, 0));
+        assert!(!world.is_night());
+
+        world.try_move_player(1, 0);
+        assert_eq!(world.clock_seconds, STARTING_CLOCK_SECONDS + 5);
+    }
+
+    #[test]
+    fn night_transitions_at_dusk_and_dawn() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Force-advance to 19:59 — still day.
+        world.clock_seconds = 19 * 3600 + 59 * 60;
+        assert!(!world.is_night());
+        world.clock_seconds = 20 * 3600;
+        assert!(world.is_night());
+        world.clock_seconds = 5 * 3600 + 59 * 60;
+        assert!(world.is_night());
+        world.clock_seconds = 6 * 3600;
+        assert!(!world.is_night());
+    }
+
+    #[test]
+    fn movement_decays_thirst_over_many_actions() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let start = world.player_needs().thirst;
+        // 12 moves × 5 sec = 60 sec → exactly 1 thirst lost.
+        for _ in 0..12 {
+            world.try_move_player(1, 0);
+            world.try_move_player(-1, 0);
+        }
+        // 24 moves total = 120 sec → 2 thirst lost.
+        assert_eq!(world.player_needs().thirst, start - 2);
+    }
+
+    #[test]
+    fn pickup_advances_clock_only_when_something_picked_up() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Empty cell: spawn cell has no items.
+        let before = world.clock_seconds;
+        world.try_pickup_all_at_player();
+        assert_eq!(
+            world.clock_seconds, before,
+            "empty pickup must not burn time"
+        );
+
+        // Walk east (5 sec) into seeded debris, then pick up (3 sec).
+        world.try_move_player(1, 0);
+        let after_move = world.clock_seconds;
+        assert_eq!(after_move - before, 5);
+        world.try_pickup_all_at_player();
+        assert_eq!(world.clock_seconds - after_move, 3);
     }
 
     #[test]

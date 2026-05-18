@@ -10,10 +10,10 @@ kanban-plugin: board
 
 ## Drafts
 
-- [ ] [[Survival - Game time clock and needs]]
-	Per-action game clock + four needs (Thirst, Hunger, Sleep, Warmth). Death enabled at 0.
-- [ ] [[Survival - Day night cycle]]
-	24-hour clock, dawn/dusk tint, save-on-dawn. Drives Warmth decay and FOV radius.
+- [ ] [[Survival - Game time clock and needs]] — death gate (slated for phase 14)
+	Clock + needs decay + HUD shipped phase 4. Remaining: death-on-zero (DEATH_ENABLED flip + game-over UX) + +0.5/min tent warmth resolution.
+- [ ] [[Survival - Day night cycle]] — visual tint + auto-save-on-dawn
+	Clock + night transitions shipped phase 4. Remaining: screen-tint blend at dusk/dawn + auto-save fired at 06:00.
 - [ ] [[Survival - FOV]]
 	Recursive shadowcasting; trees block sight; lit fire extends night vision.
 - [ ] [[Survival - Command menu]]
@@ -46,6 +46,7 @@ kanban-plugin: board
 	Single-chunk world + per-cell item lists. The storage substrate everything else sits on. **Phase 3 shipped on cd440a2.**
 - [ ] [[Survival - ItemInstance and weights]]
 	`Vec<ItemInstance>` (stackable fungibles, unique uniques) + per-item weight grams + 15kg pack cap. **Phase 3 shipped on cd440a2.**
+- Phase 4 (clock + needs HUD, death gate off): partial-ship of [[Survival - Game time clock and needs]] and [[Survival - Day night cycle]] — see Drafts column.
 
 
 ## Playtest
