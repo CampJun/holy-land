@@ -712,7 +712,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let cell_state = world.cell_at(wx, wy);
                 let visible = cell_state.map(|c| c.visible).unwrap_or(false);
                 let explored = cell_state.map(|c| c.explored).unwrap_or(false);
-                let fire_lit = cell_state.map(|c| c.fire_lit).unwrap_or(false);
+                let light_intensity = cell_state.map(|c| c.light_intensity).unwrap_or(0);
 
                 // Items + player only render when the cell is currently
                 // visible. Memory of explored-but-unseen cells shows
@@ -758,18 +758,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     0.0
                 };
-                let mut fg = tint_color(fg, cell_brightness);
-                let mut bg = tint_color(bg, cell_brightness);
-                // Warm yellow overlay for cells inside a lit source's
-                // FOV disc at night. Applied AFTER the day/night dim so
-                // the fire-glow color survives the night-darkening
-                // multiply (a scalar tint on top of darkness erases the
-                // color; a blend toward warm RGB preserves it).
-                if fire_lit && is_night {
-                    const FIRE_TINT: [u8; 3] = [255, 200, 100];
-                    const FIRE_TINT_MIX: f32 = 0.35;
-                    fg = blend_to_terrain(FIRE_TINT, [fg.r, fg.g, fg.b], FIRE_TINT_MIX);
-                    bg = blend_to_terrain(FIRE_TINT, [bg.r, bg.g, bg.b], FIRE_TINT_MIX);
+                // Light-source contribution at night: cells inside a
+                // lit disc get BOTH a brightness boost (so a fire-lit
+                // cell isn't dim) AND a warm yellow blend, each scaled
+                // by per-cell intensity. Intensity falls off linearly
+                // with distance to the source, so the disc gradients
+                // from bright-warm at the source to dark-cold at the
+                // edge instead of being a uniform patch.
+                //
+                // The boost adds to brightness BEFORE the scalar dim
+                // multiply (otherwise night's 0.4 floor would crush
+                // the warm color back to grey).
+                const LIGHT_TINT: [u8; 3] = [255, 200, 100];
+                const LIGHT_BRIGHTNESS_BOOST_MAX: f32 = 0.6;
+                const LIGHT_TINT_MIX_MAX: f32 = 0.5;
+                let light = if is_night && visible {
+                    light_intensity as f32 / 255.0
+                } else {
+                    0.0
+                };
+                let effective_brightness =
+                    (cell_brightness + light * LIGHT_BRIGHTNESS_BOOST_MAX).min(1.0);
+                let mut fg = tint_color(fg, effective_brightness);
+                let mut bg = tint_color(bg, effective_brightness);
+                if light > 0.0 {
+                    let mix = light * LIGHT_TINT_MIX_MAX;
+                    fg = blend_to_terrain(LIGHT_TINT, [fg.r, fg.g, fg.b], mix);
+                    bg = blend_to_terrain(LIGHT_TINT, [bg.r, bg.g, bg.b], mix);
                 }
                 let mut cell = Cell { glyph, fg, bg };
                 let i = (vy as u32 * WORLD_W + vx as u32) as usize;

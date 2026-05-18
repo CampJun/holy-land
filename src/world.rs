@@ -321,11 +321,14 @@ pub struct CellState {
     /// Has been visible at least once. Persisted across save/load via
     /// `RunSave.explored_cells`.
     pub explored: bool,
-    /// Lit by an active light source (any `ItemMetadata::Lit` carrier)
-    /// this recompute. Render uses this to overlay a warm yellow tint
-    /// on top of the day/night dim. Transient like `visible` — reset
-    /// and rebuilt every `recompute_fov` call; not persisted.
-    pub fire_lit: bool,
+    /// Per-cell light intensity from active light sources (any
+    /// `ItemMetadata::Lit` carrier) this recompute. 0 = no light,
+    /// 255 = at a light source. Render scales the warm-yellow blend
+    /// and a brightness boost by this so the disc gradients from
+    /// bright-warm at the source to invisible at the edge instead of
+    /// being a uniform patch. Transient like `visible` — reset and
+    /// rebuilt every `recompute_fov` call; not persisted.
+    pub light_intensity: u8,
 }
 
 impl CellState {
@@ -335,7 +338,7 @@ impl CellState {
             items: Vec::new(),
             visible: false,
             explored: false,
-            fire_lit: false,
+            light_intensity: 0,
         }
     }
 }
@@ -860,13 +863,13 @@ impl World {
     /// allocation per move — the previous implementation used a HashSet,
     /// which paid alloc/hash cost per recompute on the Cortex-A7 target.
     pub fn recompute_fov(&mut self) {
-        // Reset transient flags across loaded cells. fire_lit is reset
-        // alongside visible so a fire that burned out doesn't leave
-        // stale glow on cells from the previous tick.
+        // Reset transient flags across loaded cells. light_intensity is
+        // reset alongside visible so a fire that burned out doesn't
+        // leave stale glow on cells from the previous tick.
         for chunk in self.chunks.values_mut() {
             for cell in chunk.cells.iter_mut() {
                 cell.visible = false;
-                cell.fire_lit = false;
+                cell.light_intensity = 0;
             }
         }
 
@@ -899,10 +902,13 @@ impl World {
     }
 
     /// Shadowcast from `origin` at `radius`, marking each visible cell
-    /// as visible+explored (and, if `mark_fire_lit`, fire_lit too).
-    /// Shared by the player cast and each per-light-source cast in
-    /// `recompute_fov`.
-    fn cast_from(&mut self, origin: Position, radius: i32, mark_fire_lit: bool) {
+    /// as visible+explored. When `mark_light` is true (per-light-source
+    /// cast), each reached cell also gets a `light_intensity` derived
+    /// from its Chebyshev distance to `origin` — distance 0 -> 255,
+    /// distance `radius` -> 0, linear. Multiple sources lighting the
+    /// same cell take the max (brightest wins). Shared by the player
+    /// cast and each per-light-source cast in `recompute_fov`.
+    fn cast_from(&mut self, origin: Position, radius: i32, mark_light: bool) {
         // Stack-allocated blocker grid centered on `origin`; sized for
         // FOV_RADIUS_DAY so every cast radius up to 20 fits without
         // reallocation.
@@ -929,11 +935,24 @@ impl World {
         });
 
         for (x, y) in visible {
+            let dx = (x - origin.x).abs();
+            let dy = (y - origin.y).abs();
+            let dist = dx.max(dy); // Chebyshev — matches the square-FOV shape
             if let Some(cell) = self.cell_at_mut(x as i64, y as i64) {
                 cell.visible = true;
                 cell.explored = true;
-                if mark_fire_lit {
-                    cell.fire_lit = true;
+                if mark_light {
+                    // Linear falloff: at the source -> 255, at the
+                    // radius edge -> 0. Clamp defensively (compute_visible
+                    // shouldn't return cells beyond `radius`).
+                    let intensity = if dist >= radius {
+                        0
+                    } else {
+                        (((radius - dist) as u32 * 255) / radius as u32) as u8
+                    };
+                    if intensity > cell.light_intensity {
+                        cell.light_intensity = intensity;
+                    }
                 }
             }
         }
@@ -1370,28 +1389,34 @@ mod tests {
         world.recompute_fov();
 
         // Inside the player's own night FOV (distance 2): visible, NOT
-        // fire_lit — the warm tint belongs to cells the fire lights,
+        // lit by fire — the warm tint belongs to cells the fire lights,
         // not cells the player just happens to see in their own dim.
         let near_player = world.cell_at((pos.x + 2) as i64, pos.y as i64).unwrap();
         assert!(near_player.visible, "player FOV (radius 3) must reach (+2,0)");
-        assert!(!near_player.fire_lit, "(+2,0) is in player FOV only");
+        assert_eq!(near_player.light_intensity, 0, "(+2,0) is in player FOV only");
 
         // Past player FOV but inside the fire's disc (distance 4 from
-        // fire): visible via fire-cast AND fire_lit.
+        // fire): visible AND lit. Distance 4 of 5 -> intensity 51.
         let in_fire_glow = world.cell_at((pos.x + 5) as i64, pos.y as i64).unwrap();
         assert!(in_fire_glow.visible, "fire FOV must reach (+5,0)");
-        assert!(in_fire_glow.fire_lit, "(+5,0) is lit by the fire");
+        let expected_5 = ((5 - 4) as u32 * 255 / 5) as u8;
+        assert_eq!(in_fire_glow.light_intensity, expected_5);
+
+        // The fire's own cell (distance 0) gets full intensity 255.
+        let fire_cell = world.cell_at((pos.x + 9) as i64, pos.y as i64).unwrap();
+        assert_eq!(fire_cell.light_intensity, 255, "fire's own cell is brightest");
 
         // Fire's far edge (distance 5 from fire = +14 from player):
-        // still inside the fire's disc.
+        // visible but intensity drops to 0 — the gradient fades to
+        // dark at the disc edge.
         let fire_far_edge = world.cell_at((pos.x + 14) as i64, pos.y as i64).unwrap();
         assert!(fire_far_edge.visible, "fire FOV reaches its own +5 east");
-        assert!(fire_far_edge.fire_lit);
+        assert_eq!(fire_far_edge.light_intensity, 0, "edge of disc fades to dark");
 
         // One cell past the fire's disc: invisible.
         let beyond = world.cell_at((pos.x + 15) as i64, pos.y as i64).unwrap();
         assert!(!beyond.visible, "past fire+5 should be invisible at night");
-        assert!(!beyond.fire_lit);
+        assert_eq!(beyond.light_intensity, 0);
     }
 
     #[test]
@@ -1412,15 +1437,16 @@ mod tests {
         }
         world.recompute_fov();
         let lit_cell = world.cell_at((pos.x + 8) as i64, pos.y as i64).unwrap();
-        assert!(lit_cell.visible && lit_cell.fire_lit, "fire-cast must light (+8,0)");
+        assert!(lit_cell.visible, "fire-cast must light (+8,0) while burning");
+        assert!(lit_cell.light_intensity > 0, "(+8,0) should pick up intensity from fire");
 
         // Advance 60s — fire dies in tick_fires, advance_time_raw
         // triggers recompute_fov, cells visible only via the fire
-        // contract back to invisible AND lose fire_lit.
+        // contract back to invisible AND lose intensity.
         world.advance_time_raw(60);
         let after = world.cell_at((pos.x + 8) as i64, pos.y as i64).unwrap();
         assert!(!after.visible, "(+8,0) outside player FOV when fire dies");
-        assert!(!after.fire_lit, "fire_lit must reset on fire death");
+        assert_eq!(after.light_intensity, 0, "intensity must reset on fire death");
     }
 
     #[test]
@@ -1447,7 +1473,7 @@ mod tests {
         // the blocker's own cell as visible. Cells BEHIND it on the same
         // axis are shadowed.
         let beyond_wall = world.cell_at((pos.x + 8) as i64, pos.y as i64).unwrap();
-        assert!(!beyond_wall.fire_lit, "wall must shadow (+8,0) from fire");
+        assert_eq!(beyond_wall.light_intensity, 0, "wall must shadow (+8,0) from fire");
         assert!(!beyond_wall.visible, "and the player can't see past it either");
     }
 
