@@ -120,7 +120,34 @@ Choose by audience: would a player running interactively want to see it?
 → info. Is it useful in postmortem-log triage? → debug. Is it
 per-frame? → verbose.
 
-### 2.8 Menu / panel rendering
+### 2.8 Locality of design constants
+
+**Source of truth lives as close to its consumer as possible.** Per-X
+tuning values stay in X's owning module, not on `world.rs` (which only
+owns engine-level primitives).
+
+| What | Lives in | Accessor |
+|---|---|---|
+| Per-verb base cost (game-seconds) | `action.rs` | `ActionId::base_cost()` — single match arm per verb |
+| Verb-specific design constants (e.g. `FIRE_BONUS_FLINT_AND_STEEL`, `FELLED_FIREWOOD_MIN`) | `action.rs` (grouped by verb) | private `const` |
+| Per-item weight / glyph / etc. | `items.rs` | `ItemKind::def()` |
+| Per-terrain glyph / walkable / blocks_sight | `world.rs` (TerrainDef table, with terrain) | `TerrainKind::def()` |
+| Per-need decay rates, max value, accumulator | `needs.rs` | private `const` |
+| Per-skill starting value, daily cap | `skill.rs` | `Skills::starting()`, `DAILY_XP_CAP` |
+| Engine primitives: movement cost, day length, FOV radii, brightness curve, multi-turn pacing | `world.rs` | `pub const` |
+
+**Rule:** if you're balancing a verb (cost, materials, output), edit
+should be one match arm or one const in `action.rs`. You should never
+need to update both `world.rs` AND `action.rs` for the same balance
+change.
+
+The phase-9 `try_pickup_all_at_player` primitive in `world.rs` follows
+this pattern: it doesn't spend action time itself; the caller (action.rs
+execute path, or main.rs's A-button handler) calls
+`world.spend_action_time(ActionId::Pickup.base_cost())` after the
+return. The world primitive is verb-agnostic.
+
+### 2.9 Menu / panel rendering
 
 UI windows (pause menu, command menu, multi-turn banner) compose from
 three primitives in `main.rs`:
@@ -144,7 +171,7 @@ directly against the same `layout` anchors.
 Don't repaint the box yourself; don't compute `x + 2` inline anywhere
 — go through the layout's accessors so the convention stays uniform.
 
-### 2.9 `#[allow(dead_code)]` justification format
+### 2.10 `#[allow(dead_code)]` justification format
 ```rust
 #[allow(dead_code)] // consumed by main.rs in phase 14 when death gate enables
 pub const DEATH_ENABLED: bool = false;

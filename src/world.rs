@@ -37,32 +37,11 @@ pub const DAY_LENGTH_SECONDS: u64 = 24 * 3600;
 pub const DAWN_HOUR: u64 = 6;
 pub const DUSK_HOUR: u64 = 20;
 
-/// Action costs in game-seconds. Read by the verb implementations in
-/// action.rs and exposed for the command menu's cost surfacing.
+/// World-primitive action costs. Each verb's costs live in `action.rs`
+/// next to its eval/execute code per STYLE.md §2 — but movement is not
+/// a menu verb (it's a direct dpad mapping), so its cost lives where
+/// `try_move_player` consumes it.
 pub const COST_MOVE_TILE: u32 = 5;
-pub const COST_PICKUP: u32 = 3;
-pub const COST_EAT_RATION: u32 = 10;
-pub const COST_EAT_HERB: u32 = 5;
-pub const COST_DRINK_WATERSKIN: u32 = 5;
-pub const COST_PITCH_TENT: u32 = 300;
-pub const COST_UNROLL_BEDROLL: u32 = 30;
-pub const COST_FIRE_MAKING_ATTEMPT: u32 = 60;
-
-/// How long (in game-seconds) a successful StartFire's lit firewood
-/// burns before it extinguishes itself. Phase-12's "feed fire" verb
-/// will add fuel to extend this; for slice 1 the player gets 1
-/// game-hour per attempt.
-pub const FIRE_FUEL_SECONDS_PER_LIGHT: u32 = 3600;
-
-/// Flint and steel skill modifier per the design card. Other tools
-/// (bow drill, weather penalty, sheltered bonus) wire in here as more
-/// content lands.
-pub const FIRE_BONUS_FLINT_AND_STEEL: i32 = 30;
-
-/// Materials threshold for a single StartFire attempt.
-pub const FIRE_MIN_TINDER: u32 = 1;
-pub const FIRE_MIN_KINDLING: u32 = 3;
-pub const FIRE_MIN_FUEL: u32 = 2;
 
 /// Phase-9 multi-turn interrupt threshold. When any need drops below this
 /// during a multi-turn tick, the active action queue cancels and control
@@ -171,13 +150,12 @@ pub enum TerrainKind {
 }
 
 pub struct TerrainDef {
-    /// Stable identifier for terrain-mutation save round-trip. Consumed
-    /// when phase 11b's ChopTree verb starts mutating terrain (tree ->
-    /// grass) and needs to persist the change.
-    #[allow(dead_code)] // wired by phase 11b's TerrainMutationSave
+    /// Stable identifier used by terrain-mutation save round-trip
+    /// (phase 11b's ChopTree converts TreeTrunk -> Grass and persists
+    /// the change via this key).
     pub save_key: &'static str,
     /// Human-readable name for the here-line ("you stand on grass").
-    #[allow(dead_code)] // wired by phase 11b's terrain-underfoot HUD
+    #[allow(dead_code)] // wired by future "terrain underfoot" HUD line
     pub name: &'static str,
     pub glyph: u8,
     pub fg: [u8; 3],
@@ -186,7 +164,30 @@ pub struct TerrainDef {
     pub blocks_sight: bool,
 }
 
+/// Iteration order for `TerrainKind::from_save_key`. Keep in sync with
+/// the enum variants — adding a kind here makes from_save_key find it.
+const ALL_TERRAINS: &[TerrainKind] = &[
+    TerrainKind::Grass,
+    TerrainKind::BareDirt,
+    TerrainKind::SandShore,
+    TerrainKind::TreeTrunk,
+    TerrainKind::StreamWater,
+    TerrainKind::PondWater,
+    TerrainKind::Wall,
+];
+
 impl TerrainKind {
+    /// Stable string for save round-tripping a terrain mutation. Just
+    /// reads `def().save_key`; from_save_key reverses by iterating the
+    /// `ALL_TERRAINS` array.
+    pub fn save_key(self) -> &'static str {
+        self.def().save_key
+    }
+
+    pub fn from_save_key(s: &str) -> Option<Self> {
+        ALL_TERRAINS.iter().copied().find(|t| t.def().save_key == s)
+    }
+
     /// Single source of truth for per-terrain rendering + game-rules
     /// metadata. Adding a new terrain variant is a one-stop edit: add
     /// the enum arm, then add an arm here. Exhaustive-match enforces it.
@@ -332,6 +333,11 @@ pub struct World {
     /// state so reloading after a critical roll re-rolls the SAME
     /// outcome — prevents save-scumming.
     pub rng: Rng,
+    /// Cells whose terrain has been mutated since chunkgen produced
+    /// them. ChopTree converts TreeTrunk -> Grass and records the
+    /// change here; on load the entries get re-applied after chunkgen
+    /// regenerates the chunk's defaults. Keyed on world coords.
+    pub terrain_mutations: HashMap<(i32, i32), TerrainKind>,
 }
 
 /// In-flight multi-turn action queue. `steps[0]` is the currently-running
@@ -431,6 +437,7 @@ impl World {
             player,
             active_action: None,
             rng: Rng::from_world_seed(DEFAULT_SEED),
+            terrain_mutations: HashMap::new(),
         };
         // First-frame FOV so the renderer doesn't draw a black screen on
         // the very first paint.
@@ -814,6 +821,32 @@ impl World {
         }
     }
 
+    /// Change the terrain at a cell and record the mutation for save
+    /// round-trip. Use this instead of writing `cell.terrain = ...`
+    /// directly so chopped trees, dug pits, etc. survive a reload.
+    pub fn set_terrain_at(&mut self, wx: i64, wy: i64, kind: TerrainKind) {
+        if let Some(cell) = self.cell_at_mut(wx, wy) {
+            cell.terrain = kind;
+        }
+        self.terrain_mutations.insert((wx as i32, wy as i32), kind);
+    }
+
+    pub fn snapshot_terrain_mutations(&self) -> Vec<(i32, i32, TerrainKind)> {
+        self.terrain_mutations
+            .iter()
+            .map(|(&(x, y), &k)| (x, y, k))
+            .collect()
+    }
+
+    pub fn restore_terrain_mutations(&mut self, snap: Vec<(i32, i32, TerrainKind)>) {
+        for (x, y, k) in snap {
+            if let Some(cell) = self.cell_at_mut(x as i64, y as i64) {
+                cell.terrain = k;
+            }
+            self.terrain_mutations.insert((x, y), k);
+        }
+    }
+
     pub fn player_pack(&self) -> hecs::Ref<'_, Pack> {
         self.ecs
             .get::<&Pack>(self.player)
@@ -833,15 +866,17 @@ impl World {
             .expect("player has Pack") = pack;
     }
 
-    /// Greedy pickup: every PICKABLE item in the player's current cell
-    /// that fits in the pack moves into the pack. Items over capacity
-    /// stay in the cell. Lit items (active fires) are NOT pickable —
-    /// you can't pocket a burning campfire. Pitched items (tents,
-    /// bedrolls) ARE pickable: re-stowing them is the "pack up camp"
-    /// behavior, intentional in phase 9.
+    /// Greedy pickup primitive: every PICKABLE item in the player's
+    /// current cell that fits in the pack moves into the pack. Items
+    /// over capacity stay in the cell. Lit items (active fires) are NOT
+    /// pickable — you can't pocket a burning campfire. Pitched items
+    /// (tents, bedrolls) ARE pickable: re-stowing them is the "pack up
+    /// camp" behavior, intentional in phase 9.
     ///
     /// Returns the number of `ItemInstance` entries successfully picked
-    /// up (a merge counts as one entry).
+    /// up (a merge counts as one entry). **Does not spend action time** —
+    /// the caller (action.rs or the A-button handler in main.rs) owns
+    /// that step so per-verb costs stay local to action.rs.
     pub fn try_pickup_all_at_player(&mut self) -> usize {
         let pos = self.player_pos();
         let wx = pos.x as i64;
@@ -873,13 +908,6 @@ impl World {
         if let Some(c) = self.cell_at_mut(wx, wy) {
             c.items.extend(rejects);
             c.items.extend(unpickable);
-        }
-
-        // Time only advances if at least one stack was picked up. Bouncing
-        // off a full pack with nothing picked doesn't burn the player's
-        // game-clock; phase 7 will surface the same logic via the menu.
-        if picked > 0 {
-            self.spend_action_time(COST_PICKUP);
         }
 
         picked
@@ -1190,22 +1218,14 @@ mod tests {
     }
 
     #[test]
-    fn pickup_advances_clock_only_when_something_picked_up() {
+    fn pickup_primitive_does_not_advance_clock() {
+        // try_pickup_all_at_player is a world primitive; per the
+        // locality refactor it no longer spends action time. The
+        // action.rs / main.rs callers own that step. Test the primitive
+        // here; the cost behavior lives in action::tests.
         let mut world = World::new(CHUNK_W, CHUNK_H);
-        // Force the spawn cell empty so the no-pickup case is reliable
-        // regardless of what chunkgen rolled into it.
         if let Some(c) = world.cell_at_mut(20, 15) {
             c.items.clear();
-        }
-        let before = world.clock_seconds;
-        world.try_pickup_all_at_player();
-        assert_eq!(
-            world.clock_seconds, before,
-            "empty pickup must not burn time"
-        );
-
-        // Put one item next to the player and pick it up.
-        if let Some(c) = world.cell_at_mut(20, 15) {
             c.items.push(ItemInstance::stack(
                 ItemKind::Twig,
                 1,
@@ -1214,8 +1234,13 @@ mod tests {
                 ItemMetadata::None,
             ));
         }
-        world.try_pickup_all_at_player();
-        assert_eq!(world.clock_seconds - before, 3);
+        let before = world.clock_seconds;
+        let picked = world.try_pickup_all_at_player();
+        assert_eq!(picked, 1);
+        assert_eq!(
+            world.clock_seconds, before,
+            "primitive must not burn time; that's the caller's job"
+        );
     }
 
     #[test]

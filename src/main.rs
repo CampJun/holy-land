@@ -27,7 +27,7 @@ use needs::Needs;
 use render::{draw_glyph, load_atlas, CELL_SIZE};
 use save::{
     ActionStepSave, ActiveActionSave, CellItemsSave, MetaSave, NeedsSave, RunSave, SaveHeader,
-    SkillSave, SkillsSave,
+    SkillSave, SkillsSave, TerrainMutationSave,
 };
 use skill::{Rng, Skill, SkillKind, Skills};
 use world::{
@@ -233,6 +233,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if run.rng_state != 0 {
             world.rng = Rng::from_state(run.rng_state);
         }
+        // Phase-11b: restore terrain mutations (chopped trees, etc.)
+        // after chunkgen has produced the chunk defaults.
+        if !run.terrain_mutations.is_empty() {
+            let snapshot: Vec<(i32, i32, world::TerrainKind)> = run
+                .terrain_mutations
+                .iter()
+                .filter_map(|tm| world::TerrainKind::from_save_key(&tm.kind).map(|k| (tm.x, tm.y, k)))
+                .collect();
+            world.restore_terrain_mutations(snapshot);
+        }
         // Recompute FOV after restoring position so the visible set is
         // correct for the loaded clock + player coord. (World::new already
         // did a recompute, but the loaded position may differ.)
@@ -419,9 +429,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Action::Left => world.try_move_player(-1, 0),
                 Action::Right => world.try_move_player(1, 0),
                 Action::A => {
-                    let picked = world.try_pickup_all_at_player();
-                    if picked > 0 {
-                        log_debug!("picked up {} stack(s)", picked);
+                    // Route through the same dispatcher the command
+                    // menu uses so Pickup's cost + side-effects stay
+                    // in one place (action.rs).
+                    if let action::ExecuteOutcome::Done(msg) =
+                        action::execute(&mut world, action::ActionId::Pickup)
+                    {
+                        log_debug!("{}", msg);
                     }
                 }
                 Action::Y => {
@@ -707,6 +721,15 @@ fn save_game(
         },
     };
     run.rng_state = world.rng.state;
+    run.terrain_mutations = world
+        .snapshot_terrain_mutations()
+        .into_iter()
+        .map(|(x, y, k)| TerrainMutationSave {
+            x,
+            y,
+            kind: k.save_key().to_string(),
+        })
+        .collect();
     run.active_action = world.active_action.as_ref().map(|active| ActiveActionSave {
         steps: active
             .steps

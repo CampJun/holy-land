@@ -106,6 +106,24 @@ pub struct RunSave {
     /// at load time" on legacy saves.
     #[serde(default)]
     pub rng_state: u32,
+    // Phase 11b (additive): cells whose terrain has been mutated since
+    // chunkgen produced them (e.g. ChopTree converts TreeTrunk -> Grass).
+    // On load these are re-applied AFTER chunkgen so a chopped tree
+    // stays chopped across save/load.
+    #[serde(default)]
+    pub terrain_mutations: Vec<TerrainMutationSave>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TerrainMutationSave {
+    #[serde(default)]
+    pub x: i32,
+    #[serde(default)]
+    pub y: i32,
+    /// `TerrainKind::save_key()` string. Unknown keys are dropped on
+    /// load (forward-compat).
+    #[serde(default)]
+    pub kind: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -177,6 +195,7 @@ impl RunSave {
             active_action: None,
             skills: SkillsSave::default(),
             rng_state: 0,
+            terrain_mutations: Vec::new(),
         }
     }
 }
@@ -343,6 +362,7 @@ mod tests {
             active_action: None,
             skills: SkillsSave::default(),
             rng_state: 0xDEADBEEF,
+            terrain_mutations: Vec::new(),
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
@@ -425,6 +445,11 @@ mod tests {
                 },
             },
             rng_state: 0xC0FFEE,
+            terrain_mutations: vec![TerrainMutationSave {
+                x: 5,
+                y: 7,
+                kind: "grass".to_string(),
+            }],
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
@@ -438,6 +463,8 @@ mod tests {
         assert_eq!(loaded.skills.fire_making.value, 23);
         assert_eq!(loaded.skills.fire_making.daily_xp, 6);
         assert_eq!(loaded.rng_state, 0xC0FFEE);
+        assert_eq!(loaded.terrain_mutations.len(), 1);
+        assert_eq!(loaded.terrain_mutations[0].kind, "grass");
         assert_eq!(loaded.pack.contents.len(), 3);
         assert_eq!(loaded.pack.contents[0].kind, "axe");
         assert_eq!(loaded.pack.contents[1].kind, "waterskin");

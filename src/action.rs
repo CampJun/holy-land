@@ -11,11 +11,27 @@
 use crate::items::{ItemInstance, ItemKind, ItemMetadata};
 use crate::needs::NeedKind;
 use crate::skill::{self, SkillKind};
-use crate::world::{
-    World, COST_DRINK_WATERSKIN, COST_EAT_HERB, COST_EAT_RATION, COST_FIRE_MAKING_ATTEMPT,
-    COST_PICKUP, COST_PITCH_TENT, COST_UNROLL_BEDROLL, FIRE_BONUS_FLINT_AND_STEEL,
-    FIRE_FUEL_SECONDS_PER_LIGHT, FIRE_MIN_FUEL, FIRE_MIN_KINDLING, FIRE_MIN_TINDER,
-};
+use crate::world::{TerrainKind, World};
+
+// ---- Per-verb design constants ---------------------------------------
+//
+// STYLE.md §2: source of truth for verb tuning lives in this module,
+// not in world.rs. World.rs only owns engine-level constants (movement
+// cost, day-length, FOV radii). Verb costs are inlined in
+// `ActionId::base_cost()` so there's literally one match arm per verb
+// to edit when rebalancing. Other verb tuning (materials, modifiers,
+// output) lives as `const`s below, grouped by verb.
+
+// Fire Making (verb: StartFire).
+const FIRE_BONUS_FLINT_AND_STEEL: i32 = 30;
+const FIRE_MIN_TINDER: u32 = 1;
+const FIRE_MIN_KINDLING: u32 = 3;
+const FIRE_MIN_FUEL: u32 = 2;
+const FIRE_FUEL_SECONDS_PER_LIGHT: u32 = 3600;
+
+// Chop Tree (verb: ChopTree).
+const FELLED_FIREWOOD_MIN: u16 = 3;
+const FELLED_FIREWOOD_MAX: u16 = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActionId {
@@ -36,6 +52,35 @@ pub enum ActionId {
 }
 
 impl ActionId {
+    /// Base cost in game-seconds before need-penalty amplification.
+    /// Single source of truth for verb tuning — evaluators consult
+    /// this for the menu's "Xs" readout; executors pass it into
+    /// `world.spend_action_time`. Change a value here and every call
+    /// site picks it up.
+    pub fn base_cost(self) -> u32 {
+        match self {
+            ActionId::Pickup => 3,
+            ActionId::EatRation => 10,
+            ActionId::EatHerb => 5,
+            ActionId::DrinkWaterskin => 5,
+            ActionId::DrinkFromStream => 10,
+            ActionId::FillWaterskin => 20,
+            ActionId::PitchTent => 300,
+            ActionId::UnrollBedroll => 30,
+            // SetupCamp queues PitchTent + UnrollBedroll; the menu's
+            // surfaced cost is the sum so the player sees the total.
+            ActionId::SetupCamp => Self::PitchTent.base_cost() + Self::UnrollBedroll.base_cost(),
+            ActionId::StartFire => 60,
+            ActionId::ChopTree => 120,
+            ActionId::PickHerb => 10,
+            // Sleep jumps the clock; the "60s" cost surfacing isn't
+            // meaningful. Phase-16 will replace this with an explicit
+            // "Sleep until..." input.
+            ActionId::Sleep => 0,
+            ActionId::Fishing => 600,
+        }
+    }
+
     /// Stable string key for save round-tripping (ActiveActionSave). Keep
     /// in sync with `from_save_key`. Mirrors the ItemKind::save_key
     /// pattern.
@@ -184,47 +229,35 @@ impl Availability {
 
 pub fn evaluate(world: &World, id: ActionId) -> Availability {
     let pack = world.player_pack();
+    let cost = id.base_cost();
     match id {
         ActionId::Pickup => eval_pickup(world),
-        ActionId::EatRation => Availability::from_has(
-            pack.has_stack(ItemKind::Ration),
-            COST_EAT_RATION,
-            "no rations in pack",
-        ),
-        ActionId::EatHerb => Availability::from_has(
-            pack.has_stack(ItemKind::Herb),
-            COST_EAT_HERB,
-            "no herbs in pack",
-        ),
+        ActionId::EatRation => {
+            Availability::from_has(pack.has_stack(ItemKind::Ration), cost, "no rations in pack")
+        }
+        ActionId::EatHerb => {
+            Availability::from_has(pack.has_stack(ItemKind::Herb), cost, "no herbs in pack")
+        }
         ActionId::DrinkWaterskin => Availability::from_has(
             pack.has_waterskin_with_water(),
-            COST_DRINK_WATERSKIN,
+            cost,
             "no water in waterskins",
         ),
-        // Slice-1 stubs; each `reason` names the phase that lights this
-        // action up. When you wire the real check, replace the arm.
-        ActionId::DrinkFromStream | ActionId::FillWaterskin => Availability::Unavailable {
-            reason: "phase 11: no water yet",
-        },
-        ActionId::ChopTree => Availability::Unavailable {
-            reason: "phase 11: no trees yet",
-        },
-        ActionId::PickHerb => Availability::Unavailable {
-            reason: "phase 11: no herbs yet",
-        },
-        ActionId::PitchTent => Availability::from_has(
-            pack.has_stack(ItemKind::Tent),
-            COST_PITCH_TENT,
-            "no tent in pack",
-        ),
+        ActionId::DrinkFromStream => eval_drink_from_stream(world),
+        ActionId::FillWaterskin => eval_fill_waterskin(world),
+        ActionId::ChopTree => eval_chop_tree(world),
+        ActionId::PickHerb => eval_pick_herb(world),
+        ActionId::PitchTent => {
+            Availability::from_has(pack.has_stack(ItemKind::Tent), cost, "no tent in pack")
+        }
         ActionId::UnrollBedroll => Availability::from_has(
             pack.has_stack(ItemKind::Bedroll),
-            COST_UNROLL_BEDROLL,
+            cost,
             "no bedroll in pack",
         ),
         ActionId::SetupCamp => Availability::from_has(
             pack.has_stack(ItemKind::Tent) && pack.has_stack(ItemKind::Bedroll),
-            COST_PITCH_TENT + COST_UNROLL_BEDROLL,
+            cost,
             "need tent + bedroll in pack",
         ),
         ActionId::StartFire => eval_start_fire(world),
@@ -306,7 +339,7 @@ fn eval_start_fire(world: &World) -> Availability {
         };
     }
     Availability::Available {
-        cost_game_seconds: COST_FIRE_MAKING_ATTEMPT,
+        cost_game_seconds: ActionId::StartFire.base_cost(),
     }
 }
 
@@ -337,7 +370,7 @@ fn eval_pickup(world: &World) -> Availability {
         };
     }
     Availability::Available {
-        cost_game_seconds: COST_PICKUP,
+        cost_game_seconds: ActionId::Pickup.base_cost(),
     }
 }
 
@@ -355,6 +388,9 @@ pub fn execute(world: &mut World, id: ActionId) -> ExecuteOutcome {
     match id {
         ActionId::Pickup => {
             let picked = world.try_pickup_all_at_player();
+            if picked > 0 {
+                world.spend_action_time(ActionId::Pickup.base_cost());
+            }
             ExecuteOutcome::Done(format!("picked up {} stack(s)", picked))
         }
         ActionId::EatRation => consume_and_restore(
@@ -362,7 +398,7 @@ pub fn execute(world: &mut World, id: ActionId) -> ExecuteOutcome {
             ConsumeFrom::Stack(ItemKind::Ration),
             NeedKind::Hunger,
             25,
-            COST_EAT_RATION,
+            ActionId::EatRation.base_cost(),
             "ate a ration (+25 hunger)",
             "no rations to eat",
         ),
@@ -371,7 +407,7 @@ pub fn execute(world: &mut World, id: ActionId) -> ExecuteOutcome {
             ConsumeFrom::Stack(ItemKind::Herb),
             NeedKind::Hunger,
             5,
-            COST_EAT_HERB,
+            ActionId::EatHerb.base_cost(),
             "ate a herb (+5 hunger)",
             "no herbs to eat",
         ),
@@ -380,26 +416,33 @@ pub fn execute(world: &mut World, id: ActionId) -> ExecuteOutcome {
             ConsumeFrom::WaterskinCharge,
             NeedKind::Thirst,
             20,
-            COST_DRINK_WATERSKIN,
+            ActionId::DrinkWaterskin.base_cost(),
             "drank from waterskin (+20 thirst)",
             "no water to drink",
         ),
         ActionId::PitchTent => {
-            world.queue_multi_turn(&[(ActionId::PitchTent, COST_PITCH_TENT)]);
+            world.queue_multi_turn(&[(ActionId::PitchTent, ActionId::PitchTent.base_cost())]);
             ExecuteOutcome::Done("pitching tent...".to_string())
         }
         ActionId::UnrollBedroll => {
-            world.queue_multi_turn(&[(ActionId::UnrollBedroll, COST_UNROLL_BEDROLL)]);
+            world.queue_multi_turn(&[(
+                ActionId::UnrollBedroll,
+                ActionId::UnrollBedroll.base_cost(),
+            )]);
             ExecuteOutcome::Done("unrolling bedroll...".to_string())
         }
         ActionId::SetupCamp => {
             world.queue_multi_turn(&[
-                (ActionId::PitchTent, COST_PITCH_TENT),
-                (ActionId::UnrollBedroll, COST_UNROLL_BEDROLL),
+                (ActionId::PitchTent, ActionId::PitchTent.base_cost()),
+                (ActionId::UnrollBedroll, ActionId::UnrollBedroll.base_cost()),
             ]);
             ExecuteOutcome::Done("setting up camp...".to_string())
         }
         ActionId::StartFire => execute_start_fire(world),
+        ActionId::ChopTree => execute_chop_tree(world),
+        ActionId::PickHerb => execute_pick_herb(world),
+        ActionId::DrinkFromStream => execute_drink_from_stream(world),
+        ActionId::FillWaterskin => execute_fill_waterskin(world),
         _ => ExecuteOutcome::NotImplemented,
     }
 }
@@ -471,7 +514,7 @@ fn execute_start_fire(world: &mut World) -> ExecuteOutcome {
         format!("strike failed (+1 Fire Making XP)")
     };
 
-    world.spend_action_time(COST_FIRE_MAKING_ATTEMPT);
+    world.spend_action_time(ActionId::StartFire.base_cost());
     ExecuteOutcome::Done(msg)
 }
 
@@ -607,6 +650,206 @@ fn consume_and_restore(
     ExecuteOutcome::Done(success_msg.to_string())
 }
 
+// ---- Phase 11b: terrain-dependent verbs ----
+
+/// Find the first adjacent cell (8-neighborhood, excluding the player's
+/// own) whose terrain satisfies `pred`. Returns the world coords.
+fn find_adjacent_terrain<F: Fn(TerrainKind) -> bool>(
+    world: &World,
+    pred: F,
+) -> Option<(i32, i32)> {
+    let p = world.player_pos();
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            let wx = p.x + dx;
+            let wy = p.y + dy;
+            if pred(world.tile_at(wx as i64, wy as i64)) {
+                return Some((wx, wy));
+            }
+        }
+    }
+    None
+}
+
+/// Find an adjacent cell holding an item that satisfies `pred`. Returns
+/// the cell coords + the item index within that cell's items vec.
+fn find_adjacent_item<F: Fn(&ItemInstance) -> bool>(
+    world: &World,
+    pred: F,
+) -> Option<(i32, i32, usize)> {
+    let p = world.player_pos();
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            let wx = p.x + dx;
+            let wy = p.y + dy;
+            if let Some(cell) = world.cell_at(wx as i64, wy as i64) {
+                if let Some(idx) = cell.items.iter().position(|i| pred(i)) {
+                    return Some((wx, wy, idx));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn is_water(t: TerrainKind) -> bool {
+    matches!(t, TerrainKind::StreamWater | TerrainKind::PondWater)
+}
+
+fn eval_drink_from_stream(world: &World) -> Availability {
+    Availability::from_has(
+        find_adjacent_terrain(world, is_water).is_some(),
+        ActionId::DrinkFromStream.base_cost(),
+        "no water adjacent",
+    )
+}
+
+fn execute_drink_from_stream(world: &mut World) -> ExecuteOutcome {
+    if find_adjacent_terrain(world, is_water).is_none() {
+        return ExecuteOutcome::Done("no water adjacent".to_string());
+    }
+    let mut needs = world.player_needs();
+    needs.restore(NeedKind::Thirst, 20);
+    world.set_player_needs(needs);
+    world.spend_action_time(ActionId::DrinkFromStream.base_cost());
+    ExecuteOutcome::Done("drank from water (+20 thirst)".to_string())
+}
+
+fn eval_fill_waterskin(world: &World) -> Availability {
+    if find_adjacent_terrain(world, is_water).is_none() {
+        return Availability::Unavailable {
+            reason: "no water adjacent",
+        };
+    }
+    let has_partial = world.player_pack().contents.iter().any(|i| {
+        i.kind == ItemKind::Waterskin
+            && matches!(i.metadata, ItemMetadata::Waterskin { water_uses } if water_uses < 4)
+    });
+    Availability::from_has(
+        has_partial,
+        ActionId::FillWaterskin.base_cost(),
+        "waterskins already full",
+    )
+}
+
+fn execute_fill_waterskin(world: &mut World) -> ExecuteOutcome {
+    if find_adjacent_terrain(world, is_water).is_none() {
+        return ExecuteOutcome::Done("no water adjacent".to_string());
+    }
+    let filled = {
+        let mut pack = world.player_pack_mut();
+        let Some(idx) = pack.contents.iter().position(|i| {
+            i.kind == ItemKind::Waterskin
+                && matches!(i.metadata, ItemMetadata::Waterskin { water_uses } if water_uses < 4)
+        }) else {
+            return ExecuteOutcome::Done("no empty waterskin".to_string());
+        };
+        pack.contents[idx].metadata = ItemMetadata::Waterskin { water_uses: 4 };
+        pack.contents[idx].weight_g_each = 1_200;
+        true
+    };
+    if filled {
+        world.spend_action_time(ActionId::FillWaterskin.base_cost());
+        ExecuteOutcome::Done("waterskin filled (4 uses)".to_string())
+    } else {
+        ExecuteOutcome::Done("no empty waterskin".to_string())
+    }
+}
+
+fn eval_chop_tree(world: &World) -> Availability {
+    if !world.player_pack().has_stack(ItemKind::Axe) {
+        return Availability::Unavailable {
+            reason: "need an axe",
+        };
+    }
+    Availability::from_has(
+        find_adjacent_terrain(world, |t| t == TerrainKind::TreeTrunk).is_some(),
+        ActionId::ChopTree.base_cost(),
+        "no tree adjacent",
+    )
+}
+
+fn execute_chop_tree(world: &mut World) -> ExecuteOutcome {
+    if !world.player_pack().has_stack(ItemKind::Axe) {
+        return ExecuteOutcome::Done("need an axe".to_string());
+    }
+    let Some((wx, wy)) = find_adjacent_terrain(world, |t| t == TerrainKind::TreeTrunk) else {
+        return ExecuteOutcome::Done("no tree to chop".to_string());
+    };
+
+    // Fell: terrain converts; FOV recomputes (the tree no longer blocks
+    // sight). Drop a random pile of firewood on the now-grass cell so
+    // the player can carry it back for fires.
+    world.set_terrain_at(wx as i64, wy as i64, TerrainKind::Grass);
+    let span = (FELLED_FIREWOOD_MAX - FELLED_FIREWOOD_MIN + 1) as u32;
+    let count = FELLED_FIREWOOD_MIN as u16 + (world.rng.next_u32() % span) as u16;
+    if let Some(cell) = world.cell_at_mut(wx as i64, wy as i64) {
+        cell.items.push(ItemInstance::stack(
+            ItemKind::Firewood,
+            count,
+            500,
+            None,
+            ItemMetadata::None,
+        ));
+    }
+    world.spend_action_time(ActionId::ChopTree.base_cost());
+    world.recompute_fov();
+    ExecuteOutcome::Done(format!("tree felled (+{} firewood on the ground)", count))
+}
+
+fn eval_pick_herb(world: &World) -> Availability {
+    if !world.player_pack().has_stack(ItemKind::Knife) {
+        return Availability::Unavailable {
+            reason: "need a knife",
+        };
+    }
+    Availability::from_has(
+        find_adjacent_item(world, |i| i.kind == ItemKind::Herb).is_some(),
+        ActionId::PickHerb.base_cost(),
+        "no herb adjacent",
+    )
+}
+
+fn execute_pick_herb(world: &mut World) -> ExecuteOutcome {
+    if !world.player_pack().has_stack(ItemKind::Knife) {
+        return ExecuteOutcome::Done("need a knife".to_string());
+    }
+    let Some((wx, wy, idx)) = find_adjacent_item(world, |i| i.kind == ItemKind::Herb) else {
+        return ExecuteOutcome::Done("no herb adjacent".to_string());
+    };
+    // Take the herb out of the cell.
+    let herb = if let Some(cell) = world.cell_at_mut(wx as i64, wy as i64) {
+        if idx < cell.items.len() {
+            cell.items.remove(idx)
+        } else {
+            return ExecuteOutcome::Done("herb gone".to_string());
+        }
+    } else {
+        return ExecuteOutcome::Done("cell gone".to_string());
+    };
+    // Pack-add. If it doesn't fit, put it back. Bind the result so the
+    // RefMut from player_pack_mut drops before the next world borrow.
+    let add_result = world.player_pack_mut().try_add(herb);
+    match add_result {
+        Ok(()) => {
+            world.spend_action_time(ActionId::PickHerb.base_cost());
+            ExecuteOutcome::Done("picked herb".to_string())
+        }
+        Err(returned) => {
+            if let Some(cell) = world.cell_at_mut(wx as i64, wy as i64) {
+                cell.items.push(returned);
+            }
+            ExecuteOutcome::Done("pack too full for herb".to_string())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,7 +873,7 @@ mod tests {
         let avail = evaluate(&world, ActionId::Pickup);
         match avail {
             Availability::Available { cost_game_seconds } => {
-                assert_eq!(cost_game_seconds, COST_PICKUP);
+                assert_eq!(cost_game_seconds, ActionId::Pickup.base_cost());
             }
             other => panic!("expected Available, got {:?}", other),
         }
@@ -679,10 +922,14 @@ mod tests {
             ActionId::EatRation,
             ActionId::EatHerb,
             ActionId::DrinkWaterskin,
+            ActionId::DrinkFromStream,
+            ActionId::FillWaterskin,
             ActionId::PitchTent,
             ActionId::UnrollBedroll,
             ActionId::SetupCamp,
             ActionId::StartFire,
+            ActionId::ChopTree,
+            ActionId::PickHerb,
         ];
         for action in ALL_ACTIONS {
             if live.contains(&action.id) {
@@ -710,7 +957,7 @@ mod tests {
         let world = World::new(CHUNK_W, CHUNK_H);
         match evaluate(&world, ActionId::EatRation) {
             Availability::Available { cost_game_seconds } => {
-                assert_eq!(cost_game_seconds, COST_EAT_RATION);
+                assert_eq!(cost_game_seconds, ActionId::EatRation.base_cost());
             }
             other => panic!("expected Available, got {:?}", other),
         }
@@ -876,7 +1123,7 @@ mod tests {
         }
         match eval_start_fire(&world) {
             Availability::Available { cost_game_seconds } => {
-                assert_eq!(cost_game_seconds, COST_FIRE_MAKING_ATTEMPT);
+                assert_eq!(cost_game_seconds, ActionId::StartFire.base_cost());
             }
             other => panic!("expected Available, got {:?}", other),
         }
