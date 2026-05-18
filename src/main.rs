@@ -781,52 +781,168 @@ fn draw_here_line(cells: &mut [Option<Cell>], world: &World, palette: &Palette) 
     put_text(cells, 1, row, &joined, palette.hud_fg, palette.hud_bg);
 }
 
-fn draw_pause_menu(cells: &mut [Option<Cell>], selected: usize, palette: &Palette) {
-    let w: i32 = 28;
-    let h: i32 = 9;
-    let x = ((WORLD_W as i32) - w) / 2;
-    let y = ((WORLD_H as i32) - h) / 2;
-    draw_panel(cells, x, y, w, h, palette.panel_fg, palette.panel_bg);
+/// Positioning + interior anchors for any UI panel (pause menu, command
+/// menu, multi-turn banner). Two construction forms cover slice-1
+/// needs; add more if a future panel doesn't fit centered-or-anchored.
+struct PanelLayout {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+}
+
+impl PanelLayout {
+    fn anchored(x: i32, y: i32, w: i32, h: i32) -> Self {
+        Self { x, y, w, h }
+    }
+    fn centered(w: i32, h: i32) -> Self {
+        Self {
+            x: ((WORLD_W as i32) - w) / 2,
+            y: ((WORLD_H as i32) - h) / 2,
+            w,
+            h,
+        }
+    }
+    fn centered_x_at(y: i32, w: i32, h: i32) -> Self {
+        Self {
+            x: ((WORLD_W as i32) - w) / 2,
+            y,
+            w,
+            h,
+        }
+    }
+    fn inner_x(&self) -> i32 {
+        self.x + 2
+    }
+    fn inner_right(&self) -> i32 {
+        self.x + self.w - 2
+    }
+    fn title_y(&self) -> i32 {
+        self.y + 1
+    }
+    /// First row of body content. Convention: leave one blank row
+    /// between title and body for visual breathing room.
+    fn first_row_y(&self) -> i32 {
+        self.y + 3
+    }
+    fn footer_y(&self) -> i32 {
+        self.y + self.h - 2
+    }
+}
+
+/// Draw a bordered window with a title (top) and footer (bottom). Body
+/// content is the caller's responsibility — use `draw_menu_row` for the
+/// canonical cursor + label + right-aligned-status row pattern, or
+/// call `put_text` / `put_cell` directly for one-off shapes like the
+/// multi-turn progress bar.
+fn draw_panel_frame(
+    cells: &mut [Option<Cell>],
+    layout: &PanelLayout,
+    title: &str,
+    footer: &str,
+    palette: &Palette,
+) {
+    draw_panel(
+        cells,
+        layout.x,
+        layout.y,
+        layout.w,
+        layout.h,
+        palette.panel_fg,
+        palette.panel_bg,
+    );
     put_text(
         cells,
-        x + 2,
-        y + 1,
-        "Paused",
+        layout.inner_x(),
+        layout.title_y(),
+        title,
         palette.panel_title_fg,
         palette.panel_bg,
     );
-
-    for (i, (action, label)) in PAUSE_OPTIONS.iter().enumerate() {
-        let row_y = y + 3 + i as i32;
-        let is_selected = i == selected;
-        let cursor = if is_selected { b'>' } else { b' ' };
-        let fg = match (is_selected, action) {
-            (true, PauseAction::ResetSave) => palette.need_critical_fg,
-            (true, _) => palette.panel_fg,
-            (false, PauseAction::ResetSave) => palette.need_critical_fg,
-            (false, _) => palette.hud_fg,
-        };
-        put_cell(
-            cells,
-            x + 2,
-            row_y,
-            Cell {
-                glyph: cursor,
-                fg: palette.panel_title_fg,
-                bg: palette.panel_bg,
-            },
-        );
-        put_text(cells, x + 4, row_y, label, fg, palette.panel_bg);
-    }
-
     put_text(
         cells,
-        x + 2,
-        y + h - 2,
-        "A: confirm   B/Start: back",
+        layout.inner_x(),
+        layout.footer_y(),
+        footer,
         palette.panel_dim_fg,
         palette.panel_bg,
     );
+}
+
+/// Canonical menu row: cursor (>/blank) + label + optional right-aligned
+/// status. The right-side text is truncated to fit the remaining inner
+/// width with `…` so a long reason can't overflow the box.
+fn draw_menu_row(
+    cells: &mut [Option<Cell>],
+    layout: &PanelLayout,
+    row_y: i32,
+    is_selected: bool,
+    label: &str,
+    label_fg: Color,
+    right_status: Option<(&str, Color)>,
+    palette: &Palette,
+) {
+    let cursor = if is_selected { b'>' } else { b' ' };
+    put_cell(
+        cells,
+        layout.inner_x(),
+        row_y,
+        Cell {
+            glyph: cursor,
+            fg: palette.panel_title_fg,
+            bg: palette.panel_bg,
+        },
+    );
+    put_text(
+        cells,
+        layout.inner_x() + 2,
+        row_y,
+        label,
+        label_fg,
+        palette.panel_bg,
+    );
+    if let Some((status, status_fg)) = right_status {
+        // Available width = inner width minus cursor (1) + space (1) +
+        // label + separator (2). Floor at 4 so very long labels still
+        // leave a stub for the status.
+        let max_status_len = (layout.w as i32 - 4 - label.len() as i32 - 2).max(4) as usize;
+        let truncated: String = status.chars().take(max_status_len).collect();
+        let status_x = layout.inner_right() - truncated.len() as i32;
+        put_text(cells, status_x, row_y, &truncated, status_fg, palette.panel_bg);
+    }
+}
+
+fn draw_pause_menu(cells: &mut [Option<Cell>], selected: usize, palette: &Palette) {
+    let layout = PanelLayout::centered(28, 9);
+    draw_panel_frame(
+        cells,
+        &layout,
+        "Paused",
+        "A: confirm   B/Start: back",
+        palette,
+    );
+
+    for (i, (action, label)) in PAUSE_OPTIONS.iter().enumerate() {
+        let row_y = layout.first_row_y() + i as i32;
+        let is_selected = i == selected;
+        // ResetSave row is always tinted red — destructive option
+        // visibility shouldn't depend on the selection cursor.
+        let label_fg = match (is_selected, action) {
+            (_, PauseAction::ResetSave) => palette.need_critical_fg,
+            (true, _) => palette.panel_fg,
+            (false, _) => palette.hud_fg,
+        };
+        draw_menu_row(
+            cells,
+            &layout,
+            row_y,
+            is_selected,
+            label,
+            label_fg,
+            None,
+            palette,
+        );
+    }
 }
 
 fn draw_multi_turn_banner(
@@ -842,28 +958,17 @@ fn draw_multi_turn_banner(
         ViewMode::ProgressBar => "watching",
         ViewMode::TimeSkip => "time-skip",
     };
-    // Banner centered around row 4; width 34. Layout:
-    //   +-------------- pitch_tent --------------+
-    //   |  [######......]  03:25 remaining       |
-    //   |  B cancel    Select toggle (watching)  |
-    //   +----------------------------------------+
-    let w: i32 = 34;
-    let h: i32 = 5;
-    let x = ((WORLD_W as i32) - w) / 2;
-    let y = 4;
-    draw_panel(cells, x, y, w, h, palette.panel_fg, palette.panel_bg);
+    // Compact h=5 layout (no blank rows around the body — banner
+    // intentionally doesn't dominate the screen during a 300-sec pitch):
+    //   +--- pitch_tent ---+
+    //   | [###......]  ... |   body row
+    //   | B cancel ...     |   footer row
+    //   +------------------+
+    let layout = PanelLayout::centered_x_at(4, 34, 5);
+    let footer = format!("B cancel    Select toggle ({})", mode_tag);
+    draw_panel_frame(cells, &layout, step.id.save_key(), &footer, palette);
 
-    let label = step.id.save_key();
-    put_text(
-        cells,
-        x + 2,
-        y + 1,
-        label,
-        palette.panel_title_fg,
-        palette.panel_bg,
-    );
-
-    // Progress bar of the current step (not the whole queue). Width 12.
+    let body_y = layout.y + 2;
     let bar_w: i32 = 12;
     let filled = if step.target_secs == 0 {
         bar_w
@@ -874,8 +979,8 @@ fn draw_multi_turn_banner(
         let glyph = if i < filled { 0xDB } else { 0xB1 }; // █ vs ▒
         put_cell(
             cells,
-            x + 2 + i,
-            y + 2,
+            layout.inner_x() + i,
+            body_y,
             Cell {
                 glyph,
                 fg: palette.panel_fg,
@@ -888,20 +993,10 @@ fn draw_multi_turn_banner(
     let remaining = format!(" {}:{:02} remaining", remaining_m, remaining_s);
     put_text(
         cells,
-        x + 2 + bar_w,
-        y + 2,
+        layout.inner_x() + bar_w,
+        body_y,
         &remaining,
         palette.hud_fg,
-        palette.panel_bg,
-    );
-
-    let footer = format!("B cancel    Select toggle ({})", mode_tag);
-    put_text(
-        cells,
-        x + 2,
-        y + 3,
-        &footer,
-        palette.panel_dim_fg,
         palette.panel_bg,
     );
 }
@@ -912,52 +1007,33 @@ fn draw_command_menu(
     selected: usize,
     palette: &Palette,
 ) {
-    let x = 2;
-    let y = 4;
-    let w = 36;
-    let h = 21;
-    draw_panel(cells, x, y, w, h, palette.panel_fg, palette.panel_bg);
-    put_text(
+    let layout = PanelLayout::anchored(2, 4, 36, 21);
+    draw_panel_frame(
         cells,
-        x + 2,
-        y + 1,
+        &layout,
         "Actions",
-        palette.panel_title_fg,
-        palette.panel_bg,
+        "A: confirm   B/Y: close",
+        palette,
     );
 
-    let inner_right = x + w - 2;
-
     for (i, ca) in action::ALL_ACTIONS.iter().enumerate() {
-        let row_y = y + 3 + i as i32;
+        let row_y = layout.first_row_y() + i as i32;
         let is_selected = i == selected;
 
-        // Cursor + name. Available actions render with the panel
-        // foreground; unavailable ones with the dim hud color so the
-        // greyed-out state reads at a glance.
         let avail = action::evaluate(world, ca.id);
         let available = matches!(avail, action::Availability::Available { .. });
-        let name_fg = match (is_selected, available) {
-            (true, true) => palette.panel_fg,
+        // Selected + available -> full panel fg (highlight).
+        // Selected + unavailable -> critical red (you tried to confirm
+        //     a verb that can't run; this color reinforces the bounce).
+        // Unselected + available -> panel fg.
+        // Unselected + unavailable -> dim fg (greyed-out catalog row).
+        let label_fg = match (is_selected, available) {
             (true, false) => palette.need_critical_fg,
-            (false, true) => palette.panel_fg,
+            (_, true) => palette.panel_fg,
             (false, false) => palette.panel_dim_fg,
         };
-        let cursor = if is_selected { b'>' } else { b' ' };
-        put_cell(
-            cells,
-            x + 2,
-            row_y,
-            Cell {
-                glyph: cursor,
-                fg: palette.panel_title_fg,
-                bg: palette.panel_bg,
-            },
-        );
-        put_text(cells, x + 4, row_y, ca.name, name_fg, palette.panel_bg);
 
-        // Right-aligned status: cost like "3s" or the unavailable reason.
-        let (status, status_fg) = match avail {
+        let (status_text, status_fg) = match avail {
             action::Availability::Available { cost_game_seconds } => {
                 (format!("{}s", cost_game_seconds), palette.panel_fg)
             }
@@ -965,30 +1041,33 @@ fn draw_command_menu(
                 (reason.to_string(), palette.panel_dim_fg)
             }
         };
-        // Truncate status to fit the inner width.
-        let max_status_len = (w - 4 - ca.name.len() as i32 - 2).max(4) as usize;
-        let status: String = status.chars().take(max_status_len).collect();
-        let status_x = inner_right - status.len() as i32;
-        put_text(cells, status_x, row_y, &status, status_fg, palette.panel_bg);
+
+        draw_menu_row(
+            cells,
+            &layout,
+            row_y,
+            is_selected,
+            ca.name,
+            label_fg,
+            Some((&status_text, status_fg)),
+            palette,
+        );
     }
 
-    // Description line for the selected row (truncated to inner width).
-    let desc_y = y + h - 3;
+    // Description for the selected row, one line above the footer.
+    let desc_y = layout.footer_y() - 1;
     if let Some(sel) = action::ALL_ACTIONS.get(selected) {
-        let max_desc_len = (w - 4) as usize;
+        let max_desc_len = (layout.w as usize).saturating_sub(4);
         let desc: String = sel.description.chars().take(max_desc_len).collect();
-        put_text(cells, x + 2, desc_y, &desc, palette.hud_fg, palette.panel_bg);
+        put_text(
+            cells,
+            layout.inner_x(),
+            desc_y,
+            &desc,
+            palette.hud_fg,
+            palette.panel_bg,
+        );
     }
-
-    // Footer hint.
-    put_text(
-        cells,
-        x + 2,
-        y + h - 2,
-        "A: confirm   B/Y: close",
-        palette.panel_dim_fg,
-        palette.panel_bg,
-    );
 }
 
 fn draw_panel(

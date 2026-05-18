@@ -120,7 +120,31 @@ Choose by audience: would a player running interactively want to see it?
 → info. Is it useful in postmortem-log triage? → debug. Is it
 per-frame? → verbose.
 
-### 2.8 `#[allow(dead_code)]` justification format
+### 2.8 Menu / panel rendering
+
+UI windows (pause menu, command menu, multi-turn banner) compose from
+three primitives in `main.rs`:
+
+- `PanelLayout` — positioning struct with `anchored(x, y, w, h)` /
+  `centered(w, h)` / `centered_x_at(y, w, h)` constructors and inner
+  anchor accessors (`inner_x`, `inner_right`, `title_y`, `first_row_y`,
+  `footer_y`).
+- `draw_panel_frame(cells, layout, title, footer, palette)` — border +
+  title at top + footer at bottom. Use for any menu-shaped window.
+- `draw_menu_row(cells, layout, row_y, is_selected, label, label_fg,
+  right_status: Option<(&str, Color)>, palette)` — canonical
+  cursor (`>`) + label + optional right-aligned status. Truncates the
+  status to fit the remaining inner width.
+
+Adding a new menu = pick a layout, call `draw_panel_frame`, iterate
+items calling `draw_menu_row`. Body that isn't a simple row list (the
+multi-turn banner's progress bar) calls `put_cell` / `put_text`
+directly against the same `layout` anchors.
+
+Don't repaint the box yourself; don't compute `x + 2` inline anywhere
+— go through the layout's accessors so the convention stays uniform.
+
+### 2.9 `#[allow(dead_code)]` justification format
 ```rust
 #[allow(dead_code)] // consumed by main.rs in phase 14 when death gate enables
 pub const DEATH_ENABLED: bool = false;
