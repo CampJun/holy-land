@@ -45,6 +45,11 @@ pub struct ItemDef {
     pub is_fungible: bool,
     pub glyph: u8,
     pub color: [u8; 3],
+    /// Weight per unit (grams) when a freshly-constructed default
+    /// instance is created (e.g. debug `give` command). Waterskins
+    /// here are EMPTY (200g, water_uses=0); a full one is heavier and
+    /// is constructed explicitly by `starting_pack`.
+    pub default_weight_g: u32,
 }
 
 /// Iteration order used by `from_save_key` and tests. Keep in sync with
@@ -81,6 +86,7 @@ impl ItemKind {
                 is_fungible: false,
                 glyph: b'P',
                 color: [180, 180, 200],
+                default_weight_g: 1_000,
             },
             ItemKind::Knife => ItemDef {
                 save_key: "knife",
@@ -88,6 +94,7 @@ impl ItemKind {
                 is_fungible: false,
                 glyph: b'-',
                 color: [180, 180, 200],
+                default_weight_g: 200,
             },
             ItemKind::Pack => ItemDef {
                 save_key: "pack",
@@ -95,6 +102,7 @@ impl ItemKind {
                 is_fungible: false,
                 glyph: b'[',
                 color: [130, 90, 50],
+                default_weight_g: 1_000,
             },
             ItemKind::Tent => ItemDef {
                 save_key: "tent",
@@ -104,6 +112,7 @@ impl ItemKind {
                 // a canvas tent silhouette much better than the prior 'A'.
                 glyph: 0x1E,
                 color: [200, 180, 140],
+                default_weight_g: 5_000,
             },
             ItemKind::Bedroll => ItemDef {
                 save_key: "bedroll",
@@ -111,6 +120,7 @@ impl ItemKind {
                 is_fungible: false,
                 glyph: b'=',
                 color: [220, 200, 160],
+                default_weight_g: 2_000,
             },
             ItemKind::CookingPan => ItemDef {
                 save_key: "cooking_pan",
@@ -118,6 +128,7 @@ impl ItemKind {
                 is_fungible: false,
                 glyph: b'O',
                 color: [80, 80, 90],
+                default_weight_g: 1_000,
             },
             ItemKind::Waterskin => ItemDef {
                 save_key: "waterskin",
@@ -125,6 +136,9 @@ impl ItemKind {
                 is_fungible: false,
                 glyph: b'u',
                 color: [100, 140, 200],
+                // Empty waterskin (no water). Use starting_pack to make a
+                // full one (1200g with water_uses=4).
+                default_weight_g: 200,
             },
             ItemKind::FlintAndSteel => ItemDef {
                 save_key: "flint_and_steel",
@@ -132,6 +146,7 @@ impl ItemKind {
                 is_fungible: false,
                 glyph: b'!',
                 color: [230, 140, 60],
+                default_weight_g: 100,
             },
             ItemKind::Herb => ItemDef {
                 save_key: "herb",
@@ -139,6 +154,7 @@ impl ItemKind {
                 is_fungible: false,
                 glyph: b'*',
                 color: [80, 160, 70],
+                default_weight_g: 10,
             },
             ItemKind::Twig => ItemDef {
                 save_key: "twig",
@@ -146,6 +162,7 @@ impl ItemKind {
                 is_fungible: true,
                 glyph: b',',
                 color: [200, 170, 110],
+                default_weight_g: 5,
             },
             ItemKind::Stick => ItemDef {
                 save_key: "stick",
@@ -153,6 +170,7 @@ impl ItemKind {
                 is_fungible: true,
                 glyph: b'/',
                 color: [200, 170, 110],
+                default_weight_g: 50,
             },
             ItemKind::Firewood => ItemDef {
                 save_key: "firewood",
@@ -160,6 +178,7 @@ impl ItemKind {
                 is_fungible: true,
                 glyph: b'=',
                 color: [110, 80, 50],
+                default_weight_g: 500,
             },
             ItemKind::GrassBlade => ItemDef {
                 save_key: "grass_blade",
@@ -167,6 +186,7 @@ impl ItemKind {
                 is_fungible: true,
                 glyph: b'"',
                 color: [80, 160, 70],
+                default_weight_g: 2,
             },
             ItemKind::Stone => ItemDef {
                 save_key: "stone",
@@ -174,6 +194,7 @@ impl ItemKind {
                 is_fungible: true,
                 glyph: b'*',
                 color: [150, 150, 150],
+                default_weight_g: 200,
             },
             ItemKind::MossPatch => ItemDef {
                 save_key: "moss_patch",
@@ -181,6 +202,7 @@ impl ItemKind {
                 is_fungible: true,
                 glyph: b'%',
                 color: [50, 100, 50],
+                default_weight_g: 10,
             },
             ItemKind::Mud => ItemDef {
                 save_key: "mud",
@@ -188,6 +210,7 @@ impl ItemKind {
                 is_fungible: true,
                 glyph: b'%',
                 color: [110, 80, 50],
+                default_weight_g: 300,
             },
             ItemKind::Ration => ItemDef {
                 save_key: "ration",
@@ -195,7 +218,26 @@ impl ItemKind {
                 is_fungible: true,
                 glyph: b'%',
                 color: [220, 200, 160],
+                default_weight_g: 500,
             },
+        }
+    }
+
+    /// Build a freshly-constructed `ItemInstance` of this kind with
+    /// default metadata + per-unit weight from `def()`. Fungibles use
+    /// `count`; uniques always get count=1 regardless of what the
+    /// caller passed (uniques don't stack). Waterskins come back
+    /// EMPTY (water_uses=0); use `starting_pack` to make a full one.
+    pub fn make_default_instance(self, count: u16) -> ItemInstance {
+        let d = self.def();
+        let metadata = match self {
+            ItemKind::Waterskin => ItemMetadata::Waterskin { water_uses: 0 },
+            _ => ItemMetadata::None,
+        };
+        if d.is_fungible {
+            ItemInstance::stack(self, count.max(1), d.default_weight_g, None, metadata)
+        } else {
+            ItemInstance::unique(self, d.default_weight_g, None, metadata)
         }
     }
 
@@ -681,6 +723,36 @@ mod tests {
             ItemMetadata::Waterskin { water_uses } => assert_eq!(water_uses, 3),
             other => panic!("got {:?}", other),
         }
+    }
+
+    #[test]
+    fn make_default_instance_fungible_uses_count_and_weight() {
+        let inst = ItemKind::Firewood.make_default_instance(4);
+        assert_eq!(inst.kind, ItemKind::Firewood);
+        assert_eq!(inst.count, 4);
+        assert_eq!(inst.weight_g_each, 500);
+        assert_eq!(inst.total_weight_g(), 2_000);
+        assert!(matches!(inst.metadata, ItemMetadata::None));
+    }
+
+    #[test]
+    fn make_default_instance_unique_count_always_one() {
+        // Asking for 5 axes via make_default_instance still produces a
+        // single ItemInstance with count 1; the caller is expected to
+        // loop.
+        let inst = ItemKind::Axe.make_default_instance(5);
+        assert_eq!(inst.count, 1);
+        assert_eq!(inst.weight_g_each, 1_000);
+    }
+
+    #[test]
+    fn make_default_instance_waterskin_is_empty() {
+        let inst = ItemKind::Waterskin.make_default_instance(1);
+        assert_eq!(inst.weight_g_each, 200, "empty waterskin");
+        assert!(matches!(
+            inst.metadata,
+            ItemMetadata::Waterskin { water_uses: 0 }
+        ));
     }
 
     #[test]

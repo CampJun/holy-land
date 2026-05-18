@@ -14,6 +14,7 @@ use std::io::{BufRead, BufReader};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
+use crate::items::ItemKind;
 use crate::needs::NeedKind;
 use crate::world::{Position, World, DAY_LENGTH_SECONDS};
 
@@ -24,6 +25,10 @@ pub enum DebugCommand {
     AdvanceSecs(u32),
     SetNeed(NeedKind, u8),
     Teleport(i32, i32),
+    /// Drop `count` of `kind` into the player's pack (subject to
+    /// capacity). Kind name is the ItemKind's save_key string ("twig",
+    /// "firewood", "flint_and_steel", etc.).
+    Give(ItemKind, u16),
     Unknown(String),
 }
 
@@ -101,6 +106,16 @@ fn parse_command(raw: &str) -> DebugCommand {
             _ => DebugCommand::Unknown(raw.to_string()),
         },
 
+        ["give", kind, count] => {
+            let Some(k) = ItemKind::from_save_key(kind) else {
+                return DebugCommand::Unknown(raw.to_string());
+            };
+            let Ok(n) = count.parse::<u16>() else {
+                return DebugCommand::Unknown(raw.to_string());
+            };
+            DebugCommand::Give(k, n.max(1))
+        }
+
         _ => DebugCommand::Unknown(raw.to_string()),
     }
 }
@@ -173,6 +188,36 @@ pub fn apply_debug_command(world: &mut World, cmd: DebugCommand) {
             world.recompute_fov();
             crate::log_info!("[debug] teleported to ({}, {})", x, y);
         }
+
+        DebugCommand::Give(kind, count) => {
+            // Fungibles: one ItemInstance with the full count, stack-
+            // merges via Pack::try_add. Uniques: count separate
+            // instances, looped because they don't stack.
+            let mut added = 0u32;
+            if kind.is_fungible() {
+                let inst = kind.make_default_instance(count);
+                if world.player_pack_mut().try_add(inst).is_ok() {
+                    added = count as u32;
+                }
+            } else {
+                for _ in 0..count {
+                    let inst = kind.make_default_instance(1);
+                    if world.player_pack_mut().try_add(inst).is_err() {
+                        break; // pack full
+                    }
+                    added += 1;
+                }
+            }
+            if added > 0 {
+                crate::log_info!("[debug] gave {} x {}", added, kind.save_key());
+            } else {
+                crate::log_info!(
+                    "[debug] could not give {} x {} (pack full?)",
+                    count,
+                    kind.save_key()
+                );
+            }
+        }
     }
 }
 
@@ -182,6 +227,7 @@ fn print_help() {
     crate::log_info!("  advance SECS      advance clock by SECS game-seconds");
     crate::log_info!("  need NAME VAL     set thirst|hunger|sleep|warmth to 0-100 (alias t|h|s|w)");
     crate::log_info!("  tp X Y            teleport player to world coords (X, Y)");
+    crate::log_info!("  give KIND N       drop N of KIND into the pack (uses save_key, e.g. firewood, twig)");
     crate::log_info!("  help | ? | h      show this");
 }
 
@@ -245,6 +291,39 @@ mod tests {
             parse_command("need nope 50"),
             DebugCommand::Unknown(_)
         ));
+    }
+
+    #[test]
+    fn give_parses_kind_and_count() {
+        match parse_command("give firewood 2") {
+            DebugCommand::Give(kind, n) => {
+                assert_eq!(kind, ItemKind::Firewood);
+                assert_eq!(n, 2);
+            }
+            other => panic!("got {:?}", other),
+        }
+        match parse_command("give flint_and_steel 1") {
+            DebugCommand::Give(kind, n) => {
+                assert_eq!(kind, ItemKind::FlintAndSteel);
+                assert_eq!(n, 1);
+            }
+            other => panic!("got {:?}", other),
+        }
+        // Unknown kind name -> Unknown command (not Give with default).
+        assert!(matches!(
+            parse_command("give nope 3"),
+            DebugCommand::Unknown(_)
+        ));
+        // Non-numeric count -> Unknown.
+        assert!(matches!(
+            parse_command("give twig many"),
+            DebugCommand::Unknown(_)
+        ));
+        // Zero count clamps to 1 (give still produces at least one).
+        match parse_command("give twig 0") {
+            DebugCommand::Give(_, n) => assert_eq!(n, 1),
+            other => panic!("got {:?}", other),
+        }
     }
 
     #[test]
