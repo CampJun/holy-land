@@ -46,11 +46,13 @@ pub fn generate_chunk(coord: ChunkCoord, world_seed: u64) -> Chunk {
     apply_skeleton_trees(&mut cells);
 
     // Step 2: extra trees in the outer ring (seeded count, seeded
-    // positions on grass).
-    let extra_trees = 10 + (rng.next_u32() % 11) as u32; // 10..=20
+    // positions on grass). 20..=30 gives ~5% density in the ring,
+    // dense enough to feel forested without crowding out
+    // pickable debris cells.
+    let extra_trees = 20 + (rng.next_u32() % 11) as u32; // 20..=30
     let mut placed = 0u32;
     let mut attempts = 0u32;
-    while placed < extra_trees && attempts < 200 {
+    while placed < extra_trees && attempts < 400 {
         attempts += 1;
         let x = (rng.next_u32() % CHUNK_W) as u32;
         let y = (rng.next_u32() % CHUNK_H) as u32;

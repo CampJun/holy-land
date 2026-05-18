@@ -1358,15 +1358,23 @@ mod tests {
     #[test]
     fn snapshot_and_restore_cell_items_round_trip() {
         let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Place an item explicitly so the assertion is independent of
+        // whatever debris chunkgen happened to roll for this seed.
+        if let Some(c) = world.cell_at_mut(21, 15) {
+            c.items.clear();
+            c.items.push(ItemInstance::stack(
+                ItemKind::Twig,
+                3,
+                5,
+                None,
+                ItemMetadata::None,
+            ));
+        }
         let snap = world.snapshot_cell_items();
         assert!(snap.iter().any(|(x, y, _)| *x == 21 && *y == 15));
 
-        // Drain everything via cell_at_mut so we exercise the same path the
-        // pickup verb uses.
-        for (x, y) in [(21, 15), (20, 16), (19, 15)] {
-            if let Some(c) = world.cell_at_mut(x, y) {
-                c.items.clear();
-            }
+        if let Some(c) = world.cell_at_mut(21, 15) {
+            c.items.clear();
         }
         assert!(world.cell_at(21, 15).expect("cell").items.is_empty());
 

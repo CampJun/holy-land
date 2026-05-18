@@ -868,8 +868,20 @@ mod tests {
     #[test]
     fn pickup_available_on_seeded_debris_cell() {
         let mut world = World::new(CHUNK_W, CHUNK_H);
-        // Walk east onto the seeded twigs + stone pile.
-        world.try_move_player(1, 0);
+        // Place a deterministic stack on the spawn cell so the test
+        // doesn't depend on chunkgen rolling debris at any specific
+        // coord (which the debris-probability tweaks can shift).
+        let pos = world.player_pos();
+        if let Some(c) = world.cell_at_mut(pos.x as i64, pos.y as i64) {
+            c.items.clear();
+            c.items.push(ItemInstance::stack(
+                ItemKind::Twig,
+                3,
+                5,
+                None,
+                ItemMetadata::None,
+            ));
+        }
         let avail = evaluate(&world, ActionId::Pickup);
         match avail {
             Availability::Available { cost_game_seconds } => {
