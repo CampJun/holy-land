@@ -558,6 +558,12 @@ fn execute_start_fire(world: &mut World) -> ExecuteOutcome {
     };
 
     world.spend_action_time(ActionId::StartFire.base_cost());
+    // Phase 13b: a freshly lit fire bumps night FOV radius — recompute
+    // so the extended sight shows on the same frame as the success log,
+    // not after the next move.
+    if success {
+        world.recompute_fov();
+    }
     ExecuteOutcome::Done(msg)
 }
 

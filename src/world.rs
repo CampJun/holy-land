@@ -54,10 +54,17 @@ pub const NEED_CRITICAL_THRESHOLD: u8 = 10;
 /// dead time, slow enough that the player can react with B to cancel.
 pub const MULTI_TURN_GAME_SEC_PER_FRAME: u32 = 1;
 
-/// FOV radii. Phase-10 adds a fire-light-source bump for night cells
-/// within 5 of a lit fire.
+/// FOV radii. Phase 13b: lit fires extend the player's night vision to
+/// `FOV_RADIUS_FIRELIT_NIGHT` when any lit fire sits within Chebyshev
+/// `FIRE_LIGHT_RADIUS` of the player. The card "Survival - FOV.md"
+/// describes this as "cells within 5 of a lit fire are visible at
+/// radius 8 at night"; the simpler implementation here bumps the
+/// player's whole-FOV radius when they're near a fire and defers the
+/// strict per-cell illumination to slice 2.
 pub const FOV_RADIUS_DAY: i32 = 20;
 pub const FOV_RADIUS_NIGHT: i32 = 3;
+pub const FOV_RADIUS_FIRELIT_NIGHT: i32 = 8;
+pub const FIRE_LIGHT_RADIUS: i32 = 5;
 
 /// Side length of the per-recompute blocker grid: covers `±FOV_RADIUS_DAY`
 /// in both axes plus the origin. The grid is stack-allocated in
@@ -600,7 +607,7 @@ impl World {
     fn needs_env(&self) -> NeedsEnv {
         NeedsEnv {
             is_night: self.is_night(),
-            adjacent_fire: self.lit_fire_adjacent_to_player(),
+            adjacent_fire: self.light_source_adjacent_to_player(),
             inside_tent: self.player_on_pitched(ItemKind::Tent),
             in_bedroll: self.player_on_pitched(ItemKind::Bedroll),
         }
@@ -637,8 +644,12 @@ impl World {
         let mut needs = self.player_needs();
         needs.tick(secs, env);
         self.set_player_needs(needs);
-        self.tick_fires(secs);
-        if self.is_night() != was_night {
+        let fire_died = self.tick_fires(secs);
+        let day_night_flipped = self.is_night() != was_night;
+        // Recompute FOV on a day/night boundary OR when a fire died
+        // during night (the lit radius may have shrunk). The day-only
+        // case is uninteresting since fires don't change day FOV.
+        if day_night_flipped || (fire_died && self.is_night()) {
             self.recompute_fov();
         }
     }
@@ -646,13 +657,17 @@ impl World {
     /// Decrement `fuel_seconds` on every Lit item in every loaded chunk.
     /// Items whose fuel hits 0 are removed (the fire burnt out and the
     /// firewood is consumed). Phase-12's "feed fire" verb adds fuel
-    /// back from inventory before the timer hits 0.
-    fn tick_fires(&mut self, secs: u32) {
+    /// back from inventory before the timer hits 0. Returns true if at
+    /// least one fire went out this tick — the caller uses that to
+    /// invalidate FOV (phase 13b: a dying fire shrinks the lit radius).
+    fn tick_fires(&mut self, secs: u32) -> bool {
+        let mut any_died = false;
         for chunk in self.chunks.values_mut() {
             for cell in chunk.cells.iter_mut() {
                 if !cell.items.iter().any(|i| matches!(i.metadata, ItemMetadata::Lit { .. })) {
                     continue;
                 }
+                let before = cell.items.len();
                 cell.items.retain_mut(|item| {
                     if let ItemMetadata::Lit { fuel_seconds } = &mut item.metadata {
                         if *fuel_seconds > secs {
@@ -665,16 +680,23 @@ impl World {
                         true
                     }
                 });
+                if cell.items.len() < before {
+                    any_died = true;
+                }
                 chunk.dirty = true;
             }
         }
+        any_died
     }
 
-    /// Is there at least one lit fire in the player's cell or any of
-    /// the 8 adjacent cells? Phase-13 wires this into NeedsEnv for
-    /// warmth shelter; phase-10 exposes it now so action-evaluation
-    /// can use the same predicate.
-    pub fn lit_fire_adjacent_to_player(&self) -> bool {
+    /// Is there at least one active light source (any item carrying
+    /// `ItemMetadata::Lit`) in the player's cell or any of the 8
+    /// adjacent cells? Slice-1 only spawns lit firewood from StartFire,
+    /// but the lit-source abstraction is the metadata marker — when
+    /// torches/lanterns land they'll be a different ItemKind with the
+    /// same Lit metadata and this predicate covers them with no edit.
+    /// NeedsEnv reads this for warmth shelter (phase 13a).
+    pub fn light_source_adjacent_to_player(&self) -> bool {
         let p = self.player_pos();
         for dy in -1..=1 {
             for dx in -1..=1 {
@@ -682,6 +704,33 @@ impl World {
                     continue;
                 };
                 if cell.items.iter().any(|i| matches!(i.metadata, ItemMetadata::Lit { .. })) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Is there at least one active light source (any item carrying
+    /// `ItemMetadata::Lit`) within Chebyshev `radius` cells of
+    /// `origin`? Used by recompute_fov (phase 13b) to decide whether
+    /// to extend the player's night FOV. Treating Lit-metadata as the
+    /// abstraction means future light sources (torches, lanterns)
+    /// participate for free. Iterates loaded chunks and short-circuits
+    /// on the first hit; light sources are sparse so this stays cheap.
+    pub fn any_light_source_within(&self, origin: Position, radius: i32) -> bool {
+        let cw = CHUNK_W as i32;
+        let ch = CHUNK_H as i32;
+        for chunk in self.chunks.values() {
+            for (idx, cell) in chunk.cells.iter().enumerate() {
+                if !cell.items.iter().any(|i| matches!(i.metadata, ItemMetadata::Lit { .. })) {
+                    continue;
+                }
+                let lx = (idx as i32) % cw;
+                let ly = (idx as i32) / cw;
+                let wx = chunk.coord.cx * cw + lx;
+                let wy = chunk.coord.cy * ch + ly;
+                if (wx - origin.x).abs() <= radius && (wy - origin.y).abs() <= radius {
                     return true;
                 }
             }
@@ -796,7 +845,11 @@ impl World {
     pub fn recompute_fov(&mut self) {
         let origin = self.player_pos();
         let radius = if self.is_night() {
-            FOV_RADIUS_NIGHT
+            if self.any_light_source_within(origin, FIRE_LIGHT_RADIUS) {
+                FOV_RADIUS_FIRELIT_NIGHT
+            } else {
+                FOV_RADIUS_NIGHT
+            }
         } else {
             FOV_RADIUS_DAY
         };
@@ -1252,6 +1305,69 @@ mod tests {
         assert!(world.is_night());
         world.clock_seconds = 6 * 3600;
         assert!(!world.is_night());
+    }
+
+    #[test]
+    fn night_fov_extends_to_8_with_lit_fire_within_5_of_player() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Jump to deep night so the night radius selection runs.
+        world.clock_seconds = 22 * 3600;
+        // Drop a lit fire 2 cells east of the player (well within
+        // FIRE_LIGHT_RADIUS = 5).
+        let pos = world.player_pos();
+        if let Some(cell) = world.cell_at_mut((pos.x + 2) as i64, pos.y as i64) {
+            cell.items.push(ItemInstance::unique(
+                ItemKind::Firewood,
+                500,
+                None,
+                ItemMetadata::Lit { fuel_seconds: 3600 },
+            ));
+        }
+        world.recompute_fov();
+        // Without the fire bump, a cell 5 east would be invisible at
+        // night radius 3. With the bump to radius 8 it must be visible.
+        let far = world
+            .cell_at((pos.x + 5) as i64, pos.y as i64)
+            .expect("cell");
+        assert!(
+            far.visible,
+            "fire-lit night FOV (radius 8) should reach (+5, 0)"
+        );
+        // A cell at distance 9 is outside the bumped radius.
+        let beyond = world
+            .cell_at((pos.x + 9) as i64, pos.y as i64)
+            .expect("cell");
+        assert!(!beyond.visible, "radius 8 must not reach (+9, 0)");
+    }
+
+    #[test]
+    fn night_fov_returns_to_night_radius_when_only_fire_burns_out() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        world.clock_seconds = 22 * 3600;
+        // Lit fire with just 30s of fuel adjacent to the player.
+        let pos = world.player_pos();
+        if let Some(cell) = world.cell_at_mut((pos.x + 1) as i64, pos.y as i64) {
+            cell.items.push(ItemInstance::unique(
+                ItemKind::Firewood,
+                500,
+                None,
+                ItemMetadata::Lit { fuel_seconds: 30 },
+            ));
+        }
+        world.recompute_fov();
+        // Sanity: at distance 5 the cell is visible while the fire
+        // still burns.
+        assert!(world.cell_at((pos.x + 5) as i64, pos.y as i64).unwrap().visible);
+        // Advance 60s -> fire dies inside tick_fires; advance_time_raw
+        // should trigger a recompute and the FOV must shrink.
+        world.advance_time_raw(60);
+        assert!(
+            !world
+                .cell_at((pos.x + 5) as i64, pos.y as i64)
+                .unwrap()
+                .visible,
+            "FOV must contract back to night radius after fire dies"
+        );
     }
 
     #[test]
