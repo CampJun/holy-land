@@ -45,7 +45,7 @@ impl DebugConsole {
     pub fn spawn() -> Self {
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            eprintln!("[debug] console ready. Type 'help' for commands.");
+            crate::log_info!("[debug] console ready. Type 'help' for commands.");
             let stdin = std::io::stdin();
             let mut reader = BufReader::new(stdin);
             let mut line = String::new();
@@ -133,7 +133,7 @@ pub fn apply_debug_command(world: &mut World, cmd: DebugCommand) {
 
         DebugCommand::Unknown(s) => {
             if !s.is_empty() {
-                eprintln!("[debug] unknown command: '{}'. type 'help'.", s);
+                crate::log_info!("[debug] unknown command: '{}'. type 'help'.", s);
             }
         }
 
@@ -144,7 +144,7 @@ pub fn apply_debug_command(world: &mut World, cmd: DebugCommand) {
             // which can rewind if the current time is already past 06:00.
             let day_offset = world.clock_seconds / DAY_LENGTH_SECONDS * DAY_LENGTH_SECONDS;
             world.clock_seconds = day_offset + h as u64 * 3600 + m as u64 * 60;
-            eprintln!(
+            crate::log_info!(
                 "[debug] time set to {:02}:{:02} day {} (clock {}s)",
                 h,
                 m,
@@ -156,7 +156,7 @@ pub fn apply_debug_command(world: &mut World, cmd: DebugCommand) {
         DebugCommand::AdvanceSecs(secs) => {
             world.clock_seconds = world.clock_seconds.saturating_add(secs as u64);
             let (h, m) = world.clock_hm();
-            eprintln!(
+            crate::log_info!(
                 "[debug] advanced {}s -> {:02}:{:02} day {}",
                 secs,
                 h,
@@ -189,23 +189,23 @@ pub fn apply_debug_command(world: &mut World, cmd: DebugCommand) {
                 }
             }
             world.set_player_needs(n);
-            eprintln!("[debug] need {:?} = {}", kind, value);
+            crate::log_info!("[debug] need {:?} = {}", kind, value);
         }
 
         DebugCommand::Teleport(x, y) => {
             world.set_player_pos(Position { x, y });
-            eprintln!("[debug] teleported to ({}, {})", x, y);
+            crate::log_info!("[debug] teleported to ({}, {})", x, y);
         }
     }
 }
 
 fn print_help() {
-    eprintln!("[debug] commands:");
-    eprintln!("  time HH:MM        set clock to HH:MM today (e.g. 'time 19:45')");
-    eprintln!("  advance SECS      advance clock by SECS game-seconds");
-    eprintln!("  need NAME VAL     set thirst|hunger|sleep|warmth to 0-100 (alias t|h|s|w)");
-    eprintln!("  tp X Y            teleport player to world coords (X, Y)");
-    eprintln!("  help | ? | h      show this");
+    crate::log_info!("[debug] commands:");
+    crate::log_info!("  time HH:MM        set clock to HH:MM today (e.g. 'time 19:45')");
+    crate::log_info!("  advance SECS      advance clock by SECS game-seconds");
+    crate::log_info!("  need NAME VAL     set thirst|hunger|sleep|warmth to 0-100 (alias t|h|s|w)");
+    crate::log_info!("  tp X Y            teleport player to world coords (X, Y)");
+    crate::log_info!("  help | ? | h      show this");
 }
 
 #[cfg(test)]

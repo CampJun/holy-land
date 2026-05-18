@@ -2,6 +2,7 @@
 mod debug_console;
 mod input;
 mod items;
+mod logging;
 mod needs;
 mod platform;
 mod render;
@@ -44,18 +45,20 @@ struct Cell {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let save_dir = platform::save_dir();
-    eprintln!("save dir: {}", save_dir.display());
+    logging::init(&save_dir);
+    log_info!("save dir: {}", save_dir.display());
 
     let mut meta = match save::load_meta(&save_dir.join(META_FILE)) {
         Ok(m) => {
-            eprintln!(
+            log_info!(
                 "loaded meta save (counter={}, device={})",
-                m.header.save_counter, m.header.device_id
+                m.header.save_counter,
+                m.header.device_id
             );
             m
         }
         Err(e) => {
-            eprintln!("no meta save loaded ({}); starting fresh", e);
+            log_info!("no meta save loaded ({}); starting fresh", e);
             MetaSave::empty(SaveHeader::fresh(None))
         }
     };
@@ -76,9 +79,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     canvas.set_logical_size(logical_w, logical_h)?;
     {
         let info = canvas.info();
-        eprintln!(
+        log_info!(
             "renderer: {} (flags={:#x}) max_texture={}x{}",
-            info.name, info.flags, info.max_texture_width, info.max_texture_height
+            info.name,
+            info.flags,
+            info.max_texture_width,
+            info.max_texture_height
         );
     }
 
@@ -100,7 +106,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut prev_run_header: Option<SaveHeader> = None;
 
     if let Ok(run) = save::load_run(&save_dir.join(RUN_FILE)) {
-        eprintln!(
+        log_info!(
             "loaded run save (player at {},{}, pack {}g, {} non-empty cells, clock {}s)",
             run.player_x,
             run.player_y,
@@ -201,7 +207,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Action::A => {
                     let picked = world.try_pickup_all_at_player();
                     if picked > 0 {
-                        eprintln!("picked up {} stack(s)", picked);
+                        log_debug!("picked up {} stack(s)", picked);
                     }
                 }
                 Action::Start => break 'main,
@@ -225,9 +231,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // subsequent forward crossing fires normally).
         let now_dawn_idx = dawns_elapsed(world.clock_seconds);
         if now_dawn_idx > last_dawn_idx {
-            eprintln!(
+            log_info!(
                 "auto-save: crossed dawn (day {} -> {})",
-                last_dawn_idx, now_dawn_idx
+                last_dawn_idx,
+                now_dawn_idx
             );
             save_game(
                 &save_dir,
@@ -336,15 +343,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         fps_count += 1;
         if fps_window.elapsed() >= TIMING_LOG_INTERVAL {
-            eprintln!("fps: {}", fps_count);
-            eprintln!("{}", timing_accum.summary());
+            log_verbose!("fps: {}", fps_count);
+            log_verbose!("{}", timing_accum.summary());
             fps_count = 0;
             fps_window = Instant::now();
             timing_accum = FrameTiming::default();
         }
     }
 
-    eprintln!("shutdown: exiting Survival main loop");
+    log_info!("shutdown: exiting Survival main loop");
     let _ = std::io::stderr().flush();
     Ok(())
 }
@@ -360,11 +367,11 @@ fn save_game(
     let mut next_meta = meta.clone();
     next_meta.header = new_meta_header.clone();
     if let Err(e) = save::save_atomic(&save_dir.join(META_FILE), &next_meta) {
-        eprintln!("meta save failed: {}", e);
+        log_info!("meta save failed: {}", e);
     } else {
         *meta = next_meta;
         *prev_meta_header = new_meta_header;
-        eprintln!("meta saved (counter={})", prev_meta_header.save_counter);
+        log_debug!("meta saved (counter={})", prev_meta_header.save_counter);
     }
 
     let pos = world.player_pos();
@@ -395,14 +402,18 @@ fn save_game(
         warmth_acc_secs: n.warmth_acc_secs,
     };
     if let Err(e) = save::save_atomic(&save_dir.join(RUN_FILE), &run) {
-        eprintln!("run save failed: {}", e);
+        log_info!("run save failed: {}", e);
     } else {
         *prev_run_header = Some(new_run_header);
-        eprintln!(
+        log_debug!(
             "run saved at ({}, {}) — pack {}g, {} non-empty cells",
             run.player_x,
             run.player_y,
-            run.pack.contents.iter().map(|i| (i.weight_g_each as u64) * (i.count as u64)).sum::<u64>(),
+            run.pack
+                .contents
+                .iter()
+                .map(|i| (i.weight_g_each as u64) * (i.count as u64))
+                .sum::<u64>(),
             run.cell_items.len()
         );
     }
