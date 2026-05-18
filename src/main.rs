@@ -1,3 +1,5 @@
+#[cfg(not(target_arch = "arm"))]
+mod debug_console;
 mod input;
 mod items;
 mod needs;
@@ -158,6 +160,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // loaded) clock so a loaded save mid-day doesn't immediately re-save.
     let mut last_dawn_idx = dawns_elapsed(world.clock_seconds);
 
+    #[cfg(not(target_arch = "arm"))]
+    let debug = debug_console::DebugConsole::spawn();
+
     let palette = Palette::default();
 
     // B-style per-cell diff renderer. `prev_cells` mirrors what we last painted
@@ -211,16 +216,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Auto-save on dawn crossing. dawns_elapsed monotonically counts
-        // 06:00 boundaries since the game-time epoch; an increment means
-        // the player just stepped past one.
+        #[cfg(not(target_arch = "arm"))]
+        debug.drain(|cmd| debug_console::apply_debug_command(&mut world, cmd));
+
+        // Auto-save on dawn crossing. Detects forward crossings via
+        // `dawns_elapsed` increments. Debug commands can rewind time, in
+        // which case we silently resync without firing save (and the
+        // subsequent forward crossing fires normally).
         let now_dawn_idx = dawns_elapsed(world.clock_seconds);
         if now_dawn_idx > last_dawn_idx {
             eprintln!(
                 "auto-save: crossed dawn (day {} -> {})",
                 last_dawn_idx, now_dawn_idx
             );
-            last_dawn_idx = now_dawn_idx;
             save_game(
                 &save_dir,
                 &mut meta,
@@ -229,6 +237,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &mut prev_run_header,
             );
         }
+        last_dawn_idx = now_dawn_idx;
 
         // Camera in world coords. While the world fits the viewport we anchor
         // at (0, 0); when the world grows beyond the viewport, switch this to
