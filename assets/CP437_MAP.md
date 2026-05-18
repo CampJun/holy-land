@@ -5,6 +5,25 @@ than the literal CP437 glyph. This file is the ground-truth reference
 for what each byte renders as in our atlas, plus our current
 assignments.
 
+## Rendering: alpha + color
+
+The atlas is RGBA. Magenta `(255, 0, 255)` is the chromakey — those
+pixels get alpha=0 in `render.rs::load_atlas`. **Every other pixel's
+RGB is preserved**, so the atlas's color and grayscale shading
+survive the load. The blit in `draw_glyph` applies `color_mod fg` and
+`alpha_mod fg.a`, so per-pixel:
+
+- white-on-magenta sprite × colored fg → tinted silhouette
+  (unchanged behavior for standard CP437 chars).
+- colored sprite × white fg → atlas color preserved (use this for
+  custom sprites like the chicken leg, mug, stone, trees, grass).
+- grayscale sprite × colored fg → shaded tint (highlights survive).
+
+**Picking fg for a new sprite:** if the atlas pixel was drawn in its
+intended color, use a near-white `fg` (e.g. `[230, 230, 230]`) so the
+artist's color shows. Day/night tinting still multiplies `fg` by the
+clock-driven brightness, so dimming works either way.
+
 ## How to inspect
 
 In-game: press **D** (X face button) to open the **CP437 glyph
@@ -19,37 +38,41 @@ description, then update `items.rs::ItemDef::def()` or
 
 ### Terrain (`world.rs`)
 
-| Kind | Byte | Current glyph |
+| Kind | Byte | Notes |
 |---|---|---|
-| Grass | `0x2E` | `.` |
+| Grass | `0x9C` | Custom grass-tuft sprite (atlas-colored). Sparse-dot logic in main.rs renders blank for ~75% of cells. |
 | BareDirt | `0x2E` | `.` |
 | SandShore | `0x2E` | `.` |
-| TreeTrunk | `0x06` | `♠` (BLACK SPADE SUIT — reads as canopy) |
+| TreeTrunk | `0x05` / `0x06` / `0x17` / `0x18` | Four canopy variants picked per cell via `tree_variant_index` hash. `TREE_VARIANT_GLYPHS` in world.rs. |
 | StreamWater | `0x7E` | `~` |
 | PondWater | `0x7E` | `~` |
 | Wall | `0x23` | `#` |
+
+**Unused tree sprites (reserved):** `0xB5`, `0xC6` are dead trees.
+Future `TerrainKind::DeadTree` (chopped stumps / burnt-out groves)
+would use these.
 
 ### Items (`items.rs`)
 
 | Kind | Byte | Current glyph | Notes |
 |---|---|---|---|
-| Axe | `0x50` | `P` | Could be more axe-like |
-| Knife | `0x2D` | `-` | Could be a dagger sprite |
-| Pack | `0x5B` | `[` | |
-| Tent | `0x1E` | `▲` (BLACK UP-POINTING TRIANGLE) | Reads well |
-| Bedroll | `0x3D` | `=` | |
-| CookingPan | `0x4F` | `O` | |
-| Waterskin | `0x75` | `u` | |
-| FlintAndSteel | `0x21` | `!` | |
-| Herb | `0x2A` | `*` | Could be a leaf/flower sprite |
-| Twig | `0x2C` | `,` | |
-| Stick | `0x2F` | `/` | |
-| Firewood | `0x3D` | `=` | |
-| GrassBlade | `0x22` | `"` | User noted: "between cent (0x9B) and yen (0x9D) looks like grass" — that's `0x9C`. Inspect with the palette and update if confirmed. |
-| Stone | `0x2A` | `*` | User noted: "we use asterisk for rocks when there is already a stone sprite". Find the stone sprite via the palette and update. |
-| MossPatch | `0x25` | `%` | |
-| Mud | `0x25` | `%` | |
-| Ration | `0x25` | `%` | |
+| Axe | `0x50` | `P` (TODO: more axe-like sprite) |
+| Knife | `0x2D` | `-` (TODO: dagger sprite) |
+| Pack | `0x5B` | `[` |
+| Tent | `0x1E` | `▲` (BLACK UP-POINTING TRIANGLE) — reads well |
+| Bedroll | `0x3D` | `=` |
+| CookingPan | `0x4F` | `O` |
+| Waterskin | `0x75` | `u` |
+| FlintAndSteel | `0x21` | `!` |
+| Herb | `0xE7` | Custom herb / small-plant sprite (atlas-colored). |
+| Twig | `0x2C` | `,` (monochrome) |
+| Stick | `0x2F` | `/` (monochrome) |
+| Firewood | `0x16` | Custom 3-log pile sprite (atlas-colored). |
+| GrassBlade | `0x22` | `"` |
+| Stone | `0x07` | Custom stone sprite (atlas-colored). |
+| MossPatch | `0x25` | `%` |
+| Mud | `0x25` | `%` |
+| Ration | `0xE0` | Custom chicken-leg sprite (atlas-colored). Also used as the HUD hunger meter symbol. |
 
 ### Other glyphs in use
 
@@ -60,8 +83,8 @@ description, then update `items.rs::ItemDef::def()` or
 | Multi-turn progress bar (filled) | `0xDB` | `█` |
 | Multi-turn progress bar (empty) | `0xB1` | `▒` |
 | Pause / command / info menu cursor | `0x3E` | `>` |
-| HUD: Thirst | `0xF7` | `≈` |
-| HUD: Hunger | `0x25` | `%` |
+| HUD: Thirst | `0x14` | Custom mug sprite (atlas-colored). |
+| HUD: Hunger | `0xE0` | Custom chicken-leg sprite (matches Ration item). |
 | HUD: Sleep | `0x7A` | `z` |
 | HUD: Warmth | `0x0F` | `☼` |
 

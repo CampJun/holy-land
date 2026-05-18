@@ -163,8 +163,10 @@ impl ItemKind {
                 save_key: "herb",
                 name: "herb",
                 is_fungible: false,
-                glyph: b'*',
-                color: [80, 160, 70],
+                // 0xE7: custom herb/small-plant sprite (atlas-colored).
+                glyph: 0xE7,
+                // Near-white so the atlas's intrinsic green tint shows.
+                color: [230, 240, 220],
                 default_weight_g: 10,
                 blends_with_terrain: false, // herbs pierce — pickable target
             },
@@ -193,8 +195,10 @@ impl ItemKind {
                 save_key: "firewood",
                 name: "firewood",
                 is_fungible: true,
-                glyph: b'=',
-                color: [110, 80, 50],
+                // 0x16: custom 3-log pile sprite (atlas-colored).
+                glyph: 0x16,
+                // Near-white so the atlas's intrinsic brown tones show.
+                color: [240, 230, 215],
                 default_weight_g: 500,
                 blends_with_terrain: false, // firewood pierces — the harvested resource
             },
@@ -211,8 +215,12 @@ impl ItemKind {
                 save_key: "stone",
                 name: "stone",
                 is_fungible: true,
-                glyph: b'*',
-                color: [150, 150, 150],
+                // 0x07: custom stone sprite (atlas-colored). Was the
+                // generic '*' bullet before; the atlas has a proper
+                // rock here.
+                glyph: 0x07,
+                // Near-white so the atlas's gray-stone shading shows.
+                color: [230, 230, 230],
                 default_weight_g: 200,
                 blends_with_terrain: false, // stones pierce
             },
@@ -238,8 +246,10 @@ impl ItemKind {
                 save_key: "ration",
                 name: "ration",
                 is_fungible: true,
-                glyph: b'%',
-                color: [220, 200, 160],
+                // 0xE0: custom chicken-leg sprite (atlas-colored).
+                glyph: 0xE0,
+                // Near-white so the atlas's meat/skin tones show.
+                color: [240, 230, 210],
                 default_weight_g: 500,
                 blends_with_terrain: false, // ration belongs in pack, not on ground
             },

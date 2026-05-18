@@ -32,7 +32,7 @@ use save::{
 use skill::{Rng, Skill, SkillKind, Skills};
 use world::{
     brightness_at, dawns_elapsed, Position, TerrainKind, ViewMode, World,
-    MULTI_TURN_GAME_SEC_PER_FRAME,
+    MULTI_TURN_GAME_SEC_PER_FRAME, TREE_VARIANT_GLYPHS,
 };
 
 const WORLD_W: u32 = 40;
@@ -686,15 +686,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 let mut fg = Color::RGB(fg_arr[0], fg_arr[1], fg_arr[2]);
                 let bg = Color::RGB(bg_arr[0], bg_arr[1], bg_arr[2]);
-                // Sparse grass dots: hash-driven so most grass cells
-                // render as blank background; only ~25% show '.'.
-                // Creates a sparse field-of-grass texture instead of a
-                // wall of dots. Deterministic across reloads via
+                // Sparse grass tufts: hash-driven so ~25% of grass
+                // cells show the 0x9C tuft sprite; the rest render as
+                // blank background. Deterministic across reloads via
                 // world.seed.
                 if terrain == TerrainKind::Grass
                     && !grass_dot_visible(wx as i32, wy as i32, world.seed)
                 {
                     glyph = b' ';
+                }
+                // Per-cell tree-variant pick from TREE_VARIANT_GLYPHS
+                // so the forest has visual variety instead of a row of
+                // identical spades.
+                if terrain == TerrainKind::TreeTrunk {
+                    let i = tree_variant_index(wx as i32, wy as i32, world.seed);
+                    glyph = TREE_VARIANT_GLYPHS[i % TREE_VARIANT_GLYPHS.len()];
                 }
                 let cell_state = world.cell_at(wx, wy);
                 let visible = cell_state.map(|c| c.visible).unwrap_or(false);
@@ -908,8 +914,8 @@ fn save_game(
 
 /// CP437 byte glyphs used in the HUD; can't be embedded in Rust string
 /// literals because the source is UTF-8 and `put_text` writes raw bytes.
-const HUD_GLYPH_THIRST: u8 = 0xF7; // ≈ wavy water
-const HUD_GLYPH_HUNGER: u8 = b'%'; // matches the ration ground-item glyph
+const HUD_GLYPH_THIRST: u8 = 0x14; // custom mug sprite
+const HUD_GLYPH_HUNGER: u8 = 0xE0; // custom chicken-leg sprite (matches Ration)
 const HUD_GLYPH_SLEEP: u8 = b'z'; // classic Z's
 const HUD_GLYPH_WARMTH: u8 = 0x0F; // ☼ sun / fire
 
@@ -1017,10 +1023,22 @@ fn blend_to_terrain(item_rgb: [u8; 3], terrain_fg: [u8; 3], mix: f32) -> Color {
     Color::RGB(r, g, b)
 }
 
+/// Index into `TREE_VARIANT_GLYPHS` for a given cell. Deterministic
+/// per `(x, y, world.seed)` so the same cell always shows the same
+/// tree silhouette. Differs from the grass-dot hash via different
+/// mixer constants so neighboring cells don't visually correlate.
+fn tree_variant_index(x: i32, y: i32, seed: u64) -> usize {
+    let h = (x as i64)
+        .wrapping_mul(467_213)
+        .wrapping_add((y as i64).wrapping_mul(2_654_435_761))
+        .wrapping_add(seed as i64);
+    let mixed = (h as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    (mixed >> 28) as usize
+}
+
 /// Returns true for ~25% of grass cells, deterministically per
 /// `(x, y, world.seed)`. Used by the render loop to render a sparse
-/// pattern of '.' across grass rather than a wall of dots. Tweaking
-/// the modulus threshold changes the density (lower = sparser).
+/// pattern of tufts across grass rather than a wall of glyphs.
 fn grass_dot_visible(x: i32, y: i32, seed: u64) -> bool {
     // Mixing constants: Knuth's multiplicative hash + two large primes
     // for spatial decorrelation, then a final golden-ratio shuffle so

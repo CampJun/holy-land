@@ -164,6 +164,13 @@ pub struct TerrainDef {
     pub blocks_sight: bool,
 }
 
+/// Atlas byte indices for the four custom tree-canopy sprites. The
+/// render loop picks one per cell via a `(x, y, seed)` hash so the
+/// forest has visual variety. 0xB5 / 0xC6 are the dead-tree sprites
+/// available for future TerrainKind::DeadTree (chopped stumps,
+/// burnt-out groves) — see assets/CP437_MAP.md.
+pub const TREE_VARIANT_GLYPHS: &[u8] = &[0x05, 0x06, 0x17, 0x18];
+
 /// Iteration order for `TerrainKind::from_save_key`. Keep in sync with
 /// the enum variants — adding a kind here makes from_save_key find it.
 const ALL_TERRAINS: &[TerrainKind] = &[
@@ -205,8 +212,12 @@ impl TerrainKind {
             TerrainKind::Grass => TerrainDef {
                 save_key: "grass",
                 name: "grass",
-                glyph: b'.',
-                fg: [42, 52, 42],
+                // 0x9C: custom grass-tuft sprite (atlas-colored).
+                // Sparse-dot logic in main.rs renders blank for ~75% of
+                // cells; this glyph shows on the rest. Was '.'.
+                glyph: 0x9C,
+                // Near-white so the atlas tuft's green shading shows.
+                fg: [210, 220, 200],
                 bg: [14, 22, 14],
                 walkable: true,
                 blocks_sight: false,
@@ -234,10 +245,12 @@ impl TerrainKind {
             TerrainKind::TreeTrunk => TerrainDef {
                 save_key: "tree_trunk",
                 name: "tree",
-                // CP437 0x06 = ♠ (BLACK SPADE SUIT) — reads as a leafy
-                // canopy in monochrome glyph fonts.
+                // Default glyph; the render loop overrides this per
+                // cell with one of TREE_VARIANT_GLYPHS based on a
+                // (x, y, seed) hash so the forest has visual variety.
                 glyph: 0x06,
-                fg: [70, 130, 50],
+                // Near-white so each variant's atlas color shows.
+                fg: [230, 235, 215],
                 bg: [12, 20, 12],
                 walkable: false,
                 blocks_sight: true,
