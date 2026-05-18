@@ -1,32 +1,71 @@
-// Survival shell. Phase 2 gut: replaces the Holy Land oasis/wilderness
-// regions, reeds, keeper, vendor, demons, shrine, and Holy-Land-specific
-// inventory with the bare-minimum tile grid, ECS, and player movement.
-// Subsequent phases add: chunked storage, per-cell item lists, needs/clock,
-// FOV, command-menu actions, fire-making, etc. (See the Survival - * cards
-// in obsidian/Cards/ and the master plan.)
+// Survival shell with chunked storage and per-cell item lists.
+//
+// Phase-3 substrate (see Survival - Chunk and per-cell items.md):
+// - `World` owns a `HashMap<ChunkCoord, Box<Chunk>>` keyed on (cx, cy) grid
+//   coords. Slice 1 only ever loads chunk (0, 0); the divmod lookup is real
+//   so phase-12+ multi-chunk expansion is a one-line `generate_if_absent` add.
+// - Each `Cell` carries a `terrain: TerrainKind` and a `Vec<ItemInstance>`.
+// - `tile_at(wx: i64, wy: i64)` returns `TerrainKind::Wall` for unloaded
+//   chunks or out-of-bounds local coords.
+// - `Position` (ECS) stays `i32` for slice 1; widening to `i64` is the
+//   explicit phase-19 save-schema-v2 task.
+//
+// `Pack` lives as a hecs component on the player entity; see items.rs.
+
+use std::collections::HashMap;
 
 use hecs::{Entity, World as Ecs};
 use serde::{Deserialize, Serialize};
 
+use crate::items::{starting_pack, ItemInstance, ItemKind, ItemMetadata, Pack};
+
+pub const CHUNK_W: u32 = 40;
+pub const CHUNK_H: u32 = 30;
+
+// TODO(phase-11): take from save or RNG. Slice-1 doesn't consume seed yet
+// because debris is a fixed test fixture, but the field is wired through so
+// `generate_chunk` can become seed-driven without a struct change.
+const DEFAULT_SEED: u64 = 0xC0FFEE_F00D_u64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ChunkCoord {
+    pub cx: i32,
+    pub cy: i32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Tile {
+pub enum TerrainKind {
     Floor,
     Wall,
 }
 
-pub struct TileMap {
-    pub width: u32,
-    pub height: u32,
-    pub tiles: Vec<Tile>,
+#[derive(Clone, Debug)]
+pub struct CellState {
+    pub terrain: TerrainKind,
+    pub items: Vec<ItemInstance>,
 }
 
-impl TileMap {
-    pub fn tile_at(&self, wx: i64, wy: i64) -> Tile {
-        if wx < 0 || wy < 0 || wx >= self.width as i64 || wy >= self.height as i64 {
-            return Tile::Wall;
+impl CellState {
+    fn floor() -> Self {
+        Self {
+            terrain: TerrainKind::Floor,
+            items: Vec::new(),
         }
-        self.tiles[(wy as u32 * self.width + wx as u32) as usize]
     }
+    fn wall() -> Self {
+        Self {
+            terrain: TerrainKind::Wall,
+            items: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Chunk {
+    #[allow(dead_code)] // read in phase 12+ when chunks load/save individually
+    pub coord: ChunkCoord,
+    pub cells: Vec<CellState>,
+    pub dirty: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,18 +85,30 @@ pub struct Renderable {
 pub struct Player;
 
 pub struct World {
-    pub map: TileMap,
+    pub chunks: HashMap<ChunkCoord, Box<Chunk>>,
+    #[allow(dead_code)] // consumed by chunkgen.rs in phase 11 (seeded gen)
+    pub seed: u64,
     pub ecs: Ecs,
     pub player: Entity,
 }
 
 impl World {
     pub fn new(width: u32, height: u32) -> Self {
-        let map = build_map(width, height);
+        // Slice-1 viewport is fixed to a single chunk. The width/height args
+        // come from main's WORLD_W/WORLD_H constants; assert they match the
+        // chunk dims so a future bump in main flags itself loudly here rather
+        // than rendering a half-chunk.
+        debug_assert_eq!(width, CHUNK_W);
+        debug_assert_eq!(height, CHUNK_H);
+
+        let mut chunks = HashMap::new();
+        let origin = ChunkCoord { cx: 0, cy: 0 };
+        chunks.insert(origin, Box::new(generate_chunk_phase3(origin)));
+
         let mut ecs = Ecs::new();
         let spawn = Position {
-            x: width as i32 / 2,
-            y: height as i32 / 2,
+            x: CHUNK_W as i32 / 2,
+            y: CHUNK_H as i32 / 2,
         };
         let player = ecs.spawn((
             Player,
@@ -67,12 +118,61 @@ impl World {
                 fg: [240, 232, 200, 255],
                 bg: [20, 17, 13, 255],
             },
+            starting_pack(),
         ));
-        Self { map, ecs, player }
+
+        let mut world = Self {
+            chunks,
+            seed: DEFAULT_SEED,
+            ecs,
+            player,
+        };
+        seed_phase3_debris(&mut world);
+        // The seeding marked the chunk dirty (via cell_at_mut); reset so a
+        // fresh game without modifications doesn't unnecessarily persist
+        // pristine debris.
+        if let Some(c) = world.chunks.get_mut(&origin) {
+            c.dirty = false;
+        }
+        world
     }
 
-    pub fn tile_at(&self, wx: i64, wy: i64) -> Tile {
-        self.map.tile_at(wx, wy)
+    fn chunk_coord_for(wx: i64, wy: i64) -> (ChunkCoord, u32, u32) {
+        let cx = wx.div_euclid(CHUNK_W as i64) as i32;
+        let cy = wy.div_euclid(CHUNK_H as i64) as i32;
+        let lx = wx.rem_euclid(CHUNK_W as i64) as u32;
+        let ly = wy.rem_euclid(CHUNK_H as i64) as u32;
+        (ChunkCoord { cx, cy }, lx, ly)
+    }
+
+    pub fn tile_at(&self, wx: i64, wy: i64) -> TerrainKind {
+        let (cc, lx, ly) = Self::chunk_coord_for(wx, wy);
+        let Some(chunk) = self.chunks.get(&cc) else {
+            return TerrainKind::Wall;
+        };
+        if lx >= CHUNK_W || ly >= CHUNK_H {
+            return TerrainKind::Wall;
+        }
+        chunk.cells[(ly * CHUNK_W + lx) as usize].terrain
+    }
+
+    pub fn cell_at(&self, wx: i64, wy: i64) -> Option<&CellState> {
+        let (cc, lx, ly) = Self::chunk_coord_for(wx, wy);
+        let chunk = self.chunks.get(&cc)?;
+        if lx >= CHUNK_W || ly >= CHUNK_H {
+            return None;
+        }
+        Some(&chunk.cells[(ly * CHUNK_W + lx) as usize])
+    }
+
+    pub fn cell_at_mut(&mut self, wx: i64, wy: i64) -> Option<&mut CellState> {
+        let (cc, lx, ly) = Self::chunk_coord_for(wx, wy);
+        let chunk = self.chunks.get_mut(&cc)?;
+        if lx >= CHUNK_W || ly >= CHUNK_H {
+            return None;
+        }
+        chunk.dirty = true;
+        Some(&mut chunk.cells[(ly * CHUNK_W + lx) as usize])
     }
 
     pub fn player_pos(&self) -> Position {
@@ -93,35 +193,166 @@ impl World {
         let pos = self.player_pos();
         let nx = pos.x + dx;
         let ny = pos.y + dy;
-        if matches!(self.tile_at(nx as i64, ny as i64), Tile::Floor) {
+        if matches!(self.tile_at(nx as i64, ny as i64), TerrainKind::Floor) {
             self.set_player_pos(Position { x: nx, y: ny });
+        }
+    }
+
+    pub fn player_pack(&self) -> hecs::Ref<'_, Pack> {
+        self.ecs
+            .get::<&Pack>(self.player)
+            .expect("player has Pack")
+    }
+
+    pub fn player_pack_mut(&mut self) -> hecs::RefMut<'_, Pack> {
+        self.ecs
+            .get::<&mut Pack>(self.player)
+            .expect("player has Pack")
+    }
+
+    pub fn replace_player_pack(&mut self, pack: Pack) {
+        *self
+            .ecs
+            .get::<&mut Pack>(self.player)
+            .expect("player has Pack") = pack;
+    }
+
+    /// Greedy pickup: every item in the player's current cell that fits in
+    /// the pack moves into the pack. Items over capacity stay in the cell.
+    /// Returns the number of `ItemInstance` entries successfully picked up
+    /// (a merge counts as one entry).
+    pub fn try_pickup_all_at_player(&mut self) -> usize {
+        let pos = self.player_pos();
+        let wx = pos.x as i64;
+        let wy = pos.y as i64;
+
+        let cell_items: Vec<ItemInstance> = match self.cell_at_mut(wx, wy) {
+            Some(c) => std::mem::take(&mut c.items),
+            None => return 0,
+        };
+
+        let mut picked = 0;
+        let mut rejects = Vec::new();
+        {
+            let mut pack = self.player_pack_mut();
+            for item in cell_items {
+                match pack.try_add(item) {
+                    Ok(()) => picked += 1,
+                    Err(item) => rejects.push(item),
+                }
+            }
+        }
+
+        if !rejects.is_empty() {
+            if let Some(c) = self.cell_at_mut(wx, wy) {
+                c.items = rejects;
+            }
+        }
+
+        picked
+    }
+
+    /// Snapshot all non-empty cells across loaded chunks. Used by the save
+    /// path. Coords are world-coords (slice 1 always world == local since
+    /// chunk (0, 0) starts at (0, 0)).
+    pub fn snapshot_cell_items(&self) -> Vec<(i32, i32, Vec<ItemInstance>)> {
+        let mut out = Vec::new();
+        for (coord, chunk) in &self.chunks {
+            for (i, cell) in chunk.cells.iter().enumerate() {
+                if cell.items.is_empty() {
+                    continue;
+                }
+                let lx = i as u32 % CHUNK_W;
+                let ly = i as u32 / CHUNK_W;
+                let wx = coord.cx * CHUNK_W as i32 + lx as i32;
+                let wy = coord.cy * CHUNK_H as i32 + ly as i32;
+                out.push((wx, wy, cell.items.clone()));
+            }
+        }
+        out
+    }
+
+    /// Replace the items at given world coords. Used by the load path.
+    /// Cells outside loaded chunks are silently ignored.
+    pub fn restore_cell_items(&mut self, snapshot: Vec<(i32, i32, Vec<ItemInstance>)>) {
+        // First clear any items in loaded chunks so a save with empty cell
+        // lists actually empties them.
+        for (_, chunk) in self.chunks.iter_mut() {
+            for cell in chunk.cells.iter_mut() {
+                cell.items.clear();
+            }
+            chunk.dirty = false;
+        }
+        for (wx, wy, items) in snapshot {
+            if let Some(c) = self.cell_at_mut(wx as i64, wy as i64) {
+                c.items = items;
+            }
         }
     }
 }
 
-fn idx(w: u32, x: i32, y: i32) -> usize {
-    (y as u32 * w + x as u32) as usize
+fn generate_chunk_phase3(coord: ChunkCoord) -> Chunk {
+    // Slice-1 placeholder: perimeter wall, floor inside. Phase 11 swaps in
+    // the authored stream/pond skeleton + seeded forest population.
+    let mut cells = Vec::with_capacity((CHUNK_W * CHUNK_H) as usize);
+    for y in 0..CHUNK_H {
+        for x in 0..CHUNK_W {
+            let is_edge = x == 0 || y == 0 || x == CHUNK_W - 1 || y == CHUNK_H - 1;
+            cells.push(if is_edge {
+                CellState::wall()
+            } else {
+                CellState::floor()
+            });
+        }
+    }
+    Chunk {
+        coord,
+        cells,
+        dirty: false,
+    }
 }
 
-fn build_map(width: u32, height: u32) -> TileMap {
-    // Phase-2 placeholder world: open floor inside a wall perimeter. Phase
-    // 3 swaps this for chunked storage; phase 11 replaces the contents with
-    // the authored stream/pond skeleton + seeded forest population.
-    let mut tiles = vec![Tile::Floor; (width * height) as usize];
-    let w = width as i32;
-    let h = height as i32;
-    for x in 0..w {
-        tiles[idx(width, x, 0)] = Tile::Wall;
-        tiles[idx(width, x, h - 1)] = Tile::Wall;
+// TODO(phase-11): remove this; replaced by chunkgen.rs's seeded debris table.
+fn seed_phase3_debris(world: &mut World) {
+    let spawn = world.player_pos();
+    // East of player: 3 twigs + 1 stone.
+    if let Some(c) = world.cell_at_mut((spawn.x + 1) as i64, spawn.y as i64) {
+        c.items
+            .push(ItemInstance::stack(ItemKind::Twig, 3, 5, None, ItemMetadata::None));
+        c.items.push(ItemInstance::stack(
+            ItemKind::Stone,
+            1,
+            200,
+            None,
+            ItemMetadata::None,
+        ));
     }
-    for y in 0..h {
-        tiles[idx(width, 0, y)] = Tile::Wall;
-        tiles[idx(width, w - 1, y)] = Tile::Wall;
+    // South of player: 2 sticks + 1 grass blade.
+    if let Some(c) = world.cell_at_mut(spawn.x as i64, (spawn.y + 1) as i64) {
+        c.items.push(ItemInstance::stack(
+            ItemKind::Stick,
+            2,
+            50,
+            None,
+            ItemMetadata::None,
+        ));
+        c.items.push(ItemInstance::stack(
+            ItemKind::GrassBlade,
+            1,
+            2,
+            None,
+            ItemMetadata::None,
+        ));
     }
-    TileMap {
-        width,
-        height,
-        tiles,
+    // West of player: 1 moss patch.
+    if let Some(c) = world.cell_at_mut((spawn.x - 1) as i64, spawn.y as i64) {
+        c.items.push(ItemInstance::stack(
+            ItemKind::MossPatch,
+            1,
+            10,
+            None,
+            ItemMetadata::None,
+        ));
     }
 }
 
@@ -131,13 +362,13 @@ mod tests {
 
     #[test]
     fn player_spawns_at_center() {
-        let world = World::new(40, 30);
+        let world = World::new(CHUNK_W, CHUNK_H);
         assert_eq!(world.player_pos(), Position { x: 20, y: 15 });
     }
 
     #[test]
     fn walls_block_movement() {
-        let mut world = World::new(40, 30);
+        let mut world = World::new(CHUNK_W, CHUNK_H);
         world.set_player_pos(Position { x: 1, y: 1 });
         // Step left into the west wall: blocked.
         world.try_move_player(-1, 0);
@@ -149,10 +380,129 @@ mod tests {
 
     #[test]
     fn out_of_bounds_reads_as_wall() {
-        let world = World::new(40, 30);
-        assert_eq!(world.tile_at(-1, 5), Tile::Wall);
-        assert_eq!(world.tile_at(40, 5), Tile::Wall);
-        assert_eq!(world.tile_at(5, -1), Tile::Wall);
-        assert_eq!(world.tile_at(5, 30), Tile::Wall);
+        let world = World::new(CHUNK_W, CHUNK_H);
+        // Unloaded neighbor chunks read as wall.
+        assert_eq!(world.tile_at(-1, 5), TerrainKind::Wall);
+        assert_eq!(world.tile_at(CHUNK_W as i64, 5), TerrainKind::Wall);
+        assert_eq!(world.tile_at(5, -1), TerrainKind::Wall);
+        assert_eq!(world.tile_at(5, CHUNK_H as i64), TerrainKind::Wall);
+    }
+
+    #[test]
+    fn chunk_zero_zero_initialized_with_perimeter_wall() {
+        let world = World::new(CHUNK_W, CHUNK_H);
+        // Inside is Floor.
+        assert_eq!(world.tile_at(5, 5), TerrainKind::Floor);
+        assert_eq!(world.tile_at(20, 15), TerrainKind::Floor);
+        // Edges are Wall.
+        assert_eq!(world.tile_at(0, 0), TerrainKind::Wall);
+        assert_eq!(world.tile_at(CHUNK_W as i64 - 1, 0), TerrainKind::Wall);
+        assert_eq!(world.tile_at(0, CHUNK_H as i64 - 1), TerrainKind::Wall);
+    }
+
+    #[test]
+    fn phase3_seeded_debris_is_findable() {
+        let world = World::new(CHUNK_W, CHUNK_H);
+        let east = world.cell_at(21, 15).expect("(21, 15) in chunk");
+        assert!(east.items.iter().any(|i| i.kind == ItemKind::Twig));
+        assert!(east.items.iter().any(|i| i.kind == ItemKind::Stone));
+        let south = world.cell_at(20, 16).expect("(20, 16) in chunk");
+        assert!(south.items.iter().any(|i| i.kind == ItemKind::Stick));
+        assert!(south.items.iter().any(|i| i.kind == ItemKind::GrassBlade));
+        let west = world.cell_at(19, 15).expect("(19, 15) in chunk");
+        assert!(west.items.iter().any(|i| i.kind == ItemKind::MossPatch));
+    }
+
+    #[test]
+    fn pickup_all_drains_cell_and_fills_pack() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // East of spawn: 3 twigs (5g each) + 1 stone (200g) = 215g.
+        world.try_move_player(1, 0);
+        assert_eq!(world.player_pos(), Position { x: 21, y: 15 });
+
+        let before = world.player_pack().total_weight_g();
+        let picked = world.try_pickup_all_at_player();
+        assert_eq!(picked, 2);
+        let after = world.player_pack().total_weight_g();
+        assert_eq!(after - before, 3 * 5 + 200);
+
+        let cell = world.cell_at(21, 15).expect("cell exists");
+        assert!(cell.items.is_empty());
+    }
+
+    #[test]
+    fn pickup_respects_pack_capacity() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let pos = world.player_pos();
+        let east_x = pos.x + 1;
+        let east_y = pos.y;
+        // Replace the existing debris with a single 10 kg boulder.
+        if let Some(c) = world.cell_at_mut(east_x as i64, east_y as i64) {
+            c.items.clear();
+            c.items.push(ItemInstance::stack(
+                ItemKind::Stone,
+                1,
+                10_000,
+                None,
+                ItemMetadata::None,
+            ));
+        }
+        world.try_move_player(1, 0);
+        let before_count = world.player_pack().contents.len();
+        let picked = world.try_pickup_all_at_player();
+        assert_eq!(picked, 0, "10kg boulder must not fit in 1.8kg of slack");
+        assert_eq!(world.player_pack().contents.len(), before_count);
+        let cell = world.cell_at(east_x as i64, east_y as i64).expect("cell");
+        assert_eq!(cell.items.len(), 1);
+    }
+
+    #[test]
+    fn stackables_merge_in_pack_across_pickups() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Drop a second twig pile west of spawn so we can pick up twigs twice.
+        let pos = world.player_pos();
+        if let Some(c) = world.cell_at_mut((pos.x - 1) as i64, pos.y as i64) {
+            // Replace the moss with twigs so the test is purely about twig
+            // stacking, not unrelated items.
+            c.items.clear();
+            c.items
+                .push(ItemInstance::stack(ItemKind::Twig, 2, 5, None, ItemMetadata::None));
+        }
+
+        // Pick up the east twigs (3) + stone.
+        world.try_move_player(1, 0);
+        world.try_pickup_all_at_player();
+        // Walk back west two steps and pick up 2 more twigs.
+        world.try_move_player(-1, 0);
+        world.try_move_player(-1, 0);
+        world.try_pickup_all_at_player();
+
+        let pack = world.player_pack();
+        let twig_stacks: Vec<&ItemInstance> = pack
+            .contents
+            .iter()
+            .filter(|i| i.kind == ItemKind::Twig)
+            .collect();
+        assert_eq!(twig_stacks.len(), 1, "twigs must merge into a single stack");
+        assert_eq!(twig_stacks[0].count, 5);
+    }
+
+    #[test]
+    fn snapshot_and_restore_cell_items_round_trip() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let snap = world.snapshot_cell_items();
+        assert!(snap.iter().any(|(x, y, _)| *x == 21 && *y == 15));
+
+        // Drain everything via cell_at_mut so we exercise the same path the
+        // pickup verb uses.
+        for (x, y) in [(21, 15), (20, 16), (19, 15)] {
+            if let Some(c) = world.cell_at_mut(x, y) {
+                c.items.clear();
+            }
+        }
+        assert!(world.cell_at(21, 15).expect("cell").items.is_empty());
+
+        world.restore_cell_items(snap);
+        assert!(!world.cell_at(21, 15).expect("cell").items.is_empty());
     }
 }

@@ -78,6 +78,12 @@ pub struct RunSave {
     pub player_x: i32,
     #[serde(default)]
     pub player_y: i32,
+    // Phase 3 (additive; schema stays v1 because the new fields all carry
+    // `#[serde(default)]`):
+    #[serde(default)]
+    pub pack: PackSave,
+    #[serde(default)]
+    pub cell_items: Vec<CellItemsSave>,
 }
 
 impl RunSave {
@@ -86,8 +92,51 @@ impl RunSave {
             header,
             player_x: 0,
             player_y: 0,
+            pack: PackSave::default(),
+            cell_items: Vec::new(),
         }
     }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PackSave {
+    #[serde(default)]
+    pub capacity_g: u32,
+    #[serde(default)]
+    pub contents: Vec<ItemInstanceSave>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ItemInstanceSave {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub count: u16,
+    #[serde(default)]
+    pub weight_g_each: u32,
+    #[serde(default)]
+    pub charges: Option<u16>,
+    #[serde(default)]
+    pub metadata: ItemMetadataSave,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub enum ItemMetadataSave {
+    #[default]
+    None,
+    Waterskin {
+        water_uses: u8,
+    },
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CellItemsSave {
+    #[serde(default)]
+    pub x: i32,
+    #[serde(default)]
+    pub y: i32,
+    #[serde(default)]
+    pub items: Vec<ItemInstanceSave>,
 }
 
 pub fn save_atomic<T: Serialize>(path: &Path, data: &T) -> io::Result<()> {
@@ -188,11 +237,118 @@ mod tests {
             header,
             player_x: 5,
             player_y: 7,
+            pack: PackSave::default(),
+            cell_items: Vec::new(),
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
         assert_eq!(loaded.player_x, 5);
         assert_eq!(loaded.player_y, 7);
+        assert_eq!(loaded.pack.capacity_g, 0);
+        assert!(loaded.pack.contents.is_empty());
+        assert!(loaded.cell_items.is_empty());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn round_trip_run_with_pack_and_cell_items() {
+        let dir = std::env::temp_dir().join(format!("survival-run-full-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("run.cbor");
+
+        let header = SaveHeader::fresh(None);
+        let pack = PackSave {
+            capacity_g: 15_000,
+            contents: vec![
+                ItemInstanceSave {
+                    kind: "axe".to_string(),
+                    count: 1,
+                    weight_g_each: 1000,
+                    charges: None,
+                    metadata: ItemMetadataSave::None,
+                },
+                ItemInstanceSave {
+                    kind: "waterskin".to_string(),
+                    count: 1,
+                    weight_g_each: 1200,
+                    charges: Some(4),
+                    metadata: ItemMetadataSave::Waterskin { water_uses: 4 },
+                },
+                ItemInstanceSave {
+                    kind: "twig".to_string(),
+                    count: 7,
+                    weight_g_each: 5,
+                    charges: None,
+                    metadata: ItemMetadataSave::None,
+                },
+            ],
+        };
+        let cell_items = vec![CellItemsSave {
+            x: 21,
+            y: 15,
+            items: vec![ItemInstanceSave {
+                kind: "stone".to_string(),
+                count: 1,
+                weight_g_each: 200,
+                charges: None,
+                metadata: ItemMetadataSave::None,
+            }],
+        }];
+        let run = RunSave {
+            header,
+            player_x: 21,
+            player_y: 15,
+            pack,
+            cell_items,
+        };
+        save_atomic(&path, &run).unwrap();
+        let loaded = load_run(&path).unwrap();
+        assert_eq!(loaded.pack.capacity_g, 15_000);
+        assert_eq!(loaded.pack.contents.len(), 3);
+        assert_eq!(loaded.pack.contents[0].kind, "axe");
+        assert_eq!(loaded.pack.contents[1].kind, "waterskin");
+        assert!(matches!(
+            loaded.pack.contents[1].metadata,
+            ItemMetadataSave::Waterskin { water_uses: 4 }
+        ));
+        assert_eq!(loaded.pack.contents[2].count, 7);
+        assert_eq!(loaded.cell_items.len(), 1);
+        assert_eq!(loaded.cell_items[0].x, 21);
+        assert_eq!(loaded.cell_items[0].items[0].kind, "stone");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn loads_old_run_save_without_pack_fields() {
+        // Simulate a pre-phase-3 save by serializing only the header +
+        // position fields, then deserializing into the new RunSave shape.
+        // The #[serde(default)] attrs on pack/cell_items must fill in
+        // safely so old saves stay loadable.
+        #[derive(Serialize)]
+        struct LegacyRun {
+            header: SaveHeader,
+            player_x: i32,
+            player_y: i32,
+        }
+        let dir = std::env::temp_dir().join(format!("survival-legacy-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.cbor");
+
+        let legacy = LegacyRun {
+            header: SaveHeader::fresh(None),
+            player_x: 3,
+            player_y: 4,
+        };
+        save_atomic(&path, &legacy).unwrap();
+
+        let loaded = load_run(&path).unwrap();
+        assert_eq!(loaded.player_x, 3);
+        assert_eq!(loaded.player_y, 4);
+        assert_eq!(loaded.pack.capacity_g, 0);
+        assert!(loaded.pack.contents.is_empty());
+        assert!(loaded.cell_items.is_empty());
 
         fs::remove_dir_all(&dir).ok();
     }

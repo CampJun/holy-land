@@ -1,4 +1,5 @@
 mod input;
+mod items;
 mod platform;
 mod render;
 mod save;
@@ -13,9 +14,10 @@ use sdl2::rect::Rect;
 use sdl2::surface::Surface;
 
 use input::{Action, Input};
+use items::{ItemInstance, Pack};
 use render::{draw_glyph, load_atlas, CELL_SIZE};
-use save::{MetaSave, RunSave, SaveHeader};
-use world::{Position, Tile, World};
+use save::{CellItemsSave, MetaSave, RunSave, SaveHeader};
+use world::{Position, TerrainKind, World};
 
 const WORLD_W: u32 = 40;
 const WORLD_H: u32 = 30;
@@ -95,14 +97,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Ok(run) = save::load_run(&save_dir.join(RUN_FILE)) {
         eprintln!(
-            "loaded run save (player at {},{})",
-            run.player_x, run.player_y
+            "loaded run save (player at {},{}, pack {}g, {} non-empty cells)",
+            run.player_x,
+            run.player_y,
+            run.pack.capacity_g,
+            run.cell_items.len()
         );
         prev_run_header = Some(run.header.clone());
         world.set_player_pos(Position {
             x: run.player_x,
             y: run.player_y,
         });
+        // A pre-phase-3 save has no pack data (capacity_g == 0 and empty
+        // contents); keep the freshly-built starting pack in that case.
+        if run.pack.capacity_g > 0 || !run.pack.contents.is_empty() {
+            world.replace_player_pack(Pack::from_save(&run.pack));
+        }
+        if !run.cell_items.is_empty() {
+            let snapshot: Vec<(i32, i32, Vec<ItemInstance>)> = run
+                .cell_items
+                .iter()
+                .map(|cs| {
+                    let items = cs
+                        .items
+                        .iter()
+                        .filter_map(ItemInstance::from_save)
+                        .collect();
+                    (cs.x, cs.y, items)
+                })
+                .collect();
+            world.restore_cell_items(snapshot);
+        }
     }
 
     let palette = Palette::default();
@@ -140,6 +165,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Action::Down => world.try_move_player(0, 1),
                 Action::Left => world.try_move_player(-1, 0),
                 Action::Right => world.try_move_player(1, 0),
+                Action::A => {
+                    let picked = world.try_pickup_all_at_player();
+                    if picked > 0 {
+                        eprintln!("picked up {} stack(s)", picked);
+                    }
+                }
                 Action::Start => break 'main,
                 Action::Select => save_game(
                     &save_dir,
@@ -162,7 +193,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let player = world.player_pos();
         let pwx = player.x as i64;
         let pwy = player.y as i64;
-        let ui_cells = build_ui_cells(&palette);
+        let (pack_weight_g, pack_capacity_g) = {
+            let p = world.player_pack();
+            (p.total_weight_g(), p.capacity_g)
+        };
+        let ui_cells = build_ui_cells(&palette, pack_weight_g, pack_capacity_g);
 
         let draw_start = Instant::now();
         let mut changed_cells = 0;
@@ -175,9 +210,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let wx = cam_x + vx as i64;
                 let wy = cam_y + vy as i64;
                 let (mut glyph, mut fg, bg) = match world.tile_at(wx, wy) {
-                    Tile::Floor => (b'.', palette.floor_fg, palette.floor_bg),
-                    Tile::Wall => (b'#', palette.wall_fg, palette.wall_bg),
+                    TerrainKind::Floor => (b'.', palette.floor_fg, palette.floor_bg),
+                    TerrainKind::Wall => (b'#', palette.wall_fg, palette.wall_bg),
                 };
+                // Ground items override terrain glyph; topmost stack wins.
+                if let Some(cell) = world.cell_at(wx, wy) {
+                    if let Some(top) = cell.items.last() {
+                        let (g, [r, gn, b]) = top.kind.glyph_color();
+                        glyph = g;
+                        fg = Color::RGB(r, gn, b);
+                    }
+                }
                 if wx == pwx && wy == pwy {
                     glyph = b'@';
                     fg = palette.player_fg;
@@ -268,17 +311,40 @@ fn save_game(
     let mut run = RunSave::empty(new_run_header.clone());
     run.player_x = pos.x;
     run.player_y = pos.y;
+    run.pack = world.player_pack().to_save();
+    run.cell_items = world
+        .snapshot_cell_items()
+        .into_iter()
+        .map(|(x, y, items)| CellItemsSave {
+            x,
+            y,
+            items: items.iter().map(|i| i.to_save()).collect(),
+        })
+        .collect();
     if let Err(e) = save::save_atomic(&save_dir.join(RUN_FILE), &run) {
         eprintln!("run save failed: {}", e);
     } else {
         *prev_run_header = Some(new_run_header);
-        eprintln!("run saved at ({}, {})", run.player_x, run.player_y);
+        eprintln!(
+            "run saved at ({}, {}) — pack {}g, {} non-empty cells",
+            run.player_x,
+            run.player_y,
+            run.pack.contents.iter().map(|i| (i.weight_g_each as u64) * (i.count as u64)).sum::<u64>(),
+            run.cell_items.len()
+        );
     }
 }
 
-fn build_ui_cells(palette: &Palette) -> Vec<Option<Cell>> {
+fn build_ui_cells(palette: &Palette, pack_weight_g: u32, pack_capacity_g: u32) -> Vec<Option<Cell>> {
     let mut cells = vec![None; (WORLD_W * WORLD_H) as usize];
     put_text(&mut cells, 1, 1, "Survival", palette.hud_fg, palette.hud_bg);
+    let weight = format!(
+        "Pack {:.1} / {:.1} kg",
+        pack_weight_g as f32 / 1000.0,
+        pack_capacity_g as f32 / 1000.0
+    );
+    let weight_x = WORLD_W as i32 - weight.len() as i32 - 1;
+    put_text(&mut cells, weight_x, 1, &weight, palette.hud_fg, palette.hud_bg);
     cells
 }
 
