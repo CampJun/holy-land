@@ -793,6 +793,26 @@ impl World {
         });
     }
 
+    /// Queue a multi-turn action whose target durations are already
+    /// the literal game-seconds you want to advance (no need-penalty
+    /// amplification). Phase 16 Sleep uses this because "sleep until
+    /// dawn" is computed from wall-clock time and shouldn't stretch
+    /// when the player is starving.
+    pub fn queue_multi_turn_raw(&mut self, steps: &[(ActionId, u32)]) {
+        let q: VecDeque<ActionStep> = steps
+            .iter()
+            .map(|&(id, target)| ActionStep {
+                id,
+                elapsed_secs: 0,
+                target_secs: target,
+            })
+            .collect();
+        self.active_action = Some(ActiveAction {
+            steps: q,
+            view_mode: ViewMode::ProgressBar,
+        });
+    }
+
     /// Advance the active multi-turn action by up to `advance_secs`
     /// game-seconds, ticking needs once per second and checking the
     /// interrupt threshold each step. Returns the ActionIds of any

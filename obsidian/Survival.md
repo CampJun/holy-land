@@ -26,6 +26,11 @@ kanban-plugin: board
 	Schema bump for the redesign. Friendly-reject v1 saves.
 
 
+## Implemented (additions)
+
+- Sleep verb **shipped phase 16**: queues a single-step multi-turn whose target is min(next-dawn, 8h) via the new `World::queue_multi_turn_raw` (no need-penalty amplification — sleep is wall-clock). Needs decay normally during the queue, so a hungry/cold player can interrupt early. `complete_step(Sleep)` restores Sleep to NEED_MAX. Explicit "Sleep until..." picker is a polish item.
+
+
 ## Planning
 
 

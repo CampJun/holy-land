@@ -78,9 +78,11 @@ impl ActionId {
             ActionId::FeedFire => 15,
             ActionId::ChopTree => 120,
             ActionId::PickHerb => 10,
-            // Sleep jumps the clock; the "60s" cost surfacing isn't
-            // meaningful. Phase-16 will replace this with an explicit
-            // "Sleep until..." input.
+            // Sleep computes its real target duration at execute time
+            // (next dawn or 8h, whichever is shorter); the menu's cost
+            // readout is just a placeholder. Phase 16 ships the
+            // duration math; an explicit "Sleep until..." picker is a
+            // future polish item.
             ActionId::Sleep => 0,
             ActionId::Fishing => 600,
         }
@@ -274,8 +276,8 @@ pub fn evaluate(world: &World, id: ActionId) -> Availability {
         ),
         ActionId::StartFire => eval_start_fire(world),
         ActionId::FeedFire => eval_feed_fire(world),
-        ActionId::Sleep => Availability::Unavailable {
-            reason: "phase 16: sleep",
+        ActionId::Sleep => Availability::Available {
+            cost_game_seconds: ActionId::Sleep.base_cost(),
         },
         ActionId::Fishing => Availability::Unavailable {
             reason: "phase 17: fishing",
@@ -486,6 +488,7 @@ pub fn execute(world: &mut World, id: ActionId) -> ExecuteOutcome {
         ActionId::PickHerb => execute_pick_herb(world),
         ActionId::DrinkFromStream => execute_drink_from_stream(world),
         ActionId::FillWaterskin => execute_fill_waterskin(world),
+        ActionId::Sleep => execute_sleep(world),
         _ => ExecuteOutcome::NotImplemented,
     }
 }
@@ -565,6 +568,29 @@ fn execute_start_fire(world: &mut World) -> ExecuteOutcome {
         world.recompute_fov();
     }
     ExecuteOutcome::Done(msg)
+}
+
+/// Phase 16 Sleep verb. Queues a single multi-turn step whose target
+/// is "seconds until next dawn (06:00) or 8 game-hours, whichever is
+/// shorter." Uses `queue_multi_turn_raw` so the duration is NOT
+/// amplified by the need-penalty — sleep is wall-clock, not
+/// effort-scaled. Need decay during the queue is real, so a player
+/// who lies down hungry/cold may wake from an interrupt before dawn.
+/// `complete_step(Sleep)` restores Sleep to NEED_MAX on a full sleep.
+fn execute_sleep(world: &mut World) -> ExecuteOutcome {
+    const HOURS_8_SECS: u64 = 8 * 3600;
+    const DAY_SECS: u64 = crate::world::DAY_LENGTH_SECONDS;
+    const DAWN_SECS: u64 = crate::world::DAWN_HOUR * 3600;
+    let now = world.clock_seconds;
+    let tod = now % DAY_SECS;
+    let dawn_at = if tod < DAWN_SECS {
+        now - tod + DAWN_SECS
+    } else {
+        now - tod + DAY_SECS + DAWN_SECS
+    };
+    let secs_to_dawn = (dawn_at - now).min(HOURS_8_SECS) as u32;
+    world.queue_multi_turn_raw(&[(ActionId::Sleep, secs_to_dawn)]);
+    ExecuteOutcome::Done(format!("sleeping ({} game-min)...", secs_to_dawn / 60))
 }
 
 /// Phase-12 instant verb. Requires a lit fire on the player's cell and
@@ -662,6 +688,15 @@ pub fn complete_step(world: &mut World, id: ActionId) -> Option<String> {
         ActionId::PitchTent => place_pitched_from_pack(world, ItemKind::Tent, 5_000, "tent pitched"),
         ActionId::UnrollBedroll => {
             place_pitched_from_pack(world, ItemKind::Bedroll, 2_000, "bedroll unrolled")
+        }
+        ActionId::Sleep => {
+            // Sleeping through to dawn (or 8h) restores Sleep to max.
+            // Other needs ticked normally during the queue's
+            // advance_time_raw — those drops are real.
+            let mut needs = world.player_needs();
+            needs.restore(NeedKind::Sleep, crate::needs::NEED_MAX);
+            world.set_player_needs(needs);
+            Some("woke rested".to_string())
         }
         // SetupCamp expands into PitchTent + UnrollBedroll steps in the
         // queue; complete_step is never called with SetupCamp itself.
@@ -1025,6 +1060,7 @@ mod tests {
             ActionId::FeedFire,
             ActionId::ChopTree,
             ActionId::PickHerb,
+            ActionId::Sleep,
         ];
         for action in ALL_ACTIONS {
             if live.contains(&action.id) {
@@ -1379,6 +1415,49 @@ mod tests {
             }
             other => panic!("expected Unavailable, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn sleep_queues_duration_to_next_dawn_or_8h_min() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // 22:00 of day 1 (8h to next dawn). Sleep should target exactly
+        // 8h since that's both the cap AND the to-dawn time.
+        world.clock_seconds = 22 * 3600;
+        let outcome = execute(&mut world, ActionId::Sleep);
+        assert!(matches!(outcome, ExecuteOutcome::Done(_)));
+        let queued = world
+            .active_action
+            .as_ref()
+            .expect("sleep must queue a multi-turn step");
+        let step = queued.steps.front().expect("at least one step");
+        assert_eq!(step.id, ActionId::Sleep);
+        assert_eq!(step.target_secs, 8 * 3600, "22:00 -> dawn = 8h");
+
+        // 23:00 same day: only 7h to dawn. Target must be 7h (< 8h cap).
+        world.cancel_multi_turn();
+        world.clock_seconds = 23 * 3600;
+        let _ = execute(&mut world, ActionId::Sleep);
+        let step = world.active_action.as_ref().unwrap().steps.front().unwrap();
+        assert_eq!(step.target_secs, 7 * 3600);
+
+        // Noon: 18h to next dawn, capped to 8h.
+        world.cancel_multi_turn();
+        world.clock_seconds = 12 * 3600;
+        let _ = execute(&mut world, ActionId::Sleep);
+        let step = world.active_action.as_ref().unwrap().steps.front().unwrap();
+        assert_eq!(step.target_secs, 8 * 3600, "noon caps at 8h");
+    }
+
+    #[test]
+    fn complete_sleep_restores_sleep_need_to_max() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let mut n = world.player_needs();
+        n.sleep = 10;
+        world.set_player_needs(n);
+
+        let msg = complete_step(&mut world, ActionId::Sleep);
+        assert_eq!(msg.as_deref(), Some("woke rested"));
+        assert_eq!(world.player_needs().sleep, crate::needs::NEED_MAX);
     }
 
     #[test]
