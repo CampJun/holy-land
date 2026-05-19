@@ -221,6 +221,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut events = sdl.event_pump()?;
     let mut input = Input::new();
     let mut world = World::new(WORLD_W, WORLD_H);
+    world.ensure_player_ring();
     let mut prev_meta_header = meta.header.clone();
     let mut prev_run_header: Option<SaveHeader> = None;
 
@@ -337,6 +338,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect();
             world.restore_terrain_mutations(snapshot);
         }
+        // After restoring position, ensure the chunk ring around the
+        // loaded player coord is in memory — otherwise the first FOV
+        // cast on a non-origin load would see all-Wall around the player.
+        world.ensure_player_ring();
         // Recompute FOV after restoring position so the visible set is
         // correct for the loaded clock + player coord. (World::new already
         // did a recompute, but the loaded position may differ.)
@@ -394,9 +399,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // B-style per-cell diff renderer. `prev_cells` mirrors what we last painted
     // into `framebuf`; each frame we recompute the visible cells and only blit
     // the ones that differ. None entries force a paint on the first frame.
+    //
+    // CDDA follow-cam: when the camera shifts, we memmove the CPU framebuffer
+    // by the same offset and shift `prev_cells` to match, so the "diff" loop
+    // only repaints newly-revealed edge cells. The shifted texture must then
+    // be uploaded full-rect (the streaming texture has no equivalent memmove).
+    // See plan: ~/.claude/plans/lets-start-planning-our-dynamic-starfish.md.
     let viewport_cells = (WORLD_W * WORLD_H) as usize;
     let mut prev_cells: Vec<Option<Cell>> = vec![None; viewport_cells];
     let _ = framebuf.fill_rect(None, palette.letterbox);
+
+    // Tracked across frames so each frame can compute (dx, dy) cell deltas
+    // for the scroll-shift path. Initialised to a sentinel that forces the
+    // first frame to fall through the non-scroll path (cam_x == cam_x_prev).
+    let mut cam_x_prev: i64 = (world.player_pos().x as i64) - WORLD_W as i64 / 2;
+    let mut cam_y_prev: i64 = (world.player_pos().y as i64) - WORLD_H as i64 / 2;
 
     let mut fps_count: u32 = 0;
     let mut fps_window = Instant::now();
@@ -798,16 +815,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         last_dawn_idx = now_dawn_idx;
 
-        // Camera in world coords. While the world fits the viewport we anchor
-        // at (0, 0); when the world grows beyond the viewport, switch this to
-        //   let cam_x = player.x as i64 - WORLD_W as i64 / 2;
-        //   let cam_y = player.y as i64 - WORLD_H as i64 / 2;
-        // and the renderer below stays unchanged.
-        let cam_x: i64 = 0;
-        let cam_y: i64 = 0;
+        // Camera in world coords — player-centered follow-cam. The viewport
+        // top-left in world coords is (player - half_viewport); the player
+        // always appears at the center cell of the viewport.
         let player = world.player_pos();
         let pwx = player.x as i64;
         let pwy = player.y as i64;
+        let cam_x: i64 = pwx - WORLD_W as i64 / 2;
+        let cam_y: i64 = pwy - WORLD_H as i64 / 2;
+
+        // Detect camera shift for the scroll-blit path below.
+        let dx_cells = (cam_x - cam_x_prev) as i32;
+        let dy_cells = (cam_y - cam_y_prev) as i32;
+        let scrolled = dx_cells != 0 || dy_cells != 0;
+        if scrolled {
+            shift_framebuffer(&mut framebuf, dx_cells, dy_cells);
+            shift_prev_cells(&mut prev_cells, WORLD_W, WORLD_H, dx_cells, dy_cells);
+        }
+        cam_x_prev = cam_x;
+        cam_y_prev = cam_y;
         let needs = world.player_needs();
         let (clock_h, clock_m) = world.clock_hm();
         let day = world.day_count();
@@ -993,7 +1019,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         timing_accum.changed_cells += changed_cells;
 
         let upload_start = Instant::now();
-        if changed_cells > 0 {
+        if scrolled {
+            // Scroll frame: the CPU surface contents shifted in-place via
+            // shift_framebuffer, but the streaming texture's contents
+            // haven't moved. Re-upload the whole framebuffer so the
+            // texture matches. Edge-strip blits and any in-place cell
+            // changes are already baked into `framebuf` by the compose
+            // loop above.
+            let pitch = framebuf.pitch() as usize;
+            let pixels = framebuf.without_lock().expect("CPU surface");
+            present_tex.update(None, pixels, pitch)?;
+        } else if changed_cells > 0 {
             let dirty = Rect::new(
                 dirty_min_x * CELL_SIZE as i32,
                 dirty_min_y * CELL_SIZE as i32,
@@ -2003,6 +2039,91 @@ fn pace_frame(frame_start: Instant, elapsed: Duration) -> Duration {
     }
 
     sleep_start.elapsed()
+}
+
+/// In-place 2D shift of a CPU `Surface`'s pixels by `(-dx_cells*CELL_SIZE,
+/// -dy_cells*CELL_SIZE)` pixels — when the camera moves by `(+dx, +dy)`
+/// cells, the *content* on screen moves by `(-dx, -dy)`. Pixels that
+/// scroll off the edge are discarded; pixels exposed at the new edge are
+/// left untouched (the compose loop will repaint them via `prev_cells`
+/// being `None` there).
+///
+/// Uses `slice::copy_within` so overlapping regions are memmove-safe.
+/// Row iteration direction picks correctly for either vertical scroll
+/// direction.
+fn shift_framebuffer(framebuf: &mut Surface, dx_cells: i32, dy_cells: i32) {
+    if dx_cells == 0 && dy_cells == 0 {
+        return;
+    }
+    let w_px = framebuf.width() as i32;
+    let h_px = framebuf.height() as i32;
+    let cell = CELL_SIZE as i32;
+    // Content shift is the negative of camera shift.
+    let content_dx = -dx_cells * cell;
+    let content_dy = -dy_cells * cell;
+    if content_dx.abs() >= w_px || content_dy.abs() >= h_px {
+        // Whole framebuffer scrolled off; nothing to preserve.
+        return;
+    }
+    let pitch = framebuf.pitch() as usize;
+    framebuf.with_lock_mut(|pixels| {
+        // Region of pixels that survives the shift.
+        let src_x = (-content_dx).max(0) as usize;
+        let src_y = (-content_dy).max(0) as usize;
+        let dst_x = content_dx.max(0) as usize;
+        let dst_y = content_dy.max(0) as usize;
+        let copy_w = (w_px - content_dx.abs()) as usize;
+        let copy_h = (h_px - content_dy.abs()) as usize;
+        let bytes_per_row = copy_w * 4;
+        let row_iter: Box<dyn Iterator<Item = usize>> = if dst_y > src_y {
+            // Content moves down; iterate bottom-up to avoid clobber.
+            Box::new((0..copy_h).rev())
+        } else {
+            Box::new(0..copy_h)
+        };
+        for i in row_iter {
+            let sy = src_y + i;
+            let dy = dst_y + i;
+            let src_off = sy * pitch + src_x * 4;
+            let dst_off = dy * pitch + dst_x * 4;
+            pixels.copy_within(src_off..src_off + bytes_per_row, dst_off);
+        }
+    });
+}
+
+/// Mirror of `shift_framebuffer` for the `prev_cells` viewport-indexed
+/// cache. A scrolled cell's identity matches what's already painted at
+/// the new viewport coord; cells whose source was off-viewport are reset
+/// to `None` so the compose loop repaints them.
+fn shift_prev_cells(prev: &mut [Option<Cell>], w: u32, h: u32, dx_cells: i32, dy_cells: i32) {
+    if dx_cells == 0 && dy_cells == 0 {
+        return;
+    }
+    let w_i = w as i32;
+    let h_i = h as i32;
+    if dx_cells.abs() >= w_i || dy_cells.abs() >= h_i {
+        for slot in prev.iter_mut() {
+            *slot = None;
+        }
+        return;
+    }
+    // For each new (vx, vy) the source is (vx + dx, vy + dy) in the
+    // *old* viewport. Anything outside [0, w) × [0, h) is a freshly
+    // exposed edge cell and must be `None`.
+    let old: Vec<Option<Cell>> = prev.to_vec();
+    for new_vy in 0..h_i {
+        for new_vx in 0..w_i {
+            let dst_i = (new_vy as u32 * w + new_vx as u32) as usize;
+            let src_vx = new_vx + dx_cells;
+            let src_vy = new_vy + dy_cells;
+            if src_vx < 0 || src_vx >= w_i || src_vy < 0 || src_vy >= h_i {
+                prev[dst_i] = None;
+            } else {
+                let src_i = (src_vy as u32 * w + src_vx as u32) as usize;
+                prev[dst_i] = old[src_i];
+            }
+        }
+    }
 }
 
 struct Palette {

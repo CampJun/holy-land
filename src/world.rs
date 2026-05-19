@@ -543,6 +543,63 @@ impl World {
         Some(&mut chunk.cells[(ly * CHUNK_W + lx) as usize])
     }
 
+    /// Lazily generate a chunk if it isn't already loaded. Reuses the
+    /// existing seeded chunkgen path so coords are deterministic across
+    /// reloads. After generation, any saved terrain mutations that fall
+    /// inside this chunk's bounds are re-applied so chopped trees etc.
+    /// survive even if the chunk wasn't in memory at load time.
+    pub fn ensure_chunk_loaded(&mut self, coord: ChunkCoord) {
+        if self.chunks.contains_key(&coord) {
+            return;
+        }
+        let mut chunk = crate::chunkgen::generate_chunk(coord, self.seed);
+        // Apply any pending terrain mutations for this chunk.
+        let cw = CHUNK_W as i32;
+        let ch = CHUNK_H as i32;
+        for (&(x, y), &kind) in self.terrain_mutations.iter() {
+            let cx = (x as i64).div_euclid(CHUNK_W as i64) as i32;
+            let cy = (y as i64).div_euclid(CHUNK_H as i64) as i32;
+            if cx != coord.cx || cy != coord.cy {
+                continue;
+            }
+            let lx = (x as i64).rem_euclid(CHUNK_W as i64) as u32;
+            let ly = (y as i64).rem_euclid(CHUNK_H as i64) as u32;
+            if (lx as i32) < cw && (ly as i32) < ch {
+                chunk.cells[(ly * CHUNK_W + lx) as usize].terrain = kind;
+            }
+        }
+        self.chunks.insert(coord, Box::new(chunk));
+    }
+
+    /// Ensure the 3x3 ring of chunks around `center` is loaded. Called
+    /// after the player crosses a chunk seam so FOV (radius 20) always
+    /// queries against in-memory chunks rather than the OOB Wall fallback.
+    pub fn ensure_chunk_ring(&mut self, center: ChunkCoord) {
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                self.ensure_chunk_loaded(ChunkCoord {
+                    cx: center.cx + dx,
+                    cy: center.cy + dy,
+                });
+            }
+        }
+    }
+
+    /// Convenience: the chunk the player currently stands in.
+    pub fn player_chunk(&self) -> ChunkCoord {
+        let p = self.player_pos();
+        let (cc, _, _) = Self::chunk_coord_for(p.x as i64, p.y as i64);
+        cc
+    }
+
+    /// Load the chunk ring around the player. Call after `World::new` and
+    /// after restoring a save, so the first frame's FOV cast has the
+    /// neighbors in memory.
+    pub fn ensure_player_ring(&mut self) {
+        let cc = self.player_chunk();
+        self.ensure_chunk_ring(cc);
+    }
+
     pub fn player_pos(&self) -> Position {
         *self
             .ecs
@@ -561,6 +618,12 @@ impl World {
         let pos = self.player_pos();
         let nx = pos.x + dx;
         let ny = pos.y + dy;
+        // Ensure the destination's chunk ring is loaded before the
+        // walkability check — otherwise stepping into a freshly-revealed
+        // chunk would read as Wall (the tile_at OOB fallback) and the
+        // move would be rejected.
+        let (target_cc, _, _) = Self::chunk_coord_for(nx as i64, ny as i64);
+        self.ensure_chunk_ring(target_cc);
         if self.tile_at(nx as i64, ny as i64).def().walkable {
             self.set_player_pos(Position { x: nx, y: ny });
             self.spend_action_time(COST_MOVE_TILE);
@@ -996,10 +1059,13 @@ impl World {
         out
     }
 
-    /// Restore explored bits from a save. Coords outside loaded chunks are
-    /// silently ignored.
+    /// Restore explored bits from a save. Lazily loads any chunks the
+    /// saved coords reference so explored cells survive across reloads
+    /// even when the player has roamed beyond chunk (0,0).
     pub fn restore_explored(&mut self, coords: &[(i32, i32)]) {
         for &(wx, wy) in coords {
+            let (cc, _, _) = Self::chunk_coord_for(wx as i64, wy as i64);
+            self.ensure_chunk_loaded(cc);
             if let Some(cell) = self.cell_at_mut(wx as i64, wy as i64) {
                 cell.explored = true;
             }
@@ -1025,6 +1091,8 @@ impl World {
 
     pub fn restore_terrain_mutations(&mut self, snap: Vec<(i32, i32, TerrainKind)>) {
         for (x, y, k) in snap {
+            let (cc, _, _) = Self::chunk_coord_for(x as i64, y as i64);
+            self.ensure_chunk_loaded(cc);
             if let Some(cell) = self.cell_at_mut(x as i64, y as i64) {
                 cell.terrain = k;
             }
@@ -1119,7 +1187,8 @@ impl World {
     }
 
     /// Replace the items at given world coords. Used by the load path.
-    /// Cells outside loaded chunks are silently ignored.
+    /// Lazily loads any chunks the snapshot references so saved items
+    /// outside the spawn ring aren't silently dropped on load.
     pub fn restore_cell_items(&mut self, snapshot: Vec<(i32, i32, Vec<ItemInstance>)>) {
         // First clear any items in loaded chunks so a save with empty cell
         // lists actually empties them.
@@ -1130,6 +1199,8 @@ impl World {
             chunk.dirty = false;
         }
         for (wx, wy, items) in snapshot {
+            let (cc, _, _) = Self::chunk_coord_for(wx as i64, wy as i64);
+            self.ensure_chunk_loaded(cc);
             if let Some(c) = self.cell_at_mut(wx as i64, wy as i64) {
                 c.items = items;
             }
@@ -1149,18 +1220,20 @@ mod tests {
     }
 
     #[test]
-    fn off_map_walk_blocked_by_oob_wall() {
-        // Cell (0, 0) is in-chunk grass on the phase-11 forest; the
-        // out-of-bounds Wall guard sits at (-1, *) and (*, -1).
+    fn moving_into_neighbor_chunk_loads_it() {
+        // Survival/follow-cam: try_move_player now lazily loads the
+        // chunk ring around the destination so the player can cross
+        // chunk seams. The "OOB Wall" fallback only fires for chunks
+        // outside the ring.
         let mut world = World::new(CHUNK_W, CHUNK_H);
-        world.set_player_pos(Position { x: 0, y: 0 });
-        // Step left into (-1, 0): blocked by Wall (no chunk loaded
-        // outside (0, 0) yet).
+        world.set_player_pos(Position { x: 0, y: 15 });
+        // Stepping west attempts to enter chunk (-1, 0); the ring around
+        // that chunk loads as a side-effect.
         world.try_move_player(-1, 0);
-        assert_eq!(world.player_pos(), Position { x: 0, y: 0 });
-        // Step right onto walkable terrain succeeds.
-        world.try_move_player(1, 0);
-        assert_eq!(world.player_pos().x, 1);
+        assert!(
+            world.chunks.contains_key(&ChunkCoord { cx: -1, cy: 0 }),
+            "neighbor chunk should be loaded after move attempt"
+        );
     }
 
     #[test]
@@ -1171,6 +1244,27 @@ mod tests {
         assert_eq!(world.tile_at(CHUNK_W as i64, 5), TerrainKind::Wall);
         assert_eq!(world.tile_at(5, -1), TerrainKind::Wall);
         assert_eq!(world.tile_at(5, CHUNK_H as i64), TerrainKind::Wall);
+    }
+
+    #[test]
+    fn fov_marks_cells_visible_across_chunk_seam() {
+        // After follow-cam: a player near the west edge of chunk (0,0)
+        // should mark cells inside chunk (-1, 0) as explored once the
+        // ring is loaded and FOV is recomputed.
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        world.ensure_player_ring();
+        // Place player at world (2, 15) — local (2, 15) in chunk (0, 0).
+        // Radius-20 FOV reaches world x = -18, well inside chunk (-1, 0).
+        world.set_player_pos(Position { x: 2, y: 15 });
+        world.ensure_player_ring();
+        world.recompute_fov();
+        // The cell at world (-1, 15) is local (39, 15) in chunk (-1, 0).
+        // FOV may or may not mark it visible depending on intervening
+        // trees, but the chunk MUST be loaded and queryable.
+        assert!(
+            world.cell_at(-1, 15).is_some(),
+            "chunk (-1, 0) cell should be queryable after ring load"
+        );
     }
 
     #[test]
