@@ -34,6 +34,7 @@ pub enum ItemKind {
     MossPatch,
     Mud,
     Ration,
+    Fish,
 }
 
 /// All per-kind metadata in one place. Adding a new `ItemKind` variant is
@@ -79,6 +80,7 @@ const ALL_KINDS: &[ItemKind] = &[
     ItemKind::MossPatch,
     ItemKind::Mud,
     ItemKind::Ration,
+    ItemKind::Fish,
 ];
 
 impl ItemKind {
@@ -248,6 +250,17 @@ impl ItemKind {
                 // Warm tan/skin — tints the grayscale chicken sprite.
                 color: [225, 180, 110],
                 default_weight_g: 500,
+                blends_with_terrain: false,
+            },
+            ItemKind::Fish => ItemDef {
+                save_key: "fish",
+                name: "fish",
+                is_fungible: true,
+                // Reuses the small-letter F glyph; no fish sprite in
+                // the atlas yet. Cool blue-grey reads "raw fish."
+                glyph: b'f',
+                color: [140, 170, 210],
+                default_weight_g: 400,
                 blends_with_terrain: false,
             },
         }

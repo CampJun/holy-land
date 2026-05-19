@@ -21,7 +21,7 @@ kanban-plugin: board
 - [ ] [[Survival - Cooking and herbs]]
 	Pan-on-fire cooks raw→cooked. Three herb uses: eat raw, brew tea, season cooked food.
 - [ ] [[Survival - Fishing]]
-	Slice-1 fishing: skill-less, flat 20%, 600 game-sec/attempt. Skill comes in slice 2.
+	Slice-1 fishing **shipped phase 17**: requires pond adjacent, flat 20% via `world.rng.d100()`, 600 game-sec/attempt regardless of outcome, success drops one Fish item on the player's cell. Skill-less for slice 1 per the card; slice 2 will add the Fishing skill chassis on the existing skill.rs infra.
 - [ ] [[Survival - Save schema v2]]
 	Schema bump for the redesign. Friendly-reject v1 saves.
 

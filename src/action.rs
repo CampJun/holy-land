@@ -279,9 +279,7 @@ pub fn evaluate(world: &World, id: ActionId) -> Availability {
         ActionId::Sleep => Availability::Available {
             cost_game_seconds: ActionId::Sleep.base_cost(),
         },
-        ActionId::Fishing => Availability::Unavailable {
-            reason: "phase 17: fishing",
-        },
+        ActionId::Fishing => eval_fishing(world),
     }
 }
 
@@ -489,6 +487,7 @@ pub fn execute(world: &mut World, id: ActionId) -> ExecuteOutcome {
         ActionId::DrinkFromStream => execute_drink_from_stream(world),
         ActionId::FillWaterskin => execute_fill_waterskin(world),
         ActionId::Sleep => execute_sleep(world),
+        ActionId::Fishing => execute_fishing(world),
         _ => ExecuteOutcome::NotImplemented,
     }
 }
@@ -591,6 +590,48 @@ fn execute_sleep(world: &mut World) -> ExecuteOutcome {
     let secs_to_dawn = (dawn_at - now).min(HOURS_8_SECS) as u32;
     world.queue_multi_turn_raw(&[(ActionId::Sleep, secs_to_dawn)]);
     ExecuteOutcome::Done(format!("sleeping ({} game-min)...", secs_to_dawn / 60))
+}
+
+/// Phase 17 fishing (slice-1 flat). Requires a pond adjacent to the
+/// player. Skill-less for slice 1: a flat 20% success roll. Cost is
+/// 600 game-seconds per attempt. Success drops one Fish on the
+/// player's cell. Slice-2 will add a Fishing skill, gear bonuses,
+/// and a stream variant; the design card calls those out.
+fn is_pond(t: TerrainKind) -> bool {
+    matches!(t, TerrainKind::PondWater)
+}
+
+const FISHING_SUCCESS_PCT: u8 = 20;
+
+fn eval_fishing(world: &World) -> Availability {
+    Availability::from_has(
+        find_adjacent_terrain(world, is_pond).is_some(),
+        ActionId::Fishing.base_cost(),
+        "no pond adjacent",
+    )
+}
+
+fn execute_fishing(world: &mut World) -> ExecuteOutcome {
+    if find_adjacent_terrain(world, is_pond).is_none() {
+        return ExecuteOutcome::Done("no pond adjacent".to_string());
+    }
+    let roll = world.rng.d100();
+    world.spend_action_time(ActionId::Fishing.base_cost());
+    if roll <= FISHING_SUCCESS_PCT {
+        let pos = world.player_pos();
+        if let Some(cell) = world.cell_at_mut(pos.x as i64, pos.y as i64) {
+            cell.items.push(ItemInstance::stack(
+                ItemKind::Fish,
+                1,
+                ItemKind::Fish.def().default_weight_g,
+                None,
+                ItemMetadata::None,
+            ));
+        }
+        ExecuteOutcome::Done("caught a fish!".to_string())
+    } else {
+        ExecuteOutcome::Done("nothing biting".to_string())
+    }
 }
 
 /// Phase-12 instant verb. Requires a lit fire on the player's cell and
@@ -1061,6 +1102,7 @@ mod tests {
             ActionId::ChopTree,
             ActionId::PickHerb,
             ActionId::Sleep,
+            ActionId::Fishing,
         ];
         for action in ALL_ACTIONS {
             if live.contains(&action.id) {
@@ -1446,6 +1488,52 @@ mod tests {
         let _ = execute(&mut world, ActionId::Sleep);
         let step = world.active_action.as_ref().unwrap().steps.front().unwrap();
         assert_eq!(step.target_secs, 8 * 3600, "noon caps at 8h");
+    }
+
+    #[test]
+    fn fishing_unavailable_without_adjacent_pond() {
+        let world = World::new(CHUNK_W, CHUNK_H);
+        // Spawn is at (20, 15); the chunkgen pond is at (28, 22). No
+        // pond should be within the 3x3 around spawn.
+        match evaluate(&world, ActionId::Fishing) {
+            Availability::Unavailable { reason } => assert_eq!(reason, "no pond adjacent"),
+            other => panic!("expected Unavailable, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fishing_with_pond_adjacent_advances_clock_and_sometimes_drops_fish() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let pos = world.player_pos();
+        // Inject a pond cell one east of the player so eval/execute
+        // both clear their "pond adjacent" gate.
+        world.set_terrain_at((pos.x + 1) as i64, pos.y as i64, TerrainKind::PondWater);
+
+        let clock_before = world.clock_seconds;
+        let outcome = execute(&mut world, ActionId::Fishing);
+        let msg = match outcome {
+            ExecuteOutcome::Done(m) => m,
+            other => panic!("expected Done, got {:?}", other),
+        };
+        // Clock must advance by base_cost (600s) regardless of catch
+        // outcome — fishing takes the same time whether you succeed.
+        assert!(world.clock_seconds >= clock_before + ActionId::Fishing.base_cost() as u64);
+        // Either outcome message is acceptable; one of them must occur.
+        assert!(
+            msg == "caught a fish!" || msg == "nothing biting",
+            "got: {}",
+            msg
+        );
+        // If success, a Fish stack exists on the player's cell.
+        let caught = world
+            .cell_at(pos.x as i64, pos.y as i64)
+            .map(|c| c.items.iter().any(|i| i.kind == ItemKind::Fish))
+            .unwrap_or(false);
+        assert_eq!(
+            caught,
+            msg == "caught a fish!",
+            "fish presence must match the outcome msg"
+        );
     }
 
     #[test]
