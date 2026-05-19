@@ -419,11 +419,10 @@ fn eval_pickup(world: &World) -> Availability {
 #[derive(Debug)]
 pub enum ExecuteOutcome {
     /// The action ran; the inner message is suitable for log_info.
+    /// Slice 1 wires every verb so this is the only variant; future
+    /// failure modes (e.g. async/queued failure) can extend the enum
+    /// without touching the call sites' Done arm.
     Done(String),
-    /// The action's implementation lives in a future phase. The menu
-    /// keeps it greyed-out via `evaluate`, but execute is defensive in
-    /// case wiring drifts.
-    NotImplemented,
 }
 
 pub fn execute(world: &mut World, id: ActionId) -> ExecuteOutcome {
@@ -488,7 +487,6 @@ pub fn execute(world: &mut World, id: ActionId) -> ExecuteOutcome {
         ActionId::FillWaterskin => execute_fill_waterskin(world),
         ActionId::Sleep => execute_sleep(world),
         ActionId::Fishing => execute_fishing(world),
-        _ => ExecuteOutcome::NotImplemented,
     }
 }
 

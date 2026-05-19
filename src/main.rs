@@ -480,14 +480,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     {
                         match action::evaluate(&world, *id) {
                             action::Availability::Available { .. } => {
-                                match action::execute(&mut world, *id) {
-                                    action::ExecuteOutcome::Done(msg) => {
-                                        log_info!("[radial] {}", msg);
-                                    }
-                                    action::ExecuteOutcome::NotImplemented => {
-                                        log_info!("[radial] {} not yet implemented", name);
-                                    }
-                                }
+                                let action::ExecuteOutcome::Done(msg) =
+                                    action::execute(&mut world, *id);
+                                log_info!("[radial] {}", msg);
                             }
                             action::Availability::Unavailable { reason } => {
                                 log_info!("[radial] can't '{}': {}", name, reason);
@@ -671,18 +666,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let id = action::ALL_ACTIONS[selected].id;
                         match action::evaluate(&world, id) {
                             action::Availability::Available { .. } => {
-                                let outcome = action::execute(&mut world, id);
-                                match outcome {
-                                    action::ExecuteOutcome::Done(msg) => {
-                                        log_info!("[menu] {}", msg)
-                                    }
-                                    action::ExecuteOutcome::NotImplemented => {
-                                        log_info!(
-                                            "[menu] {} not yet implemented",
-                                            action::ALL_ACTIONS[selected].name
-                                        );
-                                    }
-                                }
+                                let action::ExecuteOutcome::Done(msg) =
+                                    action::execute(&mut world, id);
+                                log_info!("[menu] {}", msg);
                                 command_menu = None;
                             }
                             action::Availability::Unavailable { reason } => {
@@ -715,11 +701,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Route through the same dispatcher the command
                     // menu uses so Pickup's cost + side-effects stay
                     // in one place (action.rs).
-                    if let action::ExecuteOutcome::Done(msg) =
-                        action::execute(&mut world, action::ActionId::Pickup)
-                    {
-                        log_debug!("{}", msg);
-                    }
+                    let action::ExecuteOutcome::Done(msg) =
+                        action::execute(&mut world, action::ActionId::Pickup);
+                    log_debug!("{}", msg);
                 }
                 Action::Start => {
                     pause_menu = Some(0);
