@@ -114,6 +114,12 @@ impl Input {
         }
     }
 
+    /// Is `a` currently held? Used for press-vs-tap-vs-hold detection
+    /// in main.rs (phase 15 hold-Y radial).
+    pub fn is_held(&self, a: Action) -> bool {
+        self.held.contains(&a)
+    }
+
     pub fn drain(&mut self) -> Vec<Action> {
         let mut out = std::mem::take(&mut self.queued);
         let now = Instant::now();

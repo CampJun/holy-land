@@ -12,8 +12,8 @@ kanban-plugin: board
 
 - [ ] [[Survival - Game time clock and needs]]
 	Clock + needs decay + HUD shipped phase 4. Death gate shipped phase 14: `DEATH_ENABLED=true`; any-need-at-zero triggers a `* DEAD *` overlay with cause-of-death epitaph (Thirst/Hunger/Cold/Exhaustion priority); A starts a new run (wipes `run.cbor`, regens world, keeps meta xp/affinity), Start quits. Active multi-turn cancels on death. Remaining: +0.5/min tent warmth precision (kept under this card; not phase-blocking).
-- [ ] [[Survival - Command menu]] — radial overlay (phase 15)
-	Tap-Y vertical menu shipped phase 7: 14-action registry (SetupCamp added phase 9), availability resolver with greyed-out reasons, A-confirms / B-Y-close, scroll via dpad, name+cost or name+reason per row, description footer. Pickup/EatRation/EatHerb/DrinkWaterskin/PitchTent/UnrollBedroll/SetupCamp wired. Remaining: hold-Y 4-direction radial overlay.
+- [ ] [[Survival - Command menu]]
+	Tap-Y vertical menu shipped phase 7. Hold-Y 4-direction radial overlay **shipped phase 15**: 250ms hold threshold promotes Y-press to a 25×5 radial showing Pickup/Eat/PickHerb/Drink in cardinal slots (greyed via panel_dim_fg when unavailable). Dpad direction while held fires the verb and closes; release-Y without direction closes silently. Quick tap-Y (release before threshold, no direction) still opens the vertical menu — Y press is owned by the hold state machine in main.rs so the two paths don't conflict.
 - [ ] [[Survival - Multi-turn action queue]]
 	Queue+tick+cancel+toggle+save-roundtrip shipped phase 9. PitchTent (300s), UnrollBedroll (30s), SetupCamp (queues both) live. Pitched tents/bedrolls feed warmth shelter flags as of phase 13a. Progress-bar banner overlay; Select toggles to time-skip (simulates each second for interrupts). Need-critical interrupt threshold = 10. Penalty amplified at queue time, not per-second.
 - [ ] [[Survival - Drag mechanic]]

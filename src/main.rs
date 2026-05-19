@@ -70,6 +70,29 @@ enum PauseAction {
     GlyphPalette,
 }
 
+/// Phase 15 hold-Y radial overlay. Tap-Y (press+release within
+/// HOLD_THRESHOLD) opens the full vertical menu as before; holding Y
+/// past the threshold opens this 4-direction radial of common verbs,
+/// and pressing a dpad direction while held fires the bound verb and
+/// closes the overlay. Releasing Y without choosing a direction
+/// closes silently.
+const HOLD_THRESHOLD: Duration = Duration::from_millis(250);
+
+const RADIAL_BINDINGS: [(RadialDir, action::ActionId, &str); 4] = [
+    (RadialDir::Up, action::ActionId::Pickup, "Pickup"),
+    (RadialDir::Right, action::ActionId::EatRation, "Eat"),
+    (RadialDir::Down, action::ActionId::PickHerb, "Pick herb"),
+    (RadialDir::Left, action::ActionId::DrinkWaterskin, "Drink"),
+];
+
+#[derive(Clone, Copy, PartialEq)]
+enum RadialDir {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
 /// Cause of death: whichever need hit 0 first. Priority order picks
 /// one when multiple zero out on the same tick (rare but possible).
 #[derive(Clone, Copy, Debug)]
@@ -344,6 +367,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // priority — blocks all other modes. A=new run, Start=quit.
     let mut dead: Option<DeathCause> = None;
 
+    // Phase 15 hold-Y radial. y_press_at is set on the press edge
+    // (detected per-frame by watching input.is_held(Y) transition).
+    // If Y stays held past HOLD_THRESHOLD, radial_open flips true; a
+    // dpad press while radial_open fires the bound verb, closes the
+    // radial, and sets radial_consumed so the eventual Y release
+    // doesn't ALSO open the vertical menu (the tap-fallback). A quick
+    // press+release (Y up before HOLD_THRESHOLD, no direction chosen)
+    // = tap = open vertical menu.
+    let mut y_press_at: Option<Instant> = None;
+    let mut radial_open: bool = false;
+    let mut radial_consumed: bool = false;
+
     // Dev tool: X-button toggles a CP437 glyph palette overlay so we
     // can audit which bytes have which sprites in our custom atlas.
     // Browse with dpad; the header shows the highlighted byte's value
@@ -383,7 +418,88 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         input.poll_gamepad();
 
+        // Hold-Y radial detection (phase 15). Watch the press/release
+        // edges of Y via is_held; the queued press events go through
+        // the input loop below as usual but the Y key itself is
+        // suppressed there so this state machine owns the menu open
+        // semantics for Y.
+        let y_held = input.is_held(Action::Y);
+        if y_press_at.is_none() && y_held {
+            // Press edge.
+            y_press_at = Some(frame_start);
+            radial_open = false;
+            radial_consumed = false;
+        } else if y_press_at.is_some() && !y_held {
+            // Release edge.
+            if !radial_open && !radial_consumed {
+                // Quick tap with no direction chosen -> open vertical
+                // menu (preserves the existing tap-Y behavior).
+                if command_menu.is_none() && pause_menu.is_none() && dead.is_none() {
+                    command_menu = Some(0);
+                }
+            }
+            y_press_at = None;
+            radial_open = false;
+            radial_consumed = false;
+        } else if let Some(t0) = y_press_at {
+            // Still held; promote to radial once past threshold and
+            // no higher-priority mode is on screen.
+            if !radial_open
+                && frame_start.saturating_duration_since(t0) >= HOLD_THRESHOLD
+                && pause_menu.is_none()
+                && dead.is_none()
+                && command_menu.is_none()
+            {
+                radial_open = true;
+            }
+        }
+
         for input_action in input.drain() {
+            // Y press events are owned by the hold-Y radial state
+            // machine above; drop them here so they don't double-fire
+            // any menu open.
+            if input_action == Action::Y {
+                continue;
+            }
+
+            // Radial overlay (phase 15). Active while Y is held past
+            // HOLD_THRESHOLD. Dpad direction fires the bound verb and
+            // closes; everything else is dropped (so the player
+            // doesn't accidentally walk while choosing).
+            if radial_open {
+                let dir = match input_action {
+                    Action::Up => Some(RadialDir::Up),
+                    Action::Down => Some(RadialDir::Down),
+                    Action::Left => Some(RadialDir::Left),
+                    Action::Right => Some(RadialDir::Right),
+                    _ => None,
+                };
+                if let Some(d) = dir {
+                    if let Some((_, id, name)) =
+                        RADIAL_BINDINGS.iter().find(|(rd, _, _)| *rd == d)
+                    {
+                        match action::evaluate(&world, *id) {
+                            action::Availability::Available { .. } => {
+                                match action::execute(&mut world, *id) {
+                                    action::ExecuteOutcome::Done(msg) => {
+                                        log_info!("[radial] {}", msg);
+                                    }
+                                    action::ExecuteOutcome::NotImplemented => {
+                                        log_info!("[radial] {} not yet implemented", name);
+                                    }
+                                }
+                            }
+                            action::Availability::Unavailable { reason } => {
+                                log_info!("[radial] can't '{}': {}", name, reason);
+                            }
+                        }
+                    }
+                    radial_open = false;
+                    radial_consumed = true;
+                }
+                continue;
+            }
+
             // Death gate: highest-priority mode once the player has
             // expired. Only A (new run) and Start (quit) do anything;
             // everything else is silently dropped so the player can't
@@ -579,7 +695,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
-                    Action::B | Action::Y => {
+                    Action::B => {
                         command_menu = None;
                     }
                     Action::Start => {
@@ -604,9 +720,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     {
                         log_debug!("{}", msg);
                     }
-                }
-                Action::Y => {
-                    command_menu = Some(0);
                 }
                 Action::Start => {
                     pause_menu = Some(0);
@@ -738,6 +851,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(cursor) = glyph_palette {
             draw_glyph_palette(&mut ui_cells, cursor, &palette);
+        }
+        if radial_open {
+            draw_radial_menu(&mut ui_cells, &world, &palette);
         }
         if let Some(selected) = pause_menu {
             draw_pause_menu(&mut ui_cells, selected, &palette);
@@ -1583,6 +1699,50 @@ fn fmt_weight(g: u32) -> String {
         format!("{:.1} kg", g as f32 / 1000.0)
     } else {
         format!("{} g", g)
+    }
+}
+
+/// Phase 15 hold-Y radial. Compact 25x5 panel with the 4 RADIAL_BINDINGS
+/// arranged cardinally; unavailable verbs greyed via panel_dim_fg so
+/// the player sees at a glance which they can fire right now.
+fn draw_radial_menu(cells: &mut [Option<Cell>], world: &World, palette: &Palette) {
+    let layout = PanelLayout::centered(25, 5);
+    draw_panel_frame(cells, &layout, "radial", "release Y", palette);
+
+    let inner_left = layout.inner_x();
+    let inner_right = layout.inner_right();
+    let inner_top = layout.first_row_y();
+    let mid_row = inner_top + 1;
+    let bot_row = inner_top + 2;
+    let inner_w = inner_right - inner_left + 1;
+
+    let pick_fg = |id: action::ActionId| -> Color {
+        match action::evaluate(world, id) {
+            action::Availability::Available { .. } => palette.panel_fg,
+            action::Availability::Unavailable { .. } => palette.panel_dim_fg,
+        }
+    };
+
+    for &(dir, id, name) in &RADIAL_BINDINGS {
+        let fg = pick_fg(id);
+        match dir {
+            RadialDir::Up => {
+                // Top row, center.
+                let x = inner_left + (inner_w - name.len() as i32) / 2;
+                put_text(cells, x, inner_top, name, fg, palette.panel_bg);
+            }
+            RadialDir::Down => {
+                let x = inner_left + (inner_w - name.len() as i32) / 2;
+                put_text(cells, x, bot_row, name, fg, palette.panel_bg);
+            }
+            RadialDir::Left => {
+                put_text(cells, inner_left, mid_row, name, fg, palette.panel_bg);
+            }
+            RadialDir::Right => {
+                let x = inner_right - name.len() as i32 + 1;
+                put_text(cells, x, mid_row, name, fg, palette.panel_bg);
+            }
+        }
     }
 }
 
