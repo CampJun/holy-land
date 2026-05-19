@@ -24,6 +24,8 @@ kanban-plugin: board
 	Slice-1 fishing **shipped phase 17**: requires pond adjacent, flat 20% via `world.rng.d100()`, 600 game-sec/attempt regardless of outcome, success drops one Fish item on the player's cell. Skill-less for slice 1 per the card; slice 2 will add the Fishing skill chassis on the existing skill.rs infra.
 - [ ] [[Survival - Save schema v2]]
 	Schema bump for the redesign. Friendly-reject v1 saves.
+- [ ] [[Survival - Miyoo 30 FPS target]]
+	Drop Miyoo to 30 FPS, keep desktop at 60. Cfg-split `TARGET_FRAME` in `main.rs:43`. Battery + pacer consistency win; pacer oversleep slop is ~30% of budget at 60 FPS but ~10% at 33 ms target so frames actually land more consistently. Watch out for `MULTI_TURN_GAME_SEC_PER_FRAME` (`world.rs:55`) — at 30 FPS all multi-turn wall-clock durations double; bump the constant on ARM or leave it.
 
 
 ## Implemented (additions)
