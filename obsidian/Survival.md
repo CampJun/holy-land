@@ -10,8 +10,8 @@ kanban-plugin: board
 
 ## Drafts
 
-- [ ] [[Survival - Game time clock and needs]] — death gate (slated for phase 14)
-	Clock + needs decay + HUD shipped phase 4. Remaining: death-on-zero (DEATH_ENABLED flip + game-over UX) + +0.5/min tent warmth resolution.
+- [ ] [[Survival - Game time clock and needs]]
+	Clock + needs decay + HUD shipped phase 4. Death gate shipped phase 14: `DEATH_ENABLED=true`; any-need-at-zero triggers a `* DEAD *` overlay with cause-of-death epitaph (Thirst/Hunger/Cold/Exhaustion priority); A starts a new run (wipes `run.cbor`, regens world, keeps meta xp/affinity), Start quits. Active multi-turn cancels on death. Remaining: +0.5/min tent warmth precision (kept under this card; not phase-blocking).
 - [ ] [[Survival - Command menu]] — radial overlay (phase 15)
 	Tap-Y vertical menu shipped phase 7: 14-action registry (SetupCamp added phase 9), availability resolver with greyed-out reasons, A-confirms / B-Y-close, scroll via dpad, name+cost or name+reason per row, description footer. Pickup/EatRation/EatHerb/DrinkWaterskin/PitchTent/UnrollBedroll/SetupCamp wired. Remaining: hold-Y 4-direction radial overlay.
 - [ ] [[Survival - Multi-turn action queue]]

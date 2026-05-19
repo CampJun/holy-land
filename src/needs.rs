@@ -18,10 +18,10 @@ use serde::{Deserialize, Serialize};
 
 pub const NEED_MAX: u8 = 100;
 
-/// Flip on in phase 14 once the slice can punish the player. Wiring is in
-/// place; only the kill check honors this. See plan phase 14.
-#[allow(dead_code)] // consumed by main.rs in phase 14 when death gate enables
-pub const DEATH_ENABLED: bool = false;
+/// Whether `is_dead()` returns true when any need hits 0. Flipped in
+/// phase 14 (death gate); main.rs reads `is_dead()` per frame and
+/// shows the death overlay.
+pub const DEATH_ENABLED: bool = true;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Needs {
@@ -59,7 +59,6 @@ impl Needs {
         }
     }
 
-    #[allow(dead_code)] // wired into main.rs game-over check in phase 14
     pub fn is_dead(&self) -> bool {
         DEATH_ENABLED
             && (self.thirst == 0 || self.hunger == 0 || self.sleep == 0 || self.warmth == 0)
@@ -323,14 +322,17 @@ mod tests {
     }
 
     #[test]
-    fn need_clamps_at_zero_no_death_in_phase_4() {
+    fn need_clamps_at_zero_and_triggers_death() {
         let mut n = Needs {
             thirst: 5,
             ..Needs::starting()
         };
         n.tick(3600, NeedsEnv::default()); // an hour at 1/min would lose 60
         assert_eq!(n.thirst, 0);
-        assert!(!n.is_dead(), "death gate must be disabled in phase 4");
+        // Phase 14 flipped DEATH_ENABLED on; zeroing any need is now
+        // terminal — main.rs reads is_dead per frame and shows the
+        // death overlay.
+        assert!(n.is_dead(), "phase 14: any need at 0 is fatal");
     }
 
     #[test]

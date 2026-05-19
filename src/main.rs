@@ -70,6 +70,41 @@ enum PauseAction {
     GlyphPalette,
 }
 
+/// Cause of death: whichever need hit 0 first. Priority order picks
+/// one when multiple zero out on the same tick (rare but possible).
+#[derive(Clone, Copy, Debug)]
+enum DeathCause {
+    Thirst,
+    Hunger,
+    Cold,
+    Exhaustion,
+}
+
+impl DeathCause {
+    fn from_needs(n: &Needs) -> Option<Self> {
+        if n.thirst == 0 {
+            Some(Self::Thirst)
+        } else if n.hunger == 0 {
+            Some(Self::Hunger)
+        } else if n.warmth == 0 {
+            Some(Self::Cold)
+        } else if n.sleep == 0 {
+            Some(Self::Exhaustion)
+        } else {
+            None
+        }
+    }
+
+    fn epitaph(self) -> &'static str {
+        match self {
+            Self::Thirst => "You died of thirst.",
+            Self::Hunger => "You died of starvation.",
+            Self::Cold => "You froze to death.",
+            Self::Exhaustion => "You died of exhaustion.",
+        }
+    }
+}
+
 /// Select-button info hub tabs. Display order = `INFO_TABS`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InfoTab {
@@ -304,6 +339,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // phases.
     let mut info_menu: Option<InfoMenuState> = None;
 
+    // Phase 14 death gate. Set when player_needs().is_dead() flips
+    // true (any need at 0 with DEATH_ENABLED on). Highest input
+    // priority — blocks all other modes. A=new run, Start=quit.
+    let mut dead: Option<DeathCause> = None;
+
     // Dev tool: X-button toggles a CP437 glyph palette overlay so we
     // can audit which bytes have which sprites in our custom atlas.
     // Browse with dpad; the header shows the highlighted byte's value
@@ -344,10 +384,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         input.poll_gamepad();
 
         for input_action in input.drain() {
-            // Pause menu is the highest-priority input mode. While open,
-            // every other state (active_action, command_menu, world)
-            // is frozen. Multi-turn actions also stop ticking — see
-            // the "if pause_menu.is_none()" guard further down.
+            // Death gate: highest-priority mode once the player has
+            // expired. Only A (new run) and Start (quit) do anything;
+            // everything else is silently dropped so the player can't
+            // wander off the death screen by accident.
+            if dead.is_some() {
+                match input_action {
+                    Action::A => {
+                        let _ = std::fs::remove_file(save_dir.join(RUN_FILE));
+                        world = World::new(WORLD_W, WORLD_H);
+                        prev_run_header = None;
+                        last_dawn_idx = dawns_elapsed(world.clock_seconds);
+                        command_menu = None;
+                        info_menu = None;
+                        dead = None;
+                        log_info!("[death] new run started");
+                    }
+                    Action::Start => break 'main,
+                    _ => {}
+                }
+                continue;
+            }
+
+            // Pause menu is the highest-priority input mode below the
+            // death gate. While open, every other state (active_action,
+            // command_menu, world) is frozen. Multi-turn actions also
+            // stop ticking — see the "if pause_menu.is_none()" guard
+            // further down.
             if let Some(selected) = pause_menu {
                 let count = PAUSE_OPTIONS.len();
                 match input_action {
@@ -565,7 +628,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // entire queue. Pause menu blocks ticking so the world stops
         // when the player opens the menu mid-pitch.
         let multi_view = world.active_action.as_ref().map(|a| a.view_mode);
-        if pause_menu.is_none() {
+        if pause_menu.is_none() && dead.is_none() {
             if let Some(view_mode) = multi_view {
                 let advance = match view_mode {
                     ViewMode::ProgressBar => MULTI_TURN_GAME_SEC_PER_FRAME,
@@ -589,6 +652,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         #[cfg(not(target_arch = "arm"))]
         debug.drain(|cmd| debug_console::apply_debug_command(&mut world, cmd));
+
+        // Death detection. Runs after action+tick so an action that
+        // pushed a need to 0 surfaces this frame. is_dead() is the
+        // gate (honors DEATH_ENABLED); from_needs picks which need
+        // killed us for the epitaph. Cancel any active multi-turn
+        // queue so the death overlay isn't competing with a ticking
+        // pitch-tent banner.
+        if dead.is_none() {
+            let needs_now = world.player_needs();
+            if needs_now.is_dead() {
+                if let Some(cause) = DeathCause::from_needs(&needs_now) {
+                    if world.active_action.is_some() {
+                        world.cancel_multi_turn();
+                    }
+                    command_menu = None;
+                    info_menu = None;
+                    log_info!("[death] {:?}", cause);
+                    dead = Some(cause);
+                }
+            }
+        }
 
         // Auto-save on dawn crossing. Detects forward crossings via
         // `dawns_elapsed` increments. Debug commands can rewind time, in
@@ -657,6 +741,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(selected) = pause_menu {
             draw_pause_menu(&mut ui_cells, selected, &palette);
+        }
+        if let Some(cause) = dead {
+            draw_death_screen(&mut ui_cells, cause, &palette);
         }
 
         let draw_start = Instant::now();
@@ -1497,6 +1584,28 @@ fn fmt_weight(g: u32) -> String {
     } else {
         format!("{} g", g)
     }
+}
+
+fn draw_death_screen(cells: &mut [Option<Cell>], cause: DeathCause, palette: &Palette) {
+    let layout = PanelLayout::centered(32, 7);
+    draw_panel_frame(
+        cells,
+        &layout,
+        "* DEAD *",
+        "A: new run    Start: quit",
+        palette,
+    );
+    let row_y = layout.first_row_y();
+    draw_menu_row(
+        cells,
+        &layout,
+        row_y,
+        true,
+        cause.epitaph(),
+        palette.need_critical_fg,
+        None,
+        palette,
+    );
 }
 
 fn draw_pause_menu(cells: &mut [Option<Cell>], selected: usize, palette: &Palette) {
