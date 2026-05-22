@@ -1,3 +1,5 @@
+> **PARTIALLY SUPERSEDED 2026-05-21.** Combat-skill XP sources replaced by [[Survival - Combat - Skill XP sources]] (new skill list: Melee/Ranged/Dodge/Block + 3 armor skills + 11 weapon proficiencies, plus CDDA-style use-based attribute training). Crafting-skill XP sources here still apply.
+
 Author the per-skill XP rules — what activity grants which skill XP, and how much.
 
 ## Why this is a card

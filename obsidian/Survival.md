@@ -6,7 +6,18 @@ kanban-plugin: board
 
 ## Ideas
 
-
+- [ ] [[Survival - Ambient effects - Brainstorm]]
+	Hub card for ambient effects (lighting, fire, wind, water). Catalog of candidates + decisions. Branches into the four follow-up cards below.
+- [ ] [[Survival - Ambient effects - Bayer dither lighting]]
+	Per-pixel 4×4 Bayer dither (4 levels) inside each 16×16 cell, replacing the smooth FOV/light blend at `main.rs:1019-1046`. Same dirty-cell cost as today.
+- [ ] [[Survival - Ambient effects - Glyph cycle framework and demo]]
+	`GlyphCycle` effect type + a standalone `cargo --example glyph_cycle_explorer` binary for A/B-ing fire-glyph cycle candidates on desktop and Miyoo.
+- [ ] [[Survival - Ambient effects - Weather state and wind vector]]
+	`WeatherState { Calm/Breezy/Gusty/Storm, Dir8 wind_dir, u8 intensity }` state machine. Save-persistent (schema bump + migration). Consumers: smoke drift, future fire-spread, future leaves/rain.
+- [ ] [[Survival - Ambient effects - Smoke particles and FOV]]
+	Transient `SmokeField` particle list emitted from lit fires; drifts on the weather wind vector. Each smoke cell adds a fixed single-cell visibility penalty in `recompute_fov`. Not saved.
+- [ ] [[Survival - Seasons and flora - Brainstorm]]
+	Hub card for seasons + procedural flora (calendar, ground cover, species variety, plant lifecycle, forest procgen). Calendar shape already settled by Cornwall-Pilgrim.md §5 (Gregorian 365-day, Sarum, start 21 Mar 1300). Branches into the five follow-up cards below.
 
 ## Drafts
 
@@ -14,21 +25,40 @@ kanban-plugin: board
 	Clock + needs decay + HUD shipped phase 4. Death gate shipped phase 14: `DEATH_ENABLED=true`; any-need-at-zero triggers a `* DEAD *` overlay with cause-of-death epitaph (Thirst/Hunger/Cold/Exhaustion priority); A starts a new run (wipes `run.cbor`, regens world, keeps meta xp/affinity), Start quits. Active multi-turn cancels on death. Remaining: +0.5/min tent warmth precision (kept under this card; not phase-blocking).
 - [ ] [[Survival - Drag mechanic]]
 	Whole-log drag, chop at destination. 2× movement cost while dragging.
-- [ ] [[Survival - Cooking and herbs]]
-	Pan-on-fire cooks raw→cooked. Three herb uses: eat raw, brew tea, season cooked food.
 - [ ] [[Survival - Save schema v2]]
-	Schema bump for the redesign. Friendly-reject v1 saves.
+	Schema bump for the redesign. Friendly-reject v1 saves. Absorbs the seasons/flora additions (`calendar_day`, `CellState.ground_cover`, `CellState.tree_species`, `CellState.decoration`, `ChunkSave.last_lifecycle_eval_day`).
 - [ ] [[Survival - Miyoo 30 FPS target]]
 	Drop Miyoo to 30 FPS, keep desktop at 60. Cfg-split `TARGET_FRAME` in `main.rs:43`. Battery + pacer consistency win; pacer oversleep slop is ~30% of budget at 60 FPS but ~10% at 33 ms target so frames actually land more consistently. Watch out for `MULTI_TURN_GAME_SEC_PER_FRAME` (`world.rs:55`) — at 30 FPS all multi-turn wall-clock durations double; bump the constant on ARM or leave it.
-
-
-## Implemented (additions)
-
-- Sleep verb **shipped phase 16**: queues a single-step multi-turn whose target is min(next-dawn, 8h) via the new `World::queue_multi_turn_raw` (no need-penalty amplification — sleep is wall-clock). Needs decay normally during the queue, so a hungry/cold player can interrupt early. `complete_step(Sleep)` restores Sleep to NEED_MAX. Explicit "Sleep until..." picker is a polish item.
-- Follow-cam **shipped on `survival/follow-cam`** (commit 613783f): player-centered camera + chunk ring + scroll-blit. No card; architectural enabler for slice-2 multi-chunk world.
-
-
-## Planning
+- [ ] [[Survival - Calendar and seasons]]
+	365-day Gregorian (no leap), Sarum liturgical, start 21 Mar 1300 (Easter, Spring). Solar season boundaries (Mar 21 / Jun 21 / Sep 23 / Dec 21). New `src/calendar.rs`; `World.calendar_day: u32` + `RunSave.calendar_day`. Status-bar date entry; dawn-tick advances calendar_day. Foundational for all seasons/flora work.
+- [ ] [[Survival - Seasonal ground cover and palette]]
+	Season-aware `TerrainDef` table (per-terrain Season→Palette) replaces flat `fg/bg`. Per-cell `GroundCover { None, FallenLeaves, LeafLitter }` field on CellState; Snow is render-time-only from `(season == Winter && outdoor)`. Two extra bg lerps per dirty cell; mmiyoo surface color mod handles it.
+- [ ] [[Survival - Species variety - trees and undergrowth]]
+	Tree species (Oak/Hazel/Holly/Ash/Rowan) via `CellState.tree_species`; per-species seasonal tints replace `TREE_TINT_VARIANTS`. Undergrowth as `CellState.decoration` (Fern/Moss/Bramble/Bracken/Gorse/Sapling/Mushroom) with interactive harvest verbs: HarvestMoss → poultice ingredient, CutFern/DigFern, CutGorse, CutBracken, PickBrambleFruit, PickMushroom. New ItemKind variants for yields.
+- [ ] [[Survival - Plant lifecycle and seasonal foraging]]
+	`PlantState { Sprout/Mature/Fruiting/Dormant/Dead }` state machine driven by `(species, calendar_day)`. Dawn-tick advances loaded chunks; chunk-load lazy fast-forwards. Stump regrowth: ChopTree spawns `Decoration::Sapling`; sapling promotes to TreeTrunk after N days (30 Hazel, 90 Oak). Mast drops (acorns, hazelnuts, rowanberries) on fruiting tree neighbors in autumn; mushrooms transient on LeafLitter cells.
+- [ ] [[Survival - Forest density and species procgen]]
+	Extends `chunkgen.rs:34` with deterministic value-noise fields (canopy + moisture), coverage-band targets (45–70% per Wyrdlands PRD §08), noise-weighted species/decoration placement, central spawn-disc reservation, and connectivity fixup. Single-biome only — sub-biome dispatch + hydrology deferred to Cornwall slice-2.
+- [ ] [[Survival - Combat - Action economy and turn flow]]
+	CDDA speed + move-cost economy: each actor accrues `speed` moves per tick, actions deduct move-cost, continuous tempo (no "100 AP per turn" budget). Introduces `Attack` / `Shoot` / `Brace` / `Grapple` / `Throw` / `Disarm` / `Reload` verbs. Supersedes the old Action point system card.
+- [ ] [[Survival - Combat - Weapon skills and proficiencies]]
+	Two-axis CDDA model: Melee + Ranged + Dodge + Block + 3 armor skills (Padded/Mail/Plate) on top; 11 weapon proficiencies underneath (Knife, Sword, Falchion, Axe, Mace, Quarterstaff, Spear, Gisarme, Bow, Crossbow, Unarmed). Unarmed = wrestling: strikes + Grapple/Throw/Disarm verbs (historically attested Devon wrestling).
+- [ ] [[Survival - Combat - Armor model]]
+	CDDA-style layered armor on six body parts (head, torso, L/R arm, L/R leg). Per-piece coverage % + per-type DR (bash/cut/stab) + encumbrance. Period categories: Padded (gambeson/doublet) / Mail (hauberk/chausses/coif) / Plate (coat-of-plates, great helm, bascinet). Three armor skills mitigate the wearer's encumbrance penalties.
+- [ ] [[Survival - Combat - Damage math and hit roll]]
+	Normal-distribution contested roll (CDDA's actual model). Margin ≥ 0 = hit; ≥ 15 = crit (armor bypass + damage bonus + body-part control). Bash/cut/stab damage triplet, weapon-vs-armor rock-paper-scissors. Per-body-part HP (torso ~80, head ~40, limbs ~60). Binary crippling at 0 HP (drop weapon / move-cost x2 / death on head or torso). Aimed shots for both melee and ranged. Supersedes the old Combat math foundation card.
+- [ ] [[Survival - Combat - Reach and ranged]]
+	Polearm reach-2 (spear, gisarme) with CDDA's no-reach-adjacency damage penalty. Bow + crossbow ranged in v1: ammo as stackable items in pack, equipped quiver, recoverable arrows with break chance. Visible to-hit % shown only when targeting ranged (melee stays hidden-roll).
+- [ ] [[Survival - Combat - Stamina]]
+	Lighter-touch stamina pool. Only running and heavy actions (grapple, brace, crossbow reload, aimed swings) cost stamina; normal swings are free. Scales with Stam attribute. Encumbrance raises stamina cost of heavy actions. Out-of-stamina state penalties.
+- [ ] [[Survival - Combat - Status armament tiers]]
+	Statute-of-Winchester-style enemy arming: humanoid enemies roll loadout from a tier table (Rabble / Yeoman / Sergeant / Knight). Replaces piece-by-piece authoring. Drops match the rolled gear — natural progression by tier-punching. Period-accurate to Cornwall/Devon ~1300.
+- [ ] [[Survival - Combat - Mythic and faerie arms]]
+	Scaffold for Arthurian / faerie / demon-forged relic loot that intentionally breaks period rules. Saint relics, faerie smithing, demon-forged, and singular legendary tiers. Mechanics via mythic-modifier flags on ItemMetadata. v1 ships scaffold only; first specific mythic item lands with the first Arthurian quest.
+- [ ] [[Survival - Combat - Skill XP sources]]
+	Per-skill XP rules for all combat skills + 11 weapon proficiencies. CDDA-style use-based attribute training (no skill→attribute milestones — that's dropped). Hundreds of relevant actions per +1 attribute. Daily XP cap matches the existing 20-XP-at-dawn chassis. Supersedes the combat sections of the old Skill XP sources card.
+- [ ] [[Survival - Combat - Bestiary slice 1]]
+	First enemy: Cornish bandit (Yeoman tier). Single humanoid that exercises every locked system — melee, reach (if rolled spear), ranged (if rolled bow), armor layering, body parts, status arming, AI chase+bump+ranged. Death drops the rolled loadout — immediate Rabble→Yeoman gear progression for the player.
 
 
 
@@ -55,6 +85,9 @@ kanban-plugin: board
 	Slice-1 fishing **shipped phase 17**: requires pond adjacent, flat 20% via `world.rng.d100()`, 600 game-sec/attempt regardless of outcome, success drops one Fish item on the player's cell. Skill-less for slice 1 per the card; slice 2 will add the Fishing skill chassis on the existing skill.rs infra.
 - [ ] [[Survival - Fire Making]]
 	StartFire verb: requires flint+steel in pack + 1 tinder/3 kindling/2 fuel within 3x3 cells or inventory. 60-sec attempt cost. Starting Fire Making 15% + flint+steel +30% = 45% effective success. Success consumes 1+2+1 of the reserve and drops a `Firewood` item with `ItemMetadata::Lit { fuel_seconds: 3600 }` on the player's cell. Failure burns the tinder only. World ticks lit fires per game-second; extinguishes at 0 fuel. **Phase 10 shipped.** FeedFire verb (15-sec cost, +1800s/firewood, no skill check) **shipped phase 12.** Warmth env wiring (lit fire adjacent / Pitched tent / Pitched bedroll all populate `NeedsEnv`) **shipped phase 13a.** Fire-as-light-source: phase 13b stopgap (whole-FOV bump to radius 8 near fire) was replaced by **phase 13c** per-light-source FOV — each Lit-metadata carrier shadowcasts its own radius-5 disc independently; player keeps their own radius-3 night FOV; visible set is the union. Fire-lit cells (new `CellState.fire_lit` flag, transient) get a warm-yellow overlay at night. Zero-alloc per recompute via stack-buffered `collect_light_sources_into` (cap 16). Walls block fire light by the same shadowcast rule.
+- Crafting system + cooking card **shipped on `survival/crafting`**: new `Crafting` tab in the Select-button info hub (between Inventory and Skills) drives a CDDA-style recipe registry. Verbs: PlacePan (pan + adjacent Lit fire → PannedOnFire cookware that owns the fire's fuel), PickUpPan (reverses with fuel transferred back to a Lit firewood), CookFish (5s setup; pan ticks the 120s passive cook), SeasonPan (5s; sets a modifier bit on the in-flight cook), TakeFromPan (lifts the finished cook out as a single `ItemKind::Cooked` whose metadata carries base/state/seasonings — no `CookedFish`/`BurntFish`/`HerbFish` permutation explosion), EatHerb (pre-existing). Ingredient lookup spans pack + 1-cell radius via `count_reachable_kind`/`consume_one_reachable`. Cookware ticks live in `World::tick_cookware` alongside `tick_fires`; fuel exhaustion mid-cook spills food onto the cell as Burnt. All metadata variants round-trip through CBOR with no schema bump. Brew-tea + recipe-start modifier picker parked for a follow-up. Recipe modifiers (Herb, future Salt/Oil) live as a `Seasonings(u8)` bitfield on the output; one base recipe covers every output combination.
+- Sleep verb **shipped phase 16**: queues a single-step multi-turn whose target is min(next-dawn, 8h) via the new `World::queue_multi_turn_raw` (no need-penalty amplification — sleep is wall-clock). Needs decay normally during the queue, so a hungry/cold player can interrupt early. `complete_step(Sleep)` restores Sleep to NEED_MAX. Explicit "Sleep until..." picker is a polish item.
+- Follow-cam **shipped on `survival/follow-cam`** (commit 613783f): player-centered camera + chunk ring + scroll-blit. No card; architectural enabler for slice-2 multi-chunk world.
 
 
 ## Playtest

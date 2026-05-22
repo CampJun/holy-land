@@ -1,3 +1,5 @@
+> **SUPERSEDED 2026-05-21** by the new 3-tier schema: **amorphous** (single HP), **humanoid** (6 body parts + flat stat block, loadout via [[Survival - Combat - Status armament tiers]]), **boss** (full player rules). v1 implementation target in [[Survival - Combat - Bestiary slice 1]]. The "in striking range" alert UX is locked separately (reverse-video glyph + log message). Kept for historical context.
+
 Two enemy schemas: simple grunts vs. full-stat-block bosses. Plus the "in striking range" alert UX.
 
 ## Grunt schema (most enemies)

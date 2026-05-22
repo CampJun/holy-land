@@ -1,3 +1,5 @@
+> **SUPERSEDED 2026-05-21** by [[Survival - Combat - Damage math and hit roll]] (CDDA-style normal-dist contested roll + bash/cut/stab + per-body-part HP). Kept for historical context.
+
 Implement the WoW-inspired combat math layer: 5 attributes, secondary stats, damage formula, hit / crit / armor.
 
 ## Attributes

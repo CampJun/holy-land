@@ -8,6 +8,9 @@
 // `reason` names the phase that unlocks it. Reading the menu in-game is
 // a live punch-list of remaining work.
 
+use crate::crafting::{
+    cook_progress, CookProgress, CookableKind, CookedState, ModifierTag, PanContents, Seasonings,
+};
 use crate::items::{ItemInstance, ItemKind, ItemMetadata};
 use crate::needs::NeedKind;
 use crate::skill::{self, SkillKind};
@@ -53,6 +56,22 @@ pub enum ActionId {
     FeedFire,
     Sleep,
     Fishing,
+    // ---- Crafting (slice-1 cooking card) ----
+    /// Move a CookingPan from pack onto an adjacent Lit fire. The fire's
+    /// fuel transfers into a single PannedOnFire item on that cell.
+    PlacePan,
+    /// Reverse of PlacePan: lift an empty PannedOnFire back into pack;
+    /// remaining fuel becomes a Lit firewood on the cell.
+    PickUpPan,
+    /// 5s setup that puts a Fish from pack into a reachable empty
+    /// pan-on-fire. The pan ticks the 120s passive cook after.
+    CookFish,
+    /// Add a Herb modifier to a pan currently cooking. 5s. Sets the
+    /// Herb seasoning bit; first stack wins.
+    SeasonPan,
+    /// Lift a finished cook out of the pan into the pack (or onto the
+    /// player's cell if pack is full). Returns the pan to Empty.
+    TakeFromPan,
 }
 
 impl ActionId {
@@ -85,6 +104,11 @@ impl ActionId {
             // future polish item.
             ActionId::Sleep => 0,
             ActionId::Fishing => 600,
+            ActionId::PlacePan => 5,
+            ActionId::PickUpPan => 5,
+            ActionId::CookFish => 5,
+            ActionId::SeasonPan => 5,
+            ActionId::TakeFromPan => 5,
         }
     }
 
@@ -108,6 +132,11 @@ impl ActionId {
             ActionId::FeedFire => "feed_fire",
             ActionId::Sleep => "sleep",
             ActionId::Fishing => "fishing",
+            ActionId::PlacePan => "place_pan",
+            ActionId::PickUpPan => "pick_up_pan",
+            ActionId::CookFish => "cook_fish",
+            ActionId::SeasonPan => "season_pan",
+            ActionId::TakeFromPan => "take_from_pan",
         }
     }
 
@@ -128,6 +157,11 @@ impl ActionId {
             "feed_fire" => ActionId::FeedFire,
             "sleep" => ActionId::Sleep,
             "fishing" => ActionId::Fishing,
+            "place_pan" => ActionId::PlacePan,
+            "pick_up_pan" => ActionId::PickUpPan,
+            "cook_fish" => ActionId::CookFish,
+            "season_pan" => ActionId::SeasonPan,
+            "take_from_pan" => ActionId::TakeFromPan,
             _ => return None,
         })
     }
@@ -280,6 +314,11 @@ pub fn evaluate(world: &World, id: ActionId) -> Availability {
             cost_game_seconds: ActionId::Sleep.base_cost(),
         },
         ActionId::Fishing => eval_fishing(world),
+        ActionId::PlacePan => eval_place_pan(world),
+        ActionId::PickUpPan => eval_pick_up_pan(world),
+        ActionId::CookFish => eval_cook_fish(world),
+        ActionId::SeasonPan => eval_season_pan(world),
+        ActionId::TakeFromPan => eval_take_from_pan(world),
     }
 }
 
@@ -487,7 +526,30 @@ pub fn execute(world: &mut World, id: ActionId) -> ExecuteOutcome {
         ActionId::FillWaterskin => execute_fill_waterskin(world),
         ActionId::Sleep => execute_sleep(world),
         ActionId::Fishing => execute_fishing(world),
+        ActionId::PlacePan
+        | ActionId::PickUpPan
+        | ActionId::CookFish
+        | ActionId::SeasonPan
+        | ActionId::TakeFromPan => execute_queue_5s(world, id),
     }
+}
+
+/// Crafting verbs share a single 5-second multi-turn queue path; the
+/// real work happens in `complete_step` once the timer runs out. This
+/// keeps the player visibly committed to the recipe (and lets the menu
+/// system surface a progress bar) without each verb reinventing the
+/// queue boilerplate.
+fn execute_queue_5s(world: &mut World, id: ActionId) -> ExecuteOutcome {
+    world.queue_multi_turn(&[(id, id.base_cost())]);
+    let msg = match id {
+        ActionId::PlacePan => "placing pan on fire...",
+        ActionId::PickUpPan => "lifting pan...",
+        ActionId::CookFish => "setting fish in pan...",
+        ActionId::SeasonPan => "seasoning...",
+        ActionId::TakeFromPan => "taking from pan...",
+        _ => "...",
+    };
+    ExecuteOutcome::Done(msg.to_string())
 }
 
 /// Phase-10 instant verb (not multi-turn for slice 1 — see card). Pays
@@ -737,11 +799,235 @@ pub fn complete_step(world: &mut World, id: ActionId) -> Option<String> {
             world.set_player_needs(needs);
             Some("woke rested".to_string())
         }
+        ActionId::PlacePan => complete_place_pan(world),
+        ActionId::PickUpPan => complete_pick_up_pan(world),
+        ActionId::CookFish => complete_cook_fish(world),
+        ActionId::SeasonPan => complete_season_pan(world),
+        ActionId::TakeFromPan => complete_take_from_pan(world),
         // SetupCamp expands into PitchTent + UnrollBedroll steps in the
         // queue; complete_step is never called with SetupCamp itself.
         // Other future multi-turn verbs land their finish effects here.
         _ => None,
     }
+}
+
+// ---- Crafting finishers ---------------------------------------------
+
+fn complete_place_pan(world: &mut World) -> Option<String> {
+    // Need both a CookingPan to consume AND a Lit fire to replace.
+    let fire = find_adjacent_item(world, |i| matches!(i.metadata, ItemMetadata::Lit { .. }));
+    let Some((fx, fy, idx)) = fire else {
+        return Some("the fire died before the pan could land".to_string());
+    };
+
+    // Capture the fire's remaining fuel and remove it.
+    let fuel_seconds = {
+        let cell = world.cell_at_mut(fx as i64, fy as i64)?;
+        let lit = cell.items.remove(idx);
+        match lit.metadata {
+            ItemMetadata::Lit { fuel_seconds } => fuel_seconds,
+            _ => return Some("internal: removed item wasn't Lit".to_string()),
+        }
+    };
+
+    // Consume a CookingPan from pack first (cleanest), then radius.
+    let took = consume_one_reachable(world, ItemKind::CookingPan);
+    if !took {
+        // Pan vanished between menu confirm and complete — put the
+        // fire back so we don't silently destroy fuel.
+        if let Some(cell) = world.cell_at_mut(fx as i64, fy as i64) {
+            cell.items.push(ItemInstance::unique(
+                ItemKind::Firewood,
+                500,
+                None,
+                ItemMetadata::Lit { fuel_seconds },
+            ));
+        }
+        return Some("no pan to place".to_string());
+    }
+
+    // Drop the pan-on-fire item on the fire's old cell.
+    if let Some(cell) = world.cell_at_mut(fx as i64, fy as i64) {
+        cell.items.push(ItemInstance::unique(
+            ItemKind::CookingPan,
+            1_000,
+            None,
+            ItemMetadata::PannedOnFire {
+                contents: PanContents::Empty,
+                fuel_seconds,
+            },
+        ));
+    }
+    world.recompute_fov();
+    Some("pan placed on fire".to_string())
+}
+
+fn complete_pick_up_pan(world: &mut World) -> Option<String> {
+    let Some((wx, wy, idx)) = find_reachable_pan(world, |c, _f| matches!(c, PanContents::Empty))
+    else {
+        return Some("pan wasn't empty anymore".to_string());
+    };
+
+    let fuel_seconds = {
+        let cell = world.cell_at_mut(wx as i64, wy as i64)?;
+        let pan = cell.items.remove(idx);
+        match pan.metadata {
+            ItemMetadata::PannedOnFire { fuel_seconds, .. } => fuel_seconds,
+            _ => 0,
+        }
+    };
+
+    // Put the remaining fuel back on the cell as a Lit firewood (if
+    // there's any fuel left) so the player can place the pan back later
+    // without losing the fire.
+    if fuel_seconds > 0 {
+        if let Some(cell) = world.cell_at_mut(wx as i64, wy as i64) {
+            cell.items.push(ItemInstance::unique(
+                ItemKind::Firewood,
+                500,
+                None,
+                ItemMetadata::Lit { fuel_seconds },
+            ));
+        }
+    }
+
+    // Pan back to pack; if full, drop on player cell.
+    let pan = ItemInstance::unique(ItemKind::CookingPan, 1_000, None, ItemMetadata::None);
+    let add = world.player_pack_mut().try_add(pan);
+    if let Err(pan) = add {
+        let pos = world.player_pos();
+        if let Some(cell) = world.cell_at_mut(pos.x as i64, pos.y as i64) {
+            cell.items.push(pan);
+        }
+    }
+    world.recompute_fov();
+    Some("picked up pan".to_string())
+}
+
+fn complete_cook_fish(world: &mut World) -> Option<String> {
+    if !consume_one_reachable(world, ItemKind::Fish) {
+        return Some("no fish to cook".to_string());
+    }
+    let Some((wx, wy, idx)) =
+        find_reachable_pan(world, |c, f| matches!(c, PanContents::Empty) && f > 0)
+    else {
+        // Refund: dropping a raw Fish at the player's feet keeps the
+        // verb honest if the pan dis-empties between confirm and finish.
+        let pos = world.player_pos();
+        if let Some(cell) = world.cell_at_mut(pos.x as i64, pos.y as i64) {
+            cell.items.push(ItemInstance::stack(
+                ItemKind::Fish,
+                1,
+                ItemKind::Fish.def().default_weight_g,
+                None,
+                ItemMetadata::None,
+            ));
+        }
+        return Some("pan no longer ready; fish set aside".to_string());
+    };
+    let cell = world.cell_at_mut(wx as i64, wy as i64)?;
+    if let ItemMetadata::PannedOnFire {
+        ref mut contents, ..
+    } = cell.items[idx].metadata
+    {
+        *contents = PanContents::Cooking {
+            input: CookableKind::Fish,
+            elapsed_secs: 0,
+            seasonings: Seasonings::empty(),
+        };
+    }
+    Some("fish cooking in pan".to_string())
+}
+
+fn complete_season_pan(world: &mut World) -> Option<String> {
+    let Some((wx, wy, idx)) = find_reachable_pan(world, |c, _f| match c {
+        PanContents::Cooking { seasonings, .. } => !seasonings.has(ModifierTag::Herb),
+        _ => false,
+    }) else {
+        return Some("nothing fresh in the pan to season".to_string());
+    };
+    if !consume_one_reachable(world, ItemKind::Herb) {
+        return Some("no herb to add".to_string());
+    }
+    let cell = world.cell_at_mut(wx as i64, wy as i64)?;
+    if let ItemMetadata::PannedOnFire {
+        ref mut contents, ..
+    } = cell.items[idx].metadata
+    {
+        if let PanContents::Cooking {
+            ref mut seasonings, ..
+        } = contents
+        {
+            seasonings.set(ModifierTag::Herb);
+        }
+    }
+    Some("herb added to the pan".to_string())
+}
+
+fn complete_take_from_pan(world: &mut World) -> Option<String> {
+    let Some((wx, wy, idx)) = find_reachable_pan(world, |c, _f| match c {
+        PanContents::Cooking {
+            input,
+            elapsed_secs,
+            ..
+        } => !matches!(cook_progress(input, elapsed_secs), CookProgress::Raw),
+        _ => false,
+    }) else {
+        return Some("nothing done in the pan".to_string());
+    };
+
+    // Pull the cooked-out triple, then reset the pan to empty.
+    let (base, seasonings, state) = {
+        let cell = world.cell_at_mut(wx as i64, wy as i64)?;
+        let result = if let ItemMetadata::PannedOnFire {
+            ref mut contents, ..
+        } = cell.items[idx].metadata
+        {
+            let snapshot = *contents;
+            *contents = PanContents::Empty;
+            snapshot
+        } else {
+            return Some("internal: pan metadata corrupt".to_string());
+        };
+        match result {
+            PanContents::Cooking {
+                input,
+                elapsed_secs,
+                seasonings,
+            } => {
+                let state = match cook_progress(input, elapsed_secs) {
+                    CookProgress::Raw => return Some("still raw".to_string()),
+                    CookProgress::Ok => CookedState::Ok,
+                    CookProgress::Burnt => CookedState::Burnt,
+                };
+                (input, seasonings, state)
+            }
+            _ => return Some("pan was empty".to_string()),
+        }
+    };
+
+    // Build the cooked instance and try-add to pack; if it doesn't fit,
+    // drop at the player's feet.
+    let cooked = ItemInstance::unique(
+        ItemKind::Cooked,
+        ItemKind::Cooked.def().default_weight_g,
+        None,
+        ItemMetadata::Cooked {
+            base,
+            state,
+            seasonings,
+        },
+    );
+    let label = cooked.display_label();
+    let added = world.player_pack_mut().try_add(cooked);
+    if let Err(cooked) = added {
+        let pos = world.player_pos();
+        if let Some(cell) = world.cell_at_mut(pos.x as i64, pos.y as i64) {
+            cell.items.push(cooked);
+        }
+        return Some(format!("{} (dropped, pack full)", label));
+    }
+    Some(format!("took {}", label))
 }
 
 /// Shared "consume one of `kind` from the pack, drop a Pitched
@@ -807,6 +1093,190 @@ fn consume_and_restore(
 }
 
 // ---- Phase 11b: terrain-dependent verbs ----
+
+// ---- Crafting / cookware helpers -------------------------------------
+//
+// Recipe rows in crafting.rs are UI-only; the source of truth for "is
+// this verb available right now?" lives here. Tools and ingredients are
+// scanned across the player's pack AND the 3x3 cells centered on the
+// player — the user's "pack + 1-cell radius" rule.
+
+/// Find a panned-on-fire cookware reachable by the player (own cell or
+/// any of the 8 neighbors), returning its `(world_x, world_y, item_idx)`.
+/// `match_contents` filters by current PanContents state.
+fn find_reachable_pan<F: Fn(PanContents, u32) -> bool>(
+    world: &World,
+    match_contents: F,
+) -> Option<(i32, i32, usize)> {
+    let p = world.player_pos();
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            let wx = p.x + dx;
+            let wy = p.y + dy;
+            if let Some(cell) = world.cell_at(wx as i64, wy as i64) {
+                if let Some(idx) = cell.items.iter().position(|i| match i.metadata {
+                    ItemMetadata::PannedOnFire {
+                        contents,
+                        fuel_seconds,
+                    } => i.kind == ItemKind::CookingPan && match_contents(contents, fuel_seconds),
+                    _ => false,
+                }) {
+                    return Some((wx, wy, idx));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// True if there's at least one cookware reachable by `pred`.
+fn any_reachable_pan<F: Fn(PanContents, u32) -> bool>(world: &World, pred: F) -> bool {
+    find_reachable_pan(world, pred).is_some()
+}
+
+/// Count units of `kind` reachable across pack + 1-cell radius. Used by
+/// crafting recipes whose ingredient scope is pack + adjacent ground.
+/// Items carrying non-None metadata (Pitched, Lit, PannedOnFire, Cooked)
+/// don't satisfy the ingredient — those represent placed structures or
+/// crafted outputs, not consumable stock.
+fn count_reachable_kind(world: &World, kind: ItemKind) -> u32 {
+    let mut total: u32 = 0;
+    for item in world.player_pack().contents.iter() {
+        if item.kind == kind && matches!(item.metadata, ItemMetadata::None) {
+            total = total.saturating_add(item.count as u32);
+        }
+    }
+    let p = world.player_pos();
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            let Some(cell) = world.cell_at((p.x + dx) as i64, (p.y + dy) as i64) else {
+                continue;
+            };
+            for item in cell.items.iter() {
+                if item.kind == kind && matches!(item.metadata, ItemMetadata::None) {
+                    total = total.saturating_add(item.count as u32);
+                }
+            }
+        }
+    }
+    total
+}
+
+/// Consume one unit of `kind` from pack first, then the 3x3 cells
+/// centered on the player. Returns true if a unit was actually
+/// consumed. Same scope rules as `count_reachable_kind`.
+fn consume_one_reachable(world: &mut World, kind: ItemKind) -> bool {
+    if world.player_pack_mut().take_one_from_stack(kind) {
+        return true;
+    }
+    let p = world.player_pos();
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            let wx = (p.x + dx) as i64;
+            let wy = (p.y + dy) as i64;
+            let Some(cell) = world.cell_at_mut(wx, wy) else {
+                continue;
+            };
+            let Some(idx) = cell.items.iter().position(|i| {
+                i.kind == kind && i.count > 0 && matches!(i.metadata, ItemMetadata::None)
+            }) else {
+                continue;
+            };
+            cell.items[idx].count -= 1;
+            if cell.items[idx].count == 0 {
+                cell.items.remove(idx);
+            }
+            return true;
+        }
+    }
+    false
+}
+
+fn eval_place_pan(world: &World) -> Availability {
+    let pack = world.player_pack();
+    if !pack.has_stack(ItemKind::CookingPan) && count_reachable_kind(world, ItemKind::CookingPan) == 0
+    {
+        return Availability::Unavailable {
+            reason: "no cooking pan",
+        };
+    }
+    if find_adjacent_item(world, |i| matches!(i.metadata, ItemMetadata::Lit { .. })).is_none() {
+        return Availability::Unavailable {
+            reason: "no lit fire adjacent",
+        };
+    }
+    Availability::Available {
+        cost_game_seconds: ActionId::PlacePan.base_cost(),
+    }
+}
+
+fn eval_pick_up_pan(world: &World) -> Availability {
+    if any_reachable_pan(world, |c, _f| matches!(c, PanContents::Empty)) {
+        Availability::Available {
+            cost_game_seconds: ActionId::PickUpPan.base_cost(),
+        }
+    } else {
+        Availability::Unavailable {
+            reason: "no empty pan-on-fire to lift",
+        }
+    }
+}
+
+fn eval_cook_fish(world: &World) -> Availability {
+    if count_reachable_kind(world, ItemKind::Fish) == 0 {
+        return Availability::Unavailable {
+            reason: "no fish in reach",
+        };
+    }
+    if !any_reachable_pan(world, |c, f| matches!(c, PanContents::Empty) && f > 0) {
+        return Availability::Unavailable {
+            reason: "need empty pan-on-fire",
+        };
+    }
+    Availability::Available {
+        cost_game_seconds: ActionId::CookFish.base_cost(),
+    }
+}
+
+fn eval_season_pan(world: &World) -> Availability {
+    if count_reachable_kind(world, ItemKind::Herb) == 0 {
+        return Availability::Unavailable {
+            reason: "no herb in reach",
+        };
+    }
+    let has_target = any_reachable_pan(world, |c, _f| match c {
+        PanContents::Cooking { seasonings, .. } => !seasonings.has(ModifierTag::Herb),
+        _ => false,
+    });
+    if !has_target {
+        return Availability::Unavailable {
+            reason: "no fresh cook to season",
+        };
+    }
+    Availability::Available {
+        cost_game_seconds: ActionId::SeasonPan.base_cost(),
+    }
+}
+
+fn eval_take_from_pan(world: &World) -> Availability {
+    let ready = any_reachable_pan(world, |c, _f| match c {
+        PanContents::Cooking {
+            input,
+            elapsed_secs,
+            ..
+        } => !matches!(cook_progress(input, elapsed_secs), CookProgress::Raw),
+        _ => false,
+    });
+    if ready {
+        Availability::Available {
+            cost_game_seconds: ActionId::TakeFromPan.base_cost(),
+        }
+    } else {
+        Availability::Unavailable {
+            reason: "nothing done in the pan",
+        }
+    }
+}
 
 /// Find the first adjacent cell (8-neighborhood, excluding the player's
 /// own) whose terrain satisfies `pred`. Returns the world coords.
@@ -1544,6 +2014,230 @@ mod tests {
         let msg = complete_step(&mut world, ActionId::Sleep);
         assert_eq!(msg.as_deref(), Some("woke rested"));
         assert_eq!(world.player_needs().sleep, crate::needs::NEED_MAX);
+    }
+
+    /// Drive a 5-second multi-turn step to completion. The crafting
+    /// verbs all queue exactly one step at `base_cost()` seconds, so
+    /// this tick-then-finish loop mirrors what the main frame loop
+    /// does — keeps the tests honest about the real time flow.
+    fn run_to_completion(world: &mut World) -> Vec<ActionId> {
+        let mut completed = Vec::new();
+        for _ in 0..200 {
+            if world.active_action.is_none() {
+                break;
+            }
+            let result = world.tick_multi_turn(1);
+            for id in result.completed_steps {
+                if complete_step(world, id).is_some() {
+                    // Discard the message; tests assert on world state.
+                }
+                completed.push(id);
+            }
+            if result.interrupted {
+                break;
+            }
+        }
+        completed
+    }
+
+    fn place_lit_fire_east_of_player(world: &mut World, fuel_seconds: u32) -> (i32, i32) {
+        let pos = world.player_pos();
+        let (fx, fy) = (pos.x + 1, pos.y);
+        if let Some(cell) = world.cell_at_mut(fx as i64, fy as i64) {
+            cell.items.clear();
+            cell.items.push(ItemInstance::unique(
+                ItemKind::Firewood,
+                500,
+                None,
+                ItemMetadata::Lit { fuel_seconds },
+            ));
+        }
+        (fx, fy)
+    }
+
+    #[test]
+    fn place_pan_then_pick_up_pan_round_trips_through_pack() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let (fx, fy) = place_lit_fire_east_of_player(&mut world, 1_000);
+
+        assert!(matches!(
+            evaluate(&world, ActionId::PlacePan),
+            Availability::Available { .. }
+        ));
+        execute(&mut world, ActionId::PlacePan);
+        run_to_completion(&mut world);
+
+        // East cell now holds a PannedOnFire CookingPan.
+        let pan = world
+            .cell_at(fx as i64, fy as i64)
+            .and_then(|c| c.items.iter().find(|i| i.kind == ItemKind::CookingPan).cloned());
+        let pan = pan.expect("pan placed on fire cell");
+        assert!(matches!(
+            pan.metadata,
+            ItemMetadata::PannedOnFire { contents: PanContents::Empty, .. }
+        ));
+
+        // Pack lost the cooking pan it had at start.
+        assert!(!world.player_pack().has_stack(ItemKind::CookingPan));
+
+        // Now lift it back.
+        execute(&mut world, ActionId::PickUpPan);
+        run_to_completion(&mut world);
+
+        // Cell no longer has a pan; fuel returned as Lit firewood.
+        let cell = world.cell_at(fx as i64, fy as i64).unwrap();
+        assert!(!cell.items.iter().any(|i| i.kind == ItemKind::CookingPan));
+        assert!(cell.items.iter().any(|i| matches!(i.metadata, ItemMetadata::Lit { .. })));
+        // Pack regained the cooking pan.
+        assert!(world.player_pack().has_stack(ItemKind::CookingPan));
+    }
+
+    #[test]
+    fn full_cook_fish_flow_with_herb_modifier_yields_herbed_cooked_fish() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Give the player a fish + a herb in pack.
+        world.player_pack_mut().try_add(ItemInstance::stack(
+            ItemKind::Fish,
+            1,
+            ItemKind::Fish.def().default_weight_g,
+            None,
+            ItemMetadata::None,
+        )).ok();
+        world.player_pack_mut().try_add(ItemInstance::unique(
+            ItemKind::Herb,
+            10,
+            None,
+            ItemMetadata::None,
+        )).ok();
+        let (fx, fy) = place_lit_fire_east_of_player(&mut world, 10_000);
+
+        // 1. Place pan.
+        execute(&mut world, ActionId::PlacePan);
+        run_to_completion(&mut world);
+
+        // 2. Start the cook.
+        assert!(matches!(
+            evaluate(&world, ActionId::CookFish),
+            Availability::Available { .. }
+        ));
+        execute(&mut world, ActionId::CookFish);
+        run_to_completion(&mut world);
+
+        // Fish consumed; pan now Cooking.
+        assert!(!world.player_pack().has_stack(ItemKind::Fish));
+        let pan_meta = world
+            .cell_at(fx as i64, fy as i64)
+            .and_then(|c| c.items.iter().find_map(|i| match i.metadata {
+                ItemMetadata::PannedOnFire { contents, .. } => Some(contents),
+                _ => None,
+            }))
+            .expect("pan still on fire");
+        assert!(matches!(pan_meta, PanContents::Cooking { input: CookableKind::Fish, .. }));
+
+        // 3. Season pan while it's cooking.
+        execute(&mut world, ActionId::SeasonPan);
+        run_to_completion(&mut world);
+        assert!(!world.player_pack().has_stack(ItemKind::Herb));
+
+        // 4. Advance time until cooking completes (target 120s).
+        world.advance_time_raw(125);
+
+        // 5. Take from pan.
+        assert!(matches!(
+            evaluate(&world, ActionId::TakeFromPan),
+            Availability::Available { .. }
+        ));
+        execute(&mut world, ActionId::TakeFromPan);
+        run_to_completion(&mut world);
+
+        // Pack should now contain a Cooked Fish with Herb seasoning, state Ok.
+        let cooked = world
+            .player_pack()
+            .contents
+            .iter()
+            .find(|i| i.kind == ItemKind::Cooked)
+            .cloned()
+            .expect("cooked food in pack");
+        match cooked.metadata {
+            ItemMetadata::Cooked { base, state, seasonings } => {
+                assert_eq!(base, CookableKind::Fish);
+                assert_eq!(state, CookedState::Ok);
+                assert!(seasonings.has(ModifierTag::Herb));
+            }
+            other => panic!("expected Cooked, got {:?}", other),
+        }
+        // Pan should be Empty again.
+        let pan_meta = world
+            .cell_at(fx as i64, fy as i64)
+            .and_then(|c| c.items.iter().find_map(|i| match i.metadata {
+                ItemMetadata::PannedOnFire { contents, .. } => Some(contents),
+                _ => None,
+            }))
+            .unwrap();
+        assert!(matches!(pan_meta, PanContents::Empty));
+    }
+
+    #[test]
+    fn overcooking_past_burn_threshold_yields_burnt() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        world.player_pack_mut().try_add(ItemInstance::stack(
+            ItemKind::Fish,
+            1,
+            ItemKind::Fish.def().default_weight_g,
+            None,
+            ItemMetadata::None,
+        )).ok();
+        place_lit_fire_east_of_player(&mut world, 10_000);
+        execute(&mut world, ActionId::PlacePan);
+        run_to_completion(&mut world);
+        execute(&mut world, ActionId::CookFish);
+        run_to_completion(&mut world);
+
+        // Past 2x target = burn threshold (240s for fish).
+        world.advance_time_raw(260);
+
+        execute(&mut world, ActionId::TakeFromPan);
+        run_to_completion(&mut world);
+        let cooked = world
+            .player_pack()
+            .contents
+            .iter()
+            .find(|i| i.kind == ItemKind::Cooked)
+            .cloned()
+            .unwrap();
+        match cooked.metadata {
+            ItemMetadata::Cooked { state, .. } => assert_eq!(state, CookedState::Burnt),
+            other => panic!("expected Cooked, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fuel_exhaustion_during_cook_spills_food_onto_cell() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        world.player_pack_mut().try_add(ItemInstance::stack(
+            ItemKind::Fish,
+            1,
+            ItemKind::Fish.def().default_weight_g,
+            None,
+            ItemMetadata::None,
+        )).ok();
+        // Only 30 seconds of fuel — fire will die mid-cook.
+        let (fx, fy) = place_lit_fire_east_of_player(&mut world, 30);
+        execute(&mut world, ActionId::PlacePan);
+        run_to_completion(&mut world);
+        execute(&mut world, ActionId::CookFish);
+        run_to_completion(&mut world);
+
+        // Drive the clock 60 seconds — well past the pan's fuel.
+        world.advance_time_raw(60);
+
+        // The PannedOnFire should be gone (back to plain pan, metadata
+        // None) and a Cooked item should be on the cell.
+        let cell = world.cell_at(fx as i64, fy as i64).unwrap();
+        let pan = cell.items.iter().find(|i| i.kind == ItemKind::CookingPan).unwrap();
+        assert!(matches!(pan.metadata, ItemMetadata::None));
+        let cooked = cell.items.iter().find(|i| i.kind == ItemKind::Cooked);
+        assert!(cooked.is_some(), "fish should spill onto cell as cooked");
     }
 
     #[test]

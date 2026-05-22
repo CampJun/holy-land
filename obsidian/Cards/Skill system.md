@@ -1,3 +1,5 @@
+> **PARTIALLY SUPERSEDED 2026-05-21.** Combat sections (single Attack/Defence skills, skill→attribute milestone rule) replaced by [[Survival - Combat - Weapon skills and proficiencies]] (CDDA two-axis: Melee + Ranged + Dodge + Block + 3 armor skills + 11 weapon proficiencies) and [[Survival - Combat - Skill XP sources]] (use-based attribute training, no milestones). Crafting sections still apply.
+
 15 Runescape-shaped skills, each pair of which raise one of the 5 attributes. Combat AND crafting both legitimately progress the character.
 
 ## The 15 skills

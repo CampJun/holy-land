@@ -1,3 +1,5 @@
+> **SUPERSEDED 2026-05-21** by [[Survival - Combat - Action economy and turn flow]] (CDDA-style speed + move-cost, continuous tempo — no 100-AP-per-turn budget). Kept for historical context.
+
 Implement the 100-AP-per-turn action economy and per-weapon AP swing costs.
 
 ## Core rules

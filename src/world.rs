@@ -59,6 +59,18 @@ pub const MULTI_TURN_GAME_SEC_PER_FRAME: u32 = 1;
 /// carrying `ItemMetadata::Lit`) cast their own independent FOV at
 /// `LIGHT_SOURCE_RADIUS` at night — see `recompute_fov` for the
 /// per-source shadowcast that the player's visible set unions with.
+/// True if the metadata represents an item that's currently burning
+/// — a plain Lit firewood OR a PannedOnFire cookware (which owns the
+/// fire's fuel). Centralized so FOV light gathering, light-source
+/// counting, and pickup-blocking all agree.
+pub(crate) fn is_active_fire(meta: &ItemMetadata) -> bool {
+    match meta {
+        ItemMetadata::Lit { .. } => true,
+        ItemMetadata::PannedOnFire { fuel_seconds, .. } => *fuel_seconds > 0,
+        _ => false,
+    }
+}
+
 pub const FOV_RADIUS_DAY: i32 = 20;
 pub const FOV_RADIUS_NIGHT: i32 = 3;
 pub const LIGHT_SOURCE_RADIUS: i32 = 5;
@@ -721,6 +733,7 @@ impl World {
         needs.tick(secs, env);
         self.set_player_needs(needs);
         let fire_died = self.tick_fires(secs);
+        self.tick_cookware(secs);
         let day_night_flipped = self.is_night() != was_night;
         // Recompute FOV on a day/night boundary OR when a fire died
         // during night (the lit radius may have shrunk). The day-only
@@ -765,6 +778,119 @@ impl World {
         any_died
     }
 
+    /// Decrement `fuel_seconds` on every PannedOnFire item and advance
+    /// any in-flight cooking. Fuel depletion converts the pan back to
+    /// a plain `CookingPan` on the cell; any food still in the pan at
+    /// that moment is dropped to the cell as a Cooked item with state
+    /// set by `cook_progress` (so abandoning a fish on a dying fire
+    /// gives you a half-cooked outcome instead of vanishing it).
+    fn tick_cookware(&mut self, secs: u32) {
+        if secs == 0 {
+            return;
+        }
+        for chunk in self.chunks.values_mut() {
+            let mut dirtied = false;
+            for cell in chunk.cells.iter_mut() {
+                let needs_pass = cell
+                    .items
+                    .iter()
+                    .any(|i| matches!(i.metadata, ItemMetadata::PannedOnFire { .. }));
+                if !needs_pass {
+                    continue;
+                }
+                let mut spilled_cooked: Vec<ItemInstance> = Vec::new();
+                for item in cell.items.iter_mut() {
+                    let (new_contents, new_fuel, spill) = match item.metadata {
+                        ItemMetadata::PannedOnFire {
+                            contents,
+                            fuel_seconds,
+                        } => {
+                            // Advance cooking BEFORE consuming fuel so
+                            // a cook that finishes exactly when fuel
+                            // hits 0 still produces its output.
+                            let advanced = match contents {
+                                crate::crafting::PanContents::Cooking {
+                                    input,
+                                    elapsed_secs,
+                                    seasonings,
+                                } => crate::crafting::PanContents::Cooking {
+                                    input,
+                                    elapsed_secs: elapsed_secs.saturating_add(secs),
+                                    seasonings,
+                                },
+                                other => other,
+                            };
+                            if fuel_seconds > secs {
+                                (Some(advanced), Some(fuel_seconds - secs), None)
+                            } else {
+                                // Fuel exhausted. Eject any in-flight
+                                // cook to the cell; pan becomes plain.
+                                let spill = match advanced {
+                                    crate::crafting::PanContents::Cooking {
+                                        input,
+                                        elapsed_secs,
+                                        seasonings,
+                                    } => {
+                                        let state = match crate::crafting::cook_progress(
+                                            input,
+                                            elapsed_secs,
+                                        ) {
+                                            crate::crafting::CookProgress::Ok => {
+                                                crate::crafting::CookedState::Ok
+                                            }
+                                            // Raw or burnt on a dead
+                                            // fire both salvage as
+                                            // Burnt — the player
+                                            // doesn't gain a full cook
+                                            // for free.
+                                            _ => crate::crafting::CookedState::Burnt,
+                                        };
+                                        Some(ItemInstance::unique(
+                                            ItemKind::Cooked,
+                                            ItemKind::Cooked.def().default_weight_g,
+                                            None,
+                                            ItemMetadata::Cooked {
+                                                base: input,
+                                                state,
+                                                seasonings,
+                                            },
+                                        ))
+                                    }
+                                    _ => None,
+                                };
+                                (None, None, spill)
+                            }
+                        }
+                        _ => continue,
+                    };
+
+                    match (new_contents, new_fuel) {
+                        (Some(c), Some(f)) => {
+                            item.metadata = ItemMetadata::PannedOnFire {
+                                contents: c,
+                                fuel_seconds: f,
+                            };
+                        }
+                        _ => {
+                            item.metadata = ItemMetadata::None;
+                        }
+                    }
+                    if let Some(s) = spill {
+                        spilled_cooked.push(s);
+                    }
+                    dirtied = true;
+                }
+                if !spilled_cooked.is_empty() {
+                    cell.items.extend(spilled_cooked);
+                    dirtied = true;
+                }
+            }
+            if dirtied {
+                chunk.dirty = true;
+            }
+        }
+    }
+
     /// Is there at least one active light source (any item carrying
     /// `ItemMetadata::Lit`) in the player's cell or any of the 8
     /// adjacent cells? Slice-1 only spawns lit firewood from StartFire,
@@ -779,7 +905,7 @@ impl World {
                 let Some(cell) = self.cell_at((p.x + dx) as i64, (p.y + dy) as i64) else {
                     continue;
                 };
-                if cell.items.iter().any(|i| matches!(i.metadata, ItemMetadata::Lit { .. })) {
+                if cell.items.iter().any(|i| is_active_fire(&i.metadata)) {
                     return true;
                 }
             }
@@ -803,7 +929,7 @@ impl World {
         let mut count = 0;
         for chunk in self.chunks.values() {
             for (idx, cell) in chunk.cells.iter().enumerate() {
-                if !cell.items.iter().any(|i| matches!(i.metadata, ItemMetadata::Lit { .. })) {
+                if !cell.items.iter().any(|i| is_active_fire(&i.metadata)) {
                     continue;
                 }
                 if count >= MAX_LIGHT_SOURCES {
@@ -1141,7 +1267,7 @@ impl World {
             match self.cell_at_mut(wx, wy) {
                 Some(c) => std::mem::take(&mut c.items)
                     .into_iter()
-                    .partition(|i| !matches!(i.metadata, ItemMetadata::Lit { .. })),
+                    .partition(|i| !is_active_fire(&i.metadata)),
                 None => return 0,
             };
 

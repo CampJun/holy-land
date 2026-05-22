@@ -1,5 +1,6 @@
 mod action;
 mod chunkgen;
+mod crafting;
 #[cfg(not(target_arch = "arm"))]
 mod debug_console;
 mod fov;
@@ -37,7 +38,34 @@ use world::{
 
 const WORLD_W: u32 = 40;
 const WORLD_H: u32 = 30;
-const ATLAS_PNG: &[u8] = include_bytes!("../assets/cp437_16x16.png");
+// Bundled character-set atlases. Player picks which one the binary loads
+// at boot via a plain-text `atlas.txt` in `save_dir` (one of: "cp437",
+// "aesomatica"). Missing / unrecognized → Cp437. See AtlasChoice below.
+const CP437_PNG: &[u8] = include_bytes!("../assets/cp437_16x16.png");
+const AESOMATICA_PNG: &[u8] = include_bytes!("../assets/Aesomatica_16x16.png");
+const ATLAS_CONFIG_FILE: &str = "atlas.txt";
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AtlasChoice {
+    Cp437,
+    Aesomatica,
+}
+
+impl AtlasChoice {
+    fn from_save_key(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "aesomatica" => Self::Aesomatica,
+            _ => Self::Cp437,
+        }
+    }
+
+    fn png_bytes(self) -> &'static [u8] {
+        match self {
+            Self::Cp437 => CP437_PNG,
+            Self::Aesomatica => AESOMATICA_PNG,
+        }
+    }
+}
 const META_FILE: &str = "meta.cbor";
 const RUN_FILE: &str = "run.cbor";
 const TARGET_FRAME: Duration = Duration::from_micros(16_667);
@@ -132,15 +160,17 @@ impl DeathCause {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InfoTab {
     Inventory,
+    Crafting,
     Skills,
 }
 
-const INFO_TABS: &[InfoTab] = &[InfoTab::Inventory, InfoTab::Skills];
+const INFO_TABS: &[InfoTab] = &[InfoTab::Inventory, InfoTab::Crafting, InfoTab::Skills];
 
 impl InfoTab {
     fn label(self) -> &'static str {
         match self {
             InfoTab::Inventory => "Inventory",
+            InfoTab::Crafting => "Crafting",
             InfoTab::Skills => "Skills",
         }
     }
@@ -213,7 +243,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // working pattern on Onion's libSDL2 (mmiyoo backend) — its renderer drops
     // every per-cell call.
     let texture_creator = canvas.texture_creator();
-    let mut atlas = load_atlas(ATLAS_PNG)?;
+    // Boot-time atlas pick. The config sits next to the binary (not in
+    // save_dir) — easy to find and edit. On Miyoo this lands at
+    // `App/HolyLand/atlas.txt`; on desktop, next to the built binary
+    // (e.g. `target/release/atlas.txt`). Bootstraps with "cp437" on
+    // first launch so the player has a discoverable file to edit later.
+    // Failures are silent; the game still runs.
+    let atlas_path = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(ATLAS_CONFIG_FILE);
+    if !atlas_path.exists() {
+        let _ = std::fs::write(&atlas_path, "cp437\n");
+    }
+    let atlas_choice = std::fs::read_to_string(&atlas_path)
+        .map(|s| AtlasChoice::from_save_key(&s))
+        .unwrap_or(AtlasChoice::Cp437);
+    log_info!("atlas: {:?} ({})", atlas_choice, atlas_path.display());
+    let mut atlas = load_atlas(atlas_choice.png_bytes())?;
     let mut framebuf = Surface::new(logical_w, logical_h, PixelFormatEnum::ARGB8888)?;
     let mut present_tex = texture_creator
         .create_texture_streaming(PixelFormatEnum::ARGB8888, logical_w, logical_h)?;
@@ -626,6 +674,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Action::Down => {
                         if row_count > 0 {
                             state.selected = (state.selected + 1).min(row_count - 1);
+                        }
+                    }
+                    Action::A => {
+                        // Only the Crafting tab consumes A (queues a
+                        // recipe); Inventory and Skills are read-only.
+                        if state.tab == InfoTab::Crafting {
+                            if let Some(recipe) = crafting::RECIPES.get(state.selected) {
+                                match action::evaluate(&world, recipe.action) {
+                                    action::Availability::Available { .. } => {
+                                        let action::ExecuteOutcome::Done(msg) =
+                                            action::execute(&mut world, recipe.action);
+                                        log_info!("[craft] {}", msg);
+                                        info_menu = None;
+                                    }
+                                    action::Availability::Unavailable { reason } => {
+                                        log_info!(
+                                            "[craft] can't '{}': {}",
+                                            recipe.name,
+                                            reason
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                     Action::B | Action::Select => {
@@ -1576,6 +1647,7 @@ fn draw_glyph_palette(cells: &mut [Option<Cell>], cursor: u8, palette: &Palette)
 fn info_tab_row_count(world: &World, tab: InfoTab) -> usize {
     match tab {
         InfoTab::Inventory => world.player_pack().contents.len(),
+        InfoTab::Crafting => crafting::RECIPES.len(),
         InfoTab::Skills => 1, // Fire Making; slice-2 adds more skills
     }
 }
@@ -1614,8 +1686,64 @@ fn draw_info_menu(
     // Body branches on the active tab.
     match state.tab {
         InfoTab::Inventory => draw_info_inventory(cells, &layout, world, state.selected, palette),
+        InfoTab::Crafting => draw_info_crafting(cells, &layout, world, state.selected, palette),
         InfoTab::Skills => draw_info_skills(cells, &layout, world, state.selected, palette),
     }
+}
+
+/// Crafting tab. Lists the slice-1 recipe catalog with green/red
+/// glyphs per requirement; the same `action::evaluate` dispatcher used
+/// by the command menu decides availability so the two stay in sync.
+fn draw_info_crafting(
+    cells: &mut [Option<Cell>],
+    layout: &PanelLayout,
+    world: &World,
+    selected: usize,
+    palette: &Palette,
+) {
+    let max_rows = (layout.footer_y() - layout.first_row_y() - 1).max(1) as usize;
+    let visible = crafting::RECIPES.iter().take(max_rows);
+    for (i, recipe) in visible.enumerate() {
+        let row_y = layout.first_row_y() + i as i32;
+        let is_selected = i == selected;
+        let avail = action::evaluate(world, recipe.action);
+        let (right, dim) = match avail {
+            action::Availability::Available { cost_game_seconds } => {
+                (format!("ok {}s", cost_game_seconds), false)
+            }
+            action::Availability::Unavailable { reason } => (reason.to_string(), true),
+        };
+        let fg = if dim {
+            palette.panel_dim_fg
+        } else {
+            palette.panel_fg
+        };
+        draw_menu_row(
+            cells,
+            layout,
+            row_y,
+            is_selected,
+            recipe.name,
+            fg,
+            Some((&right, palette.panel_dim_fg)),
+            palette,
+        );
+    }
+
+    // Footer-adjacent hint. Selecting a row with A queues the recipe.
+    let hint = if let Some(recipe) = crafting::RECIPES.get(selected) {
+        format!("A: craft  ({})", recipe.name)
+    } else {
+        String::new()
+    };
+    put_text(
+        cells,
+        layout.inner_x(),
+        layout.footer_y() - 1,
+        &hint,
+        palette.hud_fg,
+        palette.panel_bg,
+    );
 }
 
 fn draw_info_inventory(

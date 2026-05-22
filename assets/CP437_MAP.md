@@ -5,6 +5,22 @@ than the literal CP437 glyph. This file is the ground-truth reference
 for what each byte renders as in our atlas, plus our current
 assignments.
 
+## Picking an atlas
+
+The binary loads one atlas at boot, chosen by `atlas.txt` in the same
+folder as the binary (Miyoo: `App/HolyLand/atlas.txt`; desktop: next to
+the built executable, e.g. `target/release/atlas.txt`). Recognized keys:
+
+- `cp437` — `assets/cp437_16x16.png` (default; documented below).
+- `aesomatica` — `assets/Aesomatica_16x16.png` (alternate art set).
+
+Edit `atlas.txt` (FTP for Miyoo, text editor for desktop) and relaunch.
+Unknown / missing value falls back to `cp437`. The chosen atlas is
+logged at boot — check `holyland.log` for the `atlas:` line to confirm.
+
+Both atlases must share the same byte → sprite layout for the game's
+glyph references (items, terrain, frame chars) to render correctly.
+
 ## Rendering: alpha + color
 
 The atlas is RGBA. Magenta `(255, 0, 255)` is the chromakey — those

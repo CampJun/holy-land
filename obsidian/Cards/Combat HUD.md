@@ -1,3 +1,5 @@
+> **PARTIALLY SUPERSEDED 2026-05-21.** AP bar no longer exists (replaced by speed/move-cost in [[Survival - Combat - Action economy and turn flow]]). Locked v1 HUD decisions (2026-05-21 brainstorm): in-combat HUD shows total HP + stamina + current target + ammo only. Limb HP lives on the Inventory/body-status tab (Select hub), not the combat HUD. "In striking range" alert = reverse-video glyph + log message. Rest of this card (power UI, target cycling, log) still applies.
+
 Build the combat overlay. Default view is uncluttered; power UI reveals only on modifier hold.
 
 ## Default elements

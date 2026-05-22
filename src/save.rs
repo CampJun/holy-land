@@ -235,6 +235,33 @@ pub enum ItemMetadataSave {
     Lit {
         fuel_seconds: u32,
     },
+    /// CookingPan placed on a fire. Contents are encoded via two flat
+    /// string fields (`contents_kind` + `input`) plus the elapsed-secs
+    /// and seasonings u8 so adding a new PanContents variant later is
+    /// purely additive (unknown contents_kind -> Empty on load).
+    PannedOnFire {
+        #[serde(default)]
+        contents_kind: String,
+        #[serde(default)]
+        input: String,
+        #[serde(default)]
+        elapsed_secs: u32,
+        #[serde(default)]
+        seasonings: u8,
+        #[serde(default)]
+        fuel_seconds: u32,
+    },
+    /// Cooked food. `base`/`state` are stringly-typed so new variants
+    /// plug in without bumping schema; unknown strings fall back to
+    /// sensible defaults at load time.
+    Cooked {
+        #[serde(default)]
+        base: String,
+        #[serde(default)]
+        state: String,
+        #[serde(default)]
+        seasonings: u8,
+    },
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -313,6 +340,78 @@ fn now_unix_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crafting::{CookableKind, CookedState, PanContents, Seasonings, ModifierTag};
+    use crate::items::{ItemInstance, ItemKind, ItemMetadata};
+
+    #[test]
+    fn panned_on_fire_metadata_round_trips_through_cbor() {
+        // Mid-cook fish with a herb seasoning, 1100 fuel-seconds left.
+        let pan = ItemInstance::unique(
+            ItemKind::CookingPan,
+            1_000,
+            None,
+            ItemMetadata::PannedOnFire {
+                contents: PanContents::Cooking {
+                    input: CookableKind::Fish,
+                    elapsed_secs: 47,
+                    seasonings: {
+                        let mut s = Seasonings::empty();
+                        s.set(ModifierTag::Herb);
+                        s
+                    },
+                },
+                fuel_seconds: 1_100,
+            },
+        );
+        let saved = pan.to_save();
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&saved, &mut bytes).unwrap();
+        let decoded: ItemInstanceSave = ciborium::from_reader(&*bytes).unwrap();
+        let restored = ItemInstance::from_save(&decoded).unwrap();
+        match restored.metadata {
+            ItemMetadata::PannedOnFire { contents, fuel_seconds } => {
+                assert_eq!(fuel_seconds, 1_100);
+                match contents {
+                    PanContents::Cooking { input, elapsed_secs, seasonings } => {
+                        assert_eq!(input, CookableKind::Fish);
+                        assert_eq!(elapsed_secs, 47);
+                        assert!(seasonings.has(ModifierTag::Herb));
+                    }
+                    other => panic!("expected Cooking, got {:?}", other),
+                }
+            }
+            other => panic!("expected PannedOnFire, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cooked_metadata_round_trips_with_seasonings_and_state() {
+        let mut s = Seasonings::empty();
+        s.set(ModifierTag::Herb);
+        let cooked = ItemInstance::unique(
+            ItemKind::Cooked,
+            400,
+            None,
+            ItemMetadata::Cooked {
+                base: CookableKind::Fish,
+                state: CookedState::Burnt,
+                seasonings: s,
+            },
+        );
+        let saved = cooked.to_save();
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&saved, &mut bytes).unwrap();
+        let decoded: ItemInstanceSave = ciborium::from_reader(&*bytes).unwrap();
+        let restored = ItemInstance::from_save(&decoded).unwrap();
+        match restored.metadata {
+            ItemMetadata::Cooked { base, state, seasonings } => {
+                assert_eq!(base, CookableKind::Fish);
+                assert_eq!(state, CookedState::Burnt);
+                assert!(seasonings.has(ModifierTag::Herb));
+            }
+            other => panic!("expected Cooked, got {:?}", other),
+        }
+    }
 
     #[test]
     fn round_trip_meta() {

@@ -11,6 +11,7 @@ pub struct RunSave {
     pub header: SaveHeader,
     pub seed: u64,
     pub clock_seconds: u64,
+    pub calendar_day: u32,            // [[Survival - Calendar and seasons]]; default 80 (21 Mar 1300)
     pub player_x: i64,
     pub player_y: i64,
     pub player_inventory: Vec<ItemInstanceSave>,
@@ -22,6 +23,18 @@ pub struct RunSave {
     pub structures: Vec<StructureSave>,
 }
 ```
+
+## New CellState fields (within `ChunkSave.cells`)
+
+Added by the seasons/flora cluster — all `#[serde(default)]`:
+
+- `tree_species: Option<TreeSpecies>` — Some on TreeTrunk cells; None elsewhere. [[Survival - Species variety - trees and undergrowth]].
+- `ground_cover: GroundCover` — `None | FallenLeaves | LeafLitter`. Snow is render-time-only, not stored. [[Survival - Seasonal ground cover and palette]].
+- `decoration: Decoration` — `None | Fern{state} | Moss | Bramble{state} | Bracken{state} | Gorse{state} | Sapling{species, planted_day} | Mushroom{kind, expires_day}`. [[Survival - Species variety - trees and undergrowth]] + [[Survival - Plant lifecycle and seasonal foraging]].
+
+## New ChunkSave field
+
+- `last_lifecycle_eval_day: u32` — for lazy fast-forward at chunk-load. [[Survival - Plant lifecycle and seasonal foraging]].
 
 ## New MetaSave
 Drop Holy Land fields: `essence` (renamed `demon_currency`), `deity_affinity`, `shrine_unlocked`, `oasis_intro_complete`.

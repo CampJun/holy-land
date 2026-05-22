@@ -13,6 +13,7 @@
 // - Save format uses stable string `save_key()`s for forward-compat. Unknown
 //   keys on load are dropped silently (see `Pack::from_save`).
 
+use crate::crafting::{CookableKind, CookedState, PanContents, Seasonings};
 use crate::save::{ItemInstanceSave, ItemMetadataSave, PackSave};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -35,6 +36,11 @@ pub enum ItemKind {
     Mud,
     Ration,
     Fish,
+    /// Output of cooking. All variants (cooked fish, herbed cooked
+    /// fish, burnt fish, ...) share this single kind; per-output
+    /// flavor lives in `ItemMetadata::Cooked { base, state, seasonings }`.
+    /// Display_label spells out the human-readable name.
+    Cooked,
 }
 
 /// All per-kind metadata in one place. Adding a new `ItemKind` variant is
@@ -81,6 +87,7 @@ const ALL_KINDS: &[ItemKind] = &[
     ItemKind::Mud,
     ItemKind::Ration,
     ItemKind::Fish,
+    ItemKind::Cooked,
 ];
 
 impl ItemKind {
@@ -263,6 +270,18 @@ impl ItemKind {
                 default_weight_g: 400,
                 blends_with_terrain: false,
             },
+            ItemKind::Cooked => ItemDef {
+                save_key: "cooked",
+                name: "cooked food",
+                // Per-instance state lives in metadata; treat as
+                // non-fungible so the (base, seasonings, state) triple
+                // never silently stack-merges across permutations.
+                is_fungible: false,
+                glyph: b'%',
+                color: [200, 150, 90],
+                default_weight_g: 400,
+                blends_with_terrain: false,
+            },
         }
     }
 
@@ -326,6 +345,24 @@ pub enum ItemMetadata {
     Lit {
         fuel_seconds: u32,
     },
+    /// A CookingPan placed on a Lit fire. Owns the fire's remaining
+    /// fuel so the pan-and-fire act as one item on the cell — pickup
+    /// hands the fuel back to a Lit firewood. The cookware tick (in
+    /// world.rs) drives `fuel_seconds` down and `PanContents::Cooking`
+    /// forward each game-second.
+    PannedOnFire {
+        contents: PanContents,
+        fuel_seconds: u32,
+    },
+    /// Cooked food. Single `ItemKind::Cooked` covers every permutation
+    /// of (base, state, seasonings) — no `CookedFish` / `BurntFish` /
+    /// `HerbCookedFish` explosion. `display_label` spells out the
+    /// readable name; eat-effects (future verb) read the bitfield.
+    Cooked {
+        base: CookableKind,
+        state: CookedState,
+        seasonings: Seasonings,
+    },
 }
 
 impl Default for ItemMetadata {
@@ -341,15 +378,93 @@ impl ItemMetadata {
             ItemMetadata::Waterskin { water_uses } => ItemMetadataSave::Waterskin { water_uses },
             ItemMetadata::Pitched => ItemMetadataSave::Pitched,
             ItemMetadata::Lit { fuel_seconds } => ItemMetadataSave::Lit { fuel_seconds },
+            ItemMetadata::PannedOnFire {
+                contents,
+                fuel_seconds,
+            } => {
+                let (kind, input, elapsed_secs, seasonings) = match contents {
+                    PanContents::Empty => (String::from("empty"), String::new(), 0, 0),
+                    PanContents::Cooking {
+                        input,
+                        elapsed_secs,
+                        seasonings,
+                    } => (
+                        String::from("cooking"),
+                        input.save_key().to_string(),
+                        elapsed_secs,
+                        seasonings.0,
+                    ),
+                };
+                ItemMetadataSave::PannedOnFire {
+                    contents_kind: kind,
+                    input,
+                    elapsed_secs,
+                    seasonings,
+                    fuel_seconds,
+                }
+            }
+            ItemMetadata::Cooked {
+                base,
+                state,
+                seasonings,
+            } => ItemMetadataSave::Cooked {
+                base: base.save_key().to_string(),
+                state: state.save_key().to_string(),
+                seasonings: seasonings.0,
+            },
         }
     }
 
     pub fn from_save(s: &ItemMetadataSave) -> Self {
-        match *s {
+        match s {
             ItemMetadataSave::None => ItemMetadata::None,
-            ItemMetadataSave::Waterskin { water_uses } => ItemMetadata::Waterskin { water_uses },
+            ItemMetadataSave::Waterskin { water_uses } => ItemMetadata::Waterskin {
+                water_uses: *water_uses,
+            },
             ItemMetadataSave::Pitched => ItemMetadata::Pitched,
-            ItemMetadataSave::Lit { fuel_seconds } => ItemMetadata::Lit { fuel_seconds },
+            ItemMetadataSave::Lit { fuel_seconds } => ItemMetadata::Lit {
+                fuel_seconds: *fuel_seconds,
+            },
+            ItemMetadataSave::PannedOnFire {
+                contents_kind,
+                input,
+                elapsed_secs,
+                seasonings,
+                fuel_seconds,
+            } => {
+                let contents = match contents_kind.as_str() {
+                    "cooking" => match CookableKind::from_save_key(input) {
+                        Some(k) => PanContents::Cooking {
+                            input: k,
+                            elapsed_secs: *elapsed_secs,
+                            seasonings: Seasonings(*seasonings),
+                        },
+                        // Unknown future cookable -> drop to empty.
+                        None => PanContents::Empty,
+                    },
+                    _ => PanContents::Empty,
+                };
+                ItemMetadata::PannedOnFire {
+                    contents,
+                    fuel_seconds: *fuel_seconds,
+                }
+            }
+            ItemMetadataSave::Cooked {
+                base,
+                state,
+                seasonings,
+            } => {
+                // Unknown base/state -> fall back to a recognisable
+                // sentinel. The item is still loadable; the player
+                // sees "cooked food" with no flavor.
+                let base = CookableKind::from_save_key(base).unwrap_or(CookableKind::Fish);
+                let state = CookedState::from_save_key(state).unwrap_or(CookedState::Ok);
+                ItemMetadata::Cooked {
+                    base,
+                    state,
+                    seasonings: Seasonings(*seasonings),
+                }
+            }
         }
     }
 }
@@ -416,6 +531,50 @@ impl ItemInstance {
                 0 => format!("{} (empty)", name),
                 n => format!("{} ({}/4)", name, n),
             },
+            ItemMetadata::PannedOnFire {
+                contents,
+                fuel_seconds,
+            } => {
+                let m = fuel_seconds / 60;
+                match contents {
+                    PanContents::Empty => format!("pan-on-fire ({}m fuel)", m),
+                    PanContents::Cooking {
+                        input,
+                        elapsed_secs,
+                        seasonings: _,
+                    } => {
+                        let status = match crate::crafting::cook_progress(input, elapsed_secs) {
+                            crate::crafting::CookProgress::Raw => {
+                                let pct = (elapsed_secs * 100 / input.target_secs().max(1)).min(99);
+                                format!("cooking {} ({}%)", input.raw_name(), pct)
+                            }
+                            crate::crafting::CookProgress::Ok => {
+                                format!("done {}", input.raw_name())
+                            }
+                            crate::crafting::CookProgress::Burnt => {
+                                format!("BURNT {}", input.raw_name())
+                            }
+                        };
+                        format!("pan-on-fire ({}, {}m fuel)", status, m)
+                    }
+                }
+            }
+            ItemMetadata::Cooked {
+                base,
+                state,
+                seasonings,
+            } => {
+                let base_name = base.raw_name();
+                let prefix = if seasonings.has(crate::crafting::ModifierTag::Herb) {
+                    "herbed "
+                } else {
+                    ""
+                };
+                match state {
+                    CookedState::Ok => format!("{}cooked {}", prefix, base_name),
+                    CookedState::Burnt => format!("burnt {}", base_name),
+                }
+            }
             ItemMetadata::None if self.count > 1 => format!("{} ({})", name, self.count),
             ItemMetadata::None => name.to_string(),
         }
@@ -474,6 +633,8 @@ impl Pack {
         if new_weight > self.capacity_g as u64 {
             return Err(item);
         }
+        // Only None-metadata fungibles merge; cooked food / cookware
+        // carry per-instance state that must not collapse together.
         if item.kind.is_fungible()
             && matches!(item.metadata, ItemMetadata::None)
             && item.charges.is_none()
