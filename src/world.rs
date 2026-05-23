@@ -182,10 +182,60 @@ pub struct TerrainDef {
     #[allow(dead_code)] // wired by future "terrain underfoot" HUD line
     pub name: &'static str,
     pub glyph: u8,
-    pub fg: [u8; 3],
-    pub bg: [u8; 3],
+    /// Per-season `(fg, bg)` palette indexed by `Season as usize`. The
+    /// render path resolves via `fg(season)/bg(season)` so the same
+    /// TerrainKind can shift through Spring/Summer/Autumn/Winter without
+    /// per-cell branching at the call site.
+    pub palette: [([u8; 3], [u8; 3]); 4],
     pub walkable: bool,
     pub blocks_sight: bool,
+}
+
+impl TerrainDef {
+    pub fn fg(&self, s: Season) -> [u8; 3] {
+        self.palette[s as usize].0
+    }
+    pub fn bg(&self, s: Season) -> [u8; 3] {
+        self.palette[s as usize].1
+    }
+}
+
+/// Per-cell ground-cover overlay (carried on CellState). Snow is NOT a
+/// variant here — it's render-time-only, computed from
+/// `(season == Winter && terrain.is_outdoor())`. Storing it would
+/// double the schema bytes for a derived value and force a write at
+/// every Winter dawn for every loaded chunk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum GroundCover {
+    #[default]
+    None,
+    /// Autumn-only. Spawned around deciduous trees during autumn,
+    /// cleared at first spring dawn. Lifecycle handled in Phase D.
+    FallenLeaves,
+    /// Permanent brown bg under canopy. Placed by chunkgen on every
+    /// Grass cell within 1 cell of a TreeTrunk. Determines mushroom
+    /// spawn weighting (Phase D) and survives the seasonal cycle.
+    LeafLitter,
+}
+
+impl GroundCover {
+    /// Stable string for save round-tripping. Unknown keys load as None.
+    #[allow(dead_code)] // Phase D wires the persistence path
+    pub fn save_key(self) -> &'static str {
+        match self {
+            GroundCover::None => "none",
+            GroundCover::FallenLeaves => "fallen_leaves",
+            GroundCover::LeafLitter => "leaf_litter",
+        }
+    }
+    #[allow(dead_code)] // Phase D wires the persistence path
+    pub fn from_save_key(s: &str) -> Self {
+        match s {
+            "fallen_leaves" => GroundCover::FallenLeaves,
+            "leaf_litter" => GroundCover::LeafLitter,
+            _ => GroundCover::None,
+        }
+    }
 }
 
 /// Atlas byte indices for the four custom tree-canopy sprites. The
@@ -232,20 +282,29 @@ impl TerrainKind {
         ALL_TERRAINS.iter().copied().find(|t| t.def().save_key == s)
     }
 
+    /// Cells where weather (snow, frost, rain) can land directly.
+    /// TreeTrunk and Wall are sheltered. Water cells count as outdoor
+    /// for now — Winter frozen-water rendering is a future card.
+    pub fn is_outdoor(self) -> bool {
+        matches!(
+            self,
+            TerrainKind::Grass
+                | TerrainKind::BareDirt
+                | TerrainKind::SandShore
+                | TerrainKind::StreamWater
+                | TerrainKind::PondWater
+        )
+    }
+
     /// Single source of truth for per-terrain rendering + game-rules
     /// metadata. Adding a new terrain variant is a one-stop edit: add
     /// the enum arm, then add an arm here. Exhaustive-match enforces it.
     pub fn def(self) -> TerrainDef {
         match self {
-            // Aesthetic note: ground terrains (grass, dirt, sand) are
-            // desaturated on purpose so trees and water remain the
-            // visual landmarks and items on the floor read with
-            // contrast. See STYLE.md §2.8 / the aesthetic pass commit.
-            // Floor terrains use heavily desaturated fg toned toward
-            // their bg; the render path adds a per-cell ±8 RGB jitter
-            // (see floor_color_offset in main.rs) to make the floor
-            // read as a gradient texture rather than flat tone. Trees
-            // + water keep saturation so they pierce the field.
+            // Per-season palette draft per
+            // `obsidian/Cards/Survival - Seasonal ground cover and palette.md`.
+            // Indexed by `Season as usize` — Spring=0, Summer=1, Autumn=2,
+            // Winter=3. Tune in playtest.
             TerrainKind::Grass => TerrainDef {
                 save_key: "grass",
                 name: "grass",
@@ -253,10 +312,12 @@ impl TerrainKind {
                 // main.rs renders blank for ~75% of cells; this glyph
                 // shows on the rest.
                 glyph: 0x9C,
-                // Saturated green tints the grayscale tuft; the
-                // per-cell floor_with_gradient adds ±8 variation.
-                fg: [80, 130, 55],
-                bg: [14, 22, 14],
+                palette: [
+                    ([80, 150, 55], [35, 70, 30]),    // Spring
+                    ([55, 120, 40], [25, 55, 25]),    // Summer
+                    ([140, 110, 45], [60, 45, 20]),   // Autumn
+                    ([180, 190, 200], [110, 120, 130]), // Winter (snow lerp paints over)
+                ],
                 walkable: true,
                 blocks_sight: false,
             },
@@ -264,8 +325,12 @@ impl TerrainKind {
                 save_key: "bare_dirt",
                 name: "dirt",
                 glyph: b'.',
-                fg: [62, 52, 40],
-                bg: [18, 15, 11],
+                palette: [
+                    ([120, 90, 55], [60, 45, 28]),
+                    ([140, 100, 55], [70, 50, 30]),
+                    ([110, 80, 45], [55, 40, 25]),
+                    ([170, 170, 170], [90, 95, 100]),
+                ],
                 walkable: true,
                 blocks_sight: false,
             },
@@ -273,23 +338,30 @@ impl TerrainKind {
                 save_key: "sand_shore",
                 name: "sand",
                 glyph: b'.',
-                fg: [105, 95, 72],
-                bg: [32, 27, 19],
+                palette: [
+                    ([200, 180, 130], [140, 120, 80]),
+                    ([210, 190, 135], [150, 125, 80]),
+                    ([190, 170, 120], [130, 110, 75]),
+                    ([210, 215, 220], [150, 160, 170]),
+                ],
                 walkable: true,
                 blocks_sight: false,
             },
-            // Trees + water keep most of their saturation so they
-            // anchor the eye against the muted floor.
+            // TreeTrunk palette is the species-agnostic fallback —
+            // render reads `cell.tree_species` first via the
+            // per-species tint table in Phase C. Default fg stays
+            // near-white so the TREE_VARIANT_GLYPHS sprites read through
+            // at any season.
             TerrainKind::TreeTrunk => TerrainDef {
                 save_key: "tree_trunk",
                 name: "tree",
-                // Default glyph; the render loop overrides this per
-                // cell with one of TREE_VARIANT_GLYPHS based on a
-                // (x, y, seed) hash so the forest has visual variety.
                 glyph: 0x06,
-                // Near-white so each variant's atlas color shows.
-                fg: [230, 235, 215],
-                bg: [12, 20, 12],
+                palette: [
+                    ([230, 235, 215], [12, 20, 12]),
+                    ([225, 230, 210], [10, 18, 10]),
+                    ([220, 200, 160], [16, 18, 12]),
+                    ([200, 200, 195], [22, 22, 26]),
+                ],
                 walkable: false,
                 blocks_sight: true,
             },
@@ -297,8 +369,12 @@ impl TerrainKind {
                 save_key: "stream_water",
                 name: "stream",
                 glyph: b'~',
-                fg: [85, 130, 175],
-                bg: [20, 30, 50],
+                palette: [
+                    ([85, 130, 175], [20, 30, 50]),
+                    ([85, 130, 175], [20, 30, 50]),
+                    ([70, 110, 150], [18, 26, 42]),
+                    ([150, 170, 200], [60, 80, 110]),
+                ],
                 walkable: false,
                 blocks_sight: false,
             },
@@ -306,17 +382,28 @@ impl TerrainKind {
                 save_key: "pond_water",
                 name: "pond",
                 glyph: b'~',
-                fg: [55, 100, 155],
-                bg: [18, 28, 48],
+                palette: [
+                    ([55, 100, 155], [18, 28, 48]),
+                    ([55, 100, 155], [18, 28, 48]),
+                    ([50, 90, 135], [16, 24, 42]),
+                    ([140, 160, 195], [55, 75, 105]),
+                ],
                 walkable: false,
                 blocks_sight: false,
             },
+            // Walls are seasonal-invariant: stone doesn't change with
+            // the year. All four palette slots match the original
+            // single-color value.
             TerrainKind::Wall => TerrainDef {
                 save_key: "wall",
                 name: "wall",
                 glyph: b'#',
-                fg: [140, 110, 75],
-                bg: [35, 28, 20],
+                palette: [
+                    ([140, 110, 75], [35, 28, 20]),
+                    ([140, 110, 75], [35, 28, 20]),
+                    ([140, 110, 75], [35, 28, 20]),
+                    ([140, 110, 75], [35, 28, 20]),
+                ],
                 walkable: false,
                 blocks_sight: true,
             },
@@ -342,6 +429,11 @@ pub struct CellState {
     /// being a uniform patch. Transient like `visible` — reset and
     /// rebuilt every `recompute_fov` call; not persisted.
     pub light_intensity: u8,
+    /// Per-cell ground-cover overlay (LeafLitter, FallenLeaves). Snow
+    /// is render-time-only based on `(season, terrain.is_outdoor())`
+    /// and never lands here. Chunkgen places LeafLitter; the Phase-D
+    /// lifecycle scheduler manages FallenLeaves spawn/clear.
+    pub ground_cover: GroundCover,
 }
 
 impl CellState {
@@ -352,6 +444,7 @@ impl CellState {
             visible: false,
             explored: false,
             light_intensity: 0,
+            ground_cover: GroundCover::None,
         }
     }
 }
@@ -1979,6 +2072,31 @@ mod tests {
         // shape so multi-day skips don't undercount.
         world.advance_time_raw(2 * 24 * 3600);
         assert_eq!(world.calendar_day, start_day + 2);
+    }
+
+    #[test]
+    fn terrain_palette_indexes_by_season() {
+        use crate::calendar::Season;
+        let grass = TerrainKind::Grass.def();
+        // The four seasons must produce distinct palettes for Grass
+        // (the whole point of the seasonal table — Wall is allowed to
+        // be identical across seasons because stone doesn't shift).
+        assert_ne!(grass.bg(Season::Spring), grass.bg(Season::Winter));
+        assert_ne!(grass.bg(Season::Summer), grass.bg(Season::Autumn));
+        // Wall stays invariant.
+        let wall = TerrainKind::Wall.def();
+        assert_eq!(wall.bg(Season::Spring), wall.bg(Season::Winter));
+    }
+
+    #[test]
+    fn outdoor_terrains_include_grass_water_sand() {
+        assert!(TerrainKind::Grass.is_outdoor());
+        assert!(TerrainKind::BareDirt.is_outdoor());
+        assert!(TerrainKind::SandShore.is_outdoor());
+        assert!(TerrainKind::StreamWater.is_outdoor());
+        assert!(TerrainKind::PondWater.is_outdoor());
+        assert!(!TerrainKind::TreeTrunk.is_outdoor());
+        assert!(!TerrainKind::Wall.is_outdoor());
     }
 
     #[test]

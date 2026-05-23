@@ -30,8 +30,6 @@ kanban-plugin: board
 	Schema bump for the redesign. Friendly-reject v1 saves. Absorbs the seasons/flora additions (`calendar_day`, `CellState.ground_cover`, `CellState.tree_species`, `CellState.decoration`, `ChunkSave.last_lifecycle_eval_day`).
 - [ ] [[Survival - Miyoo 30 FPS target]]
 	Drop Miyoo to 30 FPS, keep desktop at 60. Cfg-split `TARGET_FRAME` in `main.rs:43`. Battery + pacer consistency win; pacer oversleep slop is ~30% of budget at 60 FPS but ~10% at 33 ms target so frames actually land more consistently. Watch out for `MULTI_TURN_GAME_SEC_PER_FRAME` (`world.rs:55`) — at 30 FPS all multi-turn wall-clock durations double; bump the constant on ARM or leave it.
-- [ ] [[Survival - Seasonal ground cover and palette]]
-	Season-aware `TerrainDef` table (per-terrain Season→Palette) replaces flat `fg/bg`. Per-cell `GroundCover { None, FallenLeaves, LeafLitter }` field on CellState; Snow is render-time-only from `(season == Winter && outdoor)`. Two extra bg lerps per dirty cell; mmiyoo surface color mod handles it.
 - [ ] [[Survival - Species variety - trees and undergrowth]]
 	Tree species (Oak/Hazel/Holly/Ash/Rowan) via `CellState.tree_species`; per-species seasonal tints replace `TREE_TINT_VARIANTS`. Undergrowth as `CellState.decoration` (Fern/Moss/Bramble/Bracken/Gorse/Sapling/Mushroom) with interactive harvest verbs: HarvestMoss → poultice ingredient, CutFern/DigFern, CutGorse, CutBracken, PickBrambleFruit, PickMushroom. New ItemKind variants for yields.
 - [ ] [[Survival - Plant lifecycle and seasonal foraging]]
@@ -100,6 +98,8 @@ kanban-plugin: board
 - [ ] Follow-cam **shipped on `survival/follow-cam`** (commit 613783f): player-centered camera + chunk ring + scroll-blit. No card; architectural enabler for slice-2 multi-chunk world.
 - [ ] [[Survival - Calendar and seasons]]
 	365-day Gregorian (no leap), Sarum liturgical, start 21 Mar 1300 (Easter, Spring). Solar season boundaries (Mar 21 / Jun 21 / Sep 23 / Dec 21). New `src/calendar.rs`; `World.calendar_day: u32` + `RunSave.calendar_day` advances at every midnight crossing; HUD shows `21 Mar Spring` on row 2 right. **Phase A of the seasons/flora cluster shipped.** Schema-v2 bump landed alongside: v1 saves now friendly-reject ("This save belongs to the Holy Land design. Start a new game…") via [[Survival - Save schema v2]] — the v2 card stays in Drafts until the per-cell season/species fields land in later phases.
+- [ ] [[Survival - Seasonal ground cover and palette]]
+	`TerrainDef.palette: [(fg, bg); 4]` indexed by `Season as usize` replaces the flat `fg/bg`; `fg(season)`/`bg(season)` accessors keep the render path one-line. Per-cell `GroundCover { None, FallenLeaves, LeafLitter }` rides `CellState`; chunkgen paints LeafLitter on every Grass cell within one 8-neighborhood of a TreeTrunk. Render path adds two bg lerps + the Winter `Snow` overlay (`Season::Winter && terrain.is_outdoor()`, render-only). `TerrainKind::is_outdoor()` excludes TreeTrunk/Wall so canopy + walls dodge the snow lerp. **Phase B shipped.** FallenLeaves spawn/clear lifecycle waits for Phase D.
 
 
 ## Playtest

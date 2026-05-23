@@ -29,7 +29,7 @@
 
 use crate::items::{ItemInstance, ItemKind, ItemMetadata};
 use crate::skill::Rng;
-use crate::world::{CellState, Chunk, ChunkCoord, TerrainKind, CHUNK_H, CHUNK_W};
+use crate::world::{CellState, Chunk, ChunkCoord, GroundCover, TerrainKind, CHUNK_H, CHUNK_W};
 
 pub fn generate_chunk(coord: ChunkCoord, world_seed: u64) -> Chunk {
     let mut rng = chunk_rng(coord, world_seed);
@@ -90,6 +90,13 @@ pub fn generate_chunk(coord: ChunkCoord, world_seed: u64) -> Chunk {
         ));
         herb_placed += 1;
     }
+
+    // Step 3.5: LeafLitter ground-cover on every Grass cell within 1
+    // cell of a TreeTrunk. Deterministic per seed (no RNG roll — every
+    // qualifying cell gets it). Pure overlay; doesn't change
+    // walkability. Regenerated on chunk-load so no save persistence
+    // needed.
+    apply_leaf_litter(&mut cells);
 
     // Step 4: per-grass-cell debris rolls. Mud roll needs to know
     // whether ANY adjacent cell is water; precompute that into a bool
@@ -293,6 +300,48 @@ fn roll_debris(out: &mut Vec<ItemInstance>, rng: &mut Rng, near_water: bool) {
     }
 }
 
+/// Set `ground_cover = LeafLitter` on every Grass cell within 1 cell
+/// (8-neighborhood) of a TreeTrunk. Runs after skeleton + extra-tree
+/// passes so every tree placed by this chunk's chunkgen contributes
+/// litter. No RNG — placement is purely positional, so the result is
+/// deterministic per seed.
+fn apply_leaf_litter(cells: &mut [CellState]) {
+    let cw = CHUNK_W as i32;
+    let ch = CHUNK_H as i32;
+    let mut targets = Vec::new();
+    for y in 0..ch {
+        for x in 0..cw {
+            let idx = cell_idx(x as u32, y as u32);
+            if cells[idx].terrain != TerrainKind::Grass {
+                continue;
+            }
+            let mut near_tree = false;
+            'outer: for dy in -1..=1 {
+                for dx in -1..=1 {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let nx = x + dx;
+                    let ny = y + dy;
+                    if nx < 0 || ny < 0 || nx >= cw || ny >= ch {
+                        continue;
+                    }
+                    if cells[cell_idx(nx as u32, ny as u32)].terrain == TerrainKind::TreeTrunk {
+                        near_tree = true;
+                        break 'outer;
+                    }
+                }
+            }
+            if near_tree {
+                targets.push(idx);
+            }
+        }
+    }
+    for idx in targets {
+        cells[idx].ground_cover = GroundCover::LeafLitter;
+    }
+}
+
 /// Compute "is this cell adjacent to any water cell" for every cell in
 /// the chunk. Returned as a flat Vec<bool> sized CHUNK_W*CHUNK_H.
 fn compute_near_water_grid(cells: &[CellState]) -> Vec<bool> {
@@ -403,6 +452,66 @@ mod tests {
                 assert_eq!(ia.kind, ib.kind);
                 assert_eq!(ia.count, ib.count);
             }
+        }
+    }
+
+    #[test]
+    fn leaf_litter_placed_near_trees() {
+        let chunk = generate_chunk(ChunkCoord { cx: 0, cy: 0 }, 0xC0FFEE);
+        // Every Grass cell with at least one TreeTrunk among its 8
+        // neighbors must carry LeafLitter. Non-tree-adjacent Grass
+        // cells must NOT.
+        let cw = CHUNK_W as i32;
+        let ch = CHUNK_H as i32;
+        for y in 0..ch {
+            for x in 0..cw {
+                let idx = cell_idx(x as u32, y as u32);
+                if chunk.cells[idx].terrain != TerrainKind::Grass {
+                    continue;
+                }
+                let mut near_tree = false;
+                for dy in -1..=1_i32 {
+                    for dx in -1..=1_i32 {
+                        if dx == 0 && dy == 0 {
+                            continue;
+                        }
+                        let nx = x + dx;
+                        let ny = y + dy;
+                        if nx < 0 || ny < 0 || nx >= cw || ny >= ch {
+                            continue;
+                        }
+                        let n = cell_idx(nx as u32, ny as u32);
+                        if chunk.cells[n].terrain == TerrainKind::TreeTrunk {
+                            near_tree = true;
+                        }
+                    }
+                }
+                let cover = chunk.cells[idx].ground_cover;
+                if near_tree {
+                    assert_eq!(
+                        cover,
+                        GroundCover::LeafLitter,
+                        "({}, {}) is grass next to a tree but has cover={:?}",
+                        x, y, cover
+                    );
+                } else {
+                    assert_eq!(
+                        cover,
+                        GroundCover::None,
+                        "({}, {}) is grass NOT next to a tree but has cover={:?}",
+                        x, y, cover
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ground_cover_round_trips_with_same_seed() {
+        let a = generate_chunk(ChunkCoord { cx: 0, cy: 0 }, 0xC0FFEE);
+        let b = generate_chunk(ChunkCoord { cx: 0, cy: 0 }, 0xC0FFEE);
+        for (ca, cb) in a.cells.iter().zip(b.cells.iter()) {
+            assert_eq!(ca.ground_cover, cb.ground_cover);
         }
     }
 

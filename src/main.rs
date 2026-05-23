@@ -33,7 +33,7 @@ use save::{
 };
 use skill::{Rng, Skill, SkillKind, Skills};
 use world::{
-    brightness_at, dawns_elapsed, Position, TerrainKind, ViewMode, World,
+    brightness_at, dawns_elapsed, GroundCover, Position, TerrainKind, ViewMode, World,
     MULTI_TURN_GAME_SEC_PER_FRAME, TREE_TINT_VARIANTS, TREE_VARIANT_GLYPHS,
 };
 
@@ -956,6 +956,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut dirty_min_y = WORLD_H as i32;
         let mut dirty_max_x = 0;
         let mut dirty_max_y = 0;
+        let season = world.season();
         for vy in 0..WORLD_H as i32 {
             for vx in 0..WORLD_W as i32 {
                 let wx = cam_x + vx as i64;
@@ -972,12 +973,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // pierces the floor as a visual landmark.
                 let apply_gradient =
                     matches!(terrain, TerrainKind::Grass | TerrainKind::BareDirt | TerrainKind::SandShore);
+                let base_fg = terrain_def.fg(season);
+                let base_bg = terrain_def.bg(season);
                 let (fg_arr, bg_arr) = if apply_gradient {
-                    floor_with_gradient(terrain_def, wx as i32, wy as i32, world.seed)
+                    floor_with_gradient(base_fg, base_bg, wx as i32, wy as i32, world.seed)
                 } else {
-                    (terrain_def.fg, terrain_def.bg)
+                    (base_fg, base_bg)
                 };
                 let mut fg = Color::RGB(fg_arr[0], fg_arr[1], fg_arr[2]);
+                // Ground-cover lerps: stored variants paint over the
+                // seasonal terrain bg. Snow is render-time-only based on
+                // (Winter && terrain.is_outdoor()) and lerps on top of
+                // any stored ground_cover, so a winter LeafLitter cell
+                // still whitens while the brown underneath survives
+                // until spring.
+                let stored_cover = world
+                    .cell_at(wx, wy)
+                    .map(|c| c.ground_cover)
+                    .unwrap_or(GroundCover::None);
+                let bg_arr = match stored_cover {
+                    GroundCover::None => bg_arr,
+                    GroundCover::FallenLeaves => lerp_rgb(bg_arr, [140, 70, 30], 0.35),
+                    GroundCover::LeafLitter => lerp_rgb(bg_arr, [60, 45, 25], 0.25),
+                };
+                let bg_arr = if matches!(season, calendar::Season::Winter) && terrain.is_outdoor() {
+                    lerp_rgb(bg_arr, [230, 235, 245], 0.60)
+                } else {
+                    bg_arr
+                };
                 let bg = Color::RGB(bg_arr[0], bg_arr[1], bg_arr[2]);
                 // Sparse grass tufts: hash-driven so ~25% of grass
                 // cells show the 0x9C tuft sprite; the rest render as
@@ -1351,7 +1374,8 @@ fn build_ui_cells(
 /// texture instead of a flat region. Three independent hashes for R,
 /// G, B keep the variation organic rather than monochromatic.
 fn floor_with_gradient(
-    def: world::TerrainDef,
+    base_fg: [u8; 3],
+    base_bg: [u8; 3],
     x: i32,
     y: i32,
     seed: u64,
@@ -1370,16 +1394,26 @@ fn floor_with_gradient(
     let dg = ((mg as i32).rem_euclid(17) - 8) as i16;
     let db = ((mb.rem_euclid(17)) - 8) as i16;
     let fg = [
-        (def.fg[0] as i16 + dr).clamp(0, 255) as u8,
-        (def.fg[1] as i16 + dg).clamp(0, 255) as u8,
-        (def.fg[2] as i16 + db).clamp(0, 255) as u8,
+        (base_fg[0] as i16 + dr).clamp(0, 255) as u8,
+        (base_fg[1] as i16 + dg).clamp(0, 255) as u8,
+        (base_fg[2] as i16 + db).clamp(0, 255) as u8,
     ];
     let bg = [
-        (def.bg[0] as i16 + dr / 2).clamp(0, 255) as u8,
-        (def.bg[1] as i16 + dg / 2).clamp(0, 255) as u8,
-        (def.bg[2] as i16 + db / 2).clamp(0, 255) as u8,
+        (base_bg[0] as i16 + dr / 2).clamp(0, 255) as u8,
+        (base_bg[1] as i16 + dg / 2).clamp(0, 255) as u8,
+        (base_bg[2] as i16 + db / 2).clamp(0, 255) as u8,
     ];
     (fg, bg)
+}
+
+/// Linear RGB blend from `a` toward `b` by `t` in [0.0, 1.0]. Used by
+/// the render path for ground-cover and Snow bg lerps. Surface-level
+/// color math runs fine on mmiyoo SDL2 (the broken bits are texture
+/// color mod, not surface composition).
+fn lerp_rgb(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round().clamp(0.0, 255.0) as u8;
+    [mix(a[0], b[0]), mix(a[1], b[1]), mix(a[2], b[2])]
 }
 
 /// Linearly mix an item color toward a terrain fg. `mix` is the
