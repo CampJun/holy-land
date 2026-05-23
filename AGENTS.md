@@ -3,6 +3,12 @@
 Snapshot for any agent (Codex / Claude / etc.) picking up the Miyoo Mini Plus port.
 Written 2026-05-11. Pair with `holyland-PLAN.md` and `holyland-ROADMAP.md` for the broader game design; this file covers the runtime + deploy specifics.
 
+**Code-conventions companion: [`STYLE.md`](STYLE.md)** — module ownership map,
+DRY patterns we've settled on, "how to add a new {item, verb, need, terrain,
+debug command, save field}", testing conventions, Miyoo resource budget table.
+AGENTS.md (this file) is operational rules (deploy, mmiyoo quirks, save format);
+STYLE.md is code style + architecture. Read both before editing.
+
 ## Project shape
 
 - Rust + SDL2 (sdl2 0.37) CP437 roguelike. Entry: `src/main.rs`.

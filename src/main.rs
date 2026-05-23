@@ -1,7 +1,17 @@
+mod action;
+mod chunkgen;
+mod crafting;
+#[cfg(not(target_arch = "arm"))]
+mod debug_console;
+mod fov;
 mod input;
+mod items;
+mod logging;
+mod needs;
 mod platform;
 mod render;
 mod save;
+mod skill;
 mod world;
 
 use std::io::Write;
@@ -13,17 +23,51 @@ use sdl2::rect::Rect;
 use sdl2::surface::Surface;
 
 use input::{Action, Input};
+use items::{ItemInstance, Pack};
+use needs::Needs;
 use render::{draw_glyph, load_atlas, CELL_SIZE};
-use save::{MetaSave, RunSave, SaveHeader};
-use world::{Inventory, Item, Position, Region, Tile, World};
+use save::{
+    ActionStepSave, ActiveActionSave, CellItemsSave, MetaSave, NeedsSave, RunSave, SaveHeader,
+    SkillSave, SkillsSave, TerrainMutationSave,
+};
+use skill::{Rng, Skill, SkillKind, Skills};
+use world::{
+    brightness_at, dawns_elapsed, Position, TerrainKind, ViewMode, World,
+    MULTI_TURN_GAME_SEC_PER_FRAME, TREE_TINT_VARIANTS, TREE_VARIANT_GLYPHS,
+};
 
 const WORLD_W: u32 = 40;
 const WORLD_H: u32 = 30;
-const ATLAS_PNG: &[u8] = include_bytes!("../assets/cp437_16x16.png");
+// Bundled character-set atlases. Player picks which one the binary loads
+// at boot via a plain-text `atlas.txt` in `save_dir` (one of: "cp437",
+// "aesomatica"). Missing / unrecognized → Cp437. See AtlasChoice below.
+const CP437_PNG: &[u8] = include_bytes!("../assets/cp437_16x16.png");
+const AESOMATICA_PNG: &[u8] = include_bytes!("../assets/Aesomatica_16x16.png");
+const ATLAS_CONFIG_FILE: &str = "atlas.txt";
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AtlasChoice {
+    Cp437,
+    Aesomatica,
+}
+
+impl AtlasChoice {
+    fn from_save_key(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "aesomatica" => Self::Aesomatica,
+            _ => Self::Cp437,
+        }
+    }
+
+    fn png_bytes(self) -> &'static [u8] {
+        match self {
+            Self::Cp437 => CP437_PNG,
+            Self::Aesomatica => AESOMATICA_PNG,
+        }
+    }
+}
 const META_FILE: &str = "meta.cbor";
 const RUN_FILE: &str = "run.cbor";
-const REEDS_REQUIRED: u32 = 3;
-const STARTER_OASIS_UNLOCK: &str = "starter_oasis";
 const TARGET_FRAME: Duration = Duration::from_micros(16_667);
 #[cfg(target_arch = "arm")]
 const SLEEP_GUARD: Duration = Duration::from_millis(10);
@@ -38,26 +82,132 @@ struct Cell {
     bg: Color,
 }
 
-struct Dialogue {
-    speaker: &'static str,
-    pages: Vec<&'static str>,
-    page: usize,
+/// Start-button pause-menu options. Render order = display order.
+const PAUSE_OPTIONS: &[(PauseAction, &str)] = &[
+    (PauseAction::Save, "Save"),
+    (PauseAction::Quit, "Quit to desktop"),
+    (PauseAction::ResetSave, "Delete save and reset"),
+    (PauseAction::GlyphPalette, "CP437 glyph palette (dev)"),
+];
+
+#[derive(Clone, Copy, PartialEq)]
+enum PauseAction {
+    Save,
+    Quit,
+    ResetSave,
+    GlyphPalette,
+}
+
+/// Phase 15 hold-Y radial overlay. Tap-Y (press+release within
+/// HOLD_THRESHOLD) opens the full vertical menu as before; holding Y
+/// past the threshold opens this 4-direction radial of common verbs,
+/// and pressing a dpad direction while held fires the bound verb and
+/// closes the overlay. Releasing Y without choosing a direction
+/// closes silently.
+const HOLD_THRESHOLD: Duration = Duration::from_millis(250);
+
+const RADIAL_BINDINGS: [(RadialDir, action::ActionId, &str); 4] = [
+    (RadialDir::Up, action::ActionId::Pickup, "Pickup"),
+    (RadialDir::Right, action::ActionId::EatRation, "Eat"),
+    (RadialDir::Down, action::ActionId::PickHerb, "Pick herb"),
+    (RadialDir::Left, action::ActionId::DrinkWaterskin, "Drink"),
+];
+
+#[derive(Clone, Copy, PartialEq)]
+enum RadialDir {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+/// Cause of death: whichever need hit 0 first. Priority order picks
+/// one when multiple zero out on the same tick (rare but possible).
+#[derive(Clone, Copy, Debug)]
+enum DeathCause {
+    Thirst,
+    Hunger,
+    Cold,
+    Exhaustion,
+}
+
+impl DeathCause {
+    fn from_needs(n: &Needs) -> Option<Self> {
+        if n.thirst == 0 {
+            Some(Self::Thirst)
+        } else if n.hunger == 0 {
+            Some(Self::Hunger)
+        } else if n.warmth == 0 {
+            Some(Self::Cold)
+        } else if n.sleep == 0 {
+            Some(Self::Exhaustion)
+        } else {
+            None
+        }
+    }
+
+    fn epitaph(self) -> &'static str {
+        match self {
+            Self::Thirst => "You died of thirst.",
+            Self::Hunger => "You died of starvation.",
+            Self::Cold => "You froze to death.",
+            Self::Exhaustion => "You died of exhaustion.",
+        }
+    }
+}
+
+/// Select-button info hub tabs. Display order = `INFO_TABS`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InfoTab {
+    Inventory,
+    Crafting,
+    Skills,
+}
+
+const INFO_TABS: &[InfoTab] = &[InfoTab::Inventory, InfoTab::Crafting, InfoTab::Skills];
+
+impl InfoTab {
+    fn label(self) -> &'static str {
+        match self {
+            InfoTab::Inventory => "Inventory",
+            InfoTab::Crafting => "Crafting",
+            InfoTab::Skills => "Skills",
+        }
+    }
+    fn index(self) -> usize {
+        INFO_TABS.iter().position(|&t| t == self).unwrap_or(0)
+    }
+    fn next(self) -> Self {
+        INFO_TABS[(self.index() + 1) % INFO_TABS.len()]
+    }
+    fn prev(self) -> Self {
+        INFO_TABS[(self.index() + INFO_TABS.len() - 1) % INFO_TABS.len()]
+    }
+}
+
+struct InfoMenuState {
+    tab: InfoTab,
+    /// Cursor row within the currently-active tab. Reset to 0 when the
+    /// tab changes.
+    selected: usize,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let save_dir = platform::save_dir();
-    eprintln!("save dir: {}", save_dir.display());
+    logging::init(&save_dir);
+    log_info!("save dir: {}", save_dir.display());
 
     let mut meta = match save::load_meta(&save_dir.join(META_FILE)) {
         Ok(m) => {
-            eprintln!(
+            log_info!(
                 "loaded meta save (counter={}, device={})",
-                m.header.save_counter, m.header.device_id
+                m.header.save_counter,
+                m.header.device_id
             );
             m
         }
         Err(e) => {
-            eprintln!("no meta save loaded ({}); starting fresh", e);
+            log_info!("no meta save loaded ({}); starting fresh", e);
             MetaSave::empty(SaveHeader::fresh(None))
         }
     };
@@ -69,7 +219,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let logical_h = WORLD_H * CELL_SIZE;
 
     let window = video
-        .window("Holy Land", logical_w, logical_h)
+        .window("Survival", logical_w, logical_h)
         .position_centered()
         .resizable()
         .build()?;
@@ -78,9 +228,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     canvas.set_logical_size(logical_w, logical_h)?;
     {
         let info = canvas.info();
-        eprintln!(
+        log_info!(
             "renderer: {} (flags={:#x}) max_texture={}x{}",
-            info.name, info.flags, info.max_texture_width, info.max_texture_height
+            info.name,
+            info.flags,
+            info.max_texture_width,
+            info.max_texture_height
         );
     }
 
@@ -90,7 +243,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // working pattern on Onion's libSDL2 (mmiyoo backend) — its renderer drops
     // every per-cell call.
     let texture_creator = canvas.texture_creator();
-    let mut atlas = load_atlas(ATLAS_PNG)?;
+    // Boot-time atlas pick. The config sits next to the binary (not in
+    // save_dir) — easy to find and edit. On Miyoo this lands at
+    // `App/HolyLand/atlas.txt`; on desktop, next to the built binary
+    // (e.g. `target/release/atlas.txt`). Bootstraps with "cp437" on
+    // first launch so the player has a discoverable file to edit later.
+    // Failures are silent; the game still runs.
+    let atlas_path = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(ATLAS_CONFIG_FILE);
+    if !atlas_path.exists() {
+        let _ = std::fs::write(&atlas_path, "cp437\n");
+    }
+    let atlas_choice = std::fs::read_to_string(&atlas_path)
+        .map(|s| AtlasChoice::from_save_key(&s))
+        .unwrap_or(AtlasChoice::Cp437);
+    log_info!("atlas: {:?} ({})", atlas_choice, atlas_path.display());
+    let mut atlas = load_atlas(atlas_choice.png_bytes())?;
     let mut framebuf = Surface::new(logical_w, logical_h, PixelFormatEnum::ARGB8888)?;
     let mut present_tex = texture_creator
         .create_texture_streaming(PixelFormatEnum::ARGB8888, logical_w, logical_h)?;
@@ -98,65 +269,211 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut events = sdl.event_pump()?;
     let mut input = Input::new();
     let mut world = World::new(WORLD_W, WORLD_H);
-    world.oasis_intro_complete = meta.oasis_intro_complete;
-    let mut loaded_run_header: Option<SaveHeader> = None;
+    world.ensure_player_ring();
+    let mut prev_meta_header = meta.header.clone();
+    let mut prev_run_header: Option<SaveHeader> = None;
 
     if let Ok(run) = save::load_run(&save_dir.join(RUN_FILE)) {
-        eprintln!(
-            "loaded run save (player at {},{}, region={})",
-            run.player_x, run.player_y, run.region
+        log_info!(
+            "loaded run save (player at {},{}, pack {}g, {} non-empty cells, clock {}s)",
+            run.player_x,
+            run.player_y,
+            run.pack.capacity_g,
+            run.cell_items.len(),
+            run.clock_seconds,
         );
-        loaded_run_header = Some(run.header.clone());
-        let restored_region = Region::from_save_key(&run.region).unwrap_or(Region::Oasis);
-        world.region = restored_region;
+        prev_run_header = Some(run.header.clone());
         world.set_player_pos(Position {
             x: run.player_x,
             y: run.player_y,
         });
-        // Build the inventory from the new field. If a pre-inventory save is
-        // mid-quest (no inventory data yet, intro not finished), seed from the
-        // legacy `reeds_harvested` counter so the player keeps their progress.
-        let mut inventory = Inventory::from_save(&run.inventory);
-        if inventory.is_empty() && !meta.oasis_intro_complete && run.reeds_harvested > 0 {
-            inventory.add(Item::Reed, run.reeds_harvested as u32);
+        // A pre-phase-3 save has no pack data (capacity_g == 0 and empty
+        // contents); keep the freshly-built starting pack in that case.
+        if run.pack.capacity_g > 0 || !run.pack.contents.is_empty() {
+            world.replace_player_pack(Pack::from_save(&run.pack));
         }
-        world.restore_oasis_state(&run.harvested_reeds, meta.oasis_intro_complete, inventory);
+        if !run.cell_items.is_empty() {
+            let snapshot: Vec<(i32, i32, Vec<ItemInstance>)> = run
+                .cell_items
+                .iter()
+                .map(|cs| {
+                    let items = cs
+                        .items
+                        .iter()
+                        .filter_map(ItemInstance::from_save)
+                        .collect();
+                    (cs.x, cs.y, items)
+                })
+                .collect();
+            world.restore_cell_items(snapshot);
+        }
+        // Phase-4 clock + needs. Legacy saves (pre-phase-4) write zeros for
+        // these defaults; treat zeros as "no data, keep starting state".
+        if run.clock_seconds > 0 {
+            world.clock_seconds = run.clock_seconds;
+        }
+        if run.needs.warmth > 0
+            || run.needs.thirst > 0
+            || run.needs.hunger > 0
+            || run.needs.sleep > 0
+        {
+            world.set_player_needs(Needs {
+                thirst: run.needs.thirst,
+                hunger: run.needs.hunger,
+                sleep: run.needs.sleep,
+                warmth: run.needs.warmth,
+                thirst_acc_secs: run.needs.thirst_acc_secs,
+                hunger_acc_secs: run.needs.hunger_acc_secs,
+                sleep_acc_secs: run.needs.sleep_acc_secs,
+                warmth_acc_secs: run.needs.warmth_acc_secs,
+            });
+        }
+        if !run.explored_cells.is_empty() {
+            world.restore_explored(&run.explored_cells);
+        }
+        // Phase-9 active-action restore: rehydrate the queue + view mode
+        // so a save mid-PitchTent resumes correctly. Steps with unknown
+        // ActionId strings are dropped silently (forward-compat).
+        if let Some(saved) = run.active_action.as_ref() {
+            let steps: Vec<(action::ActionId, u32)> = saved
+                .steps
+                .iter()
+                .filter_map(|s| {
+                    action::ActionId::from_save_key(&s.id).map(|id| (id, s.target_secs))
+                })
+                .collect();
+            if !steps.is_empty() {
+                world.queue_multi_turn(&steps);
+                // Restore elapsed counters for the current step (which
+                // queue_multi_turn just zeroed) and the view mode.
+                if let Some(active) = world.active_action.as_mut() {
+                    for (i, src) in saved.steps.iter().enumerate() {
+                        if let Some(dst) = active.steps.get_mut(i) {
+                            dst.elapsed_secs = src.elapsed_secs;
+                            dst.target_secs = src.target_secs;
+                        }
+                    }
+                    active.view_mode = match saved.view_mode.as_str() {
+                        "time_skip" => ViewMode::TimeSkip,
+                        _ => ViewMode::ProgressBar,
+                    };
+                }
+            }
+        }
+        // Phase-10 skills + RNG. Legacy saves leave SkillsSave at all-
+        // zero defaults; treat all-zero as "no data, keep the freshly
+        // built Skills::starting()" so loaded games don't suddenly
+        // start with Fire Making 0.
+        let saved_skill = run.skills.fire_making;
+        if saved_skill.value > 0 || saved_skill.daily_xp > 0 {
+            world.set_player_skills(Skills {
+                fire_making: Skill {
+                    value: saved_skill.value,
+                    daily_xp: saved_skill.daily_xp,
+                },
+            });
+        }
+        if run.rng_state != 0 {
+            world.rng = Rng::from_state(run.rng_state);
+        }
+        // Phase-11b: restore terrain mutations (chopped trees, etc.)
+        // after chunkgen has produced the chunk defaults.
+        if !run.terrain_mutations.is_empty() {
+            let snapshot: Vec<(i32, i32, world::TerrainKind)> = run
+                .terrain_mutations
+                .iter()
+                .filter_map(|tm| world::TerrainKind::from_save_key(&tm.kind).map(|k| (tm.x, tm.y, k)))
+                .collect();
+            world.restore_terrain_mutations(snapshot);
+        }
+        // After restoring position, ensure the chunk ring around the
+        // loaded player coord is in memory — otherwise the first FOV
+        // cast on a non-origin load would see all-Wall around the player.
+        world.ensure_player_ring();
+        // Recompute FOV after restoring position so the visible set is
+        // correct for the loaded clock + player coord. (World::new already
+        // did a recompute, but the loaded position may differ.)
+        world.recompute_fov();
     }
 
+    // Track dawn crossings for auto-save-on-dawn. Init from the (possibly
+    // loaded) clock so a loaded save mid-day doesn't immediately re-save.
+    let mut last_dawn_idx = dawns_elapsed(world.clock_seconds);
+
+    // Tap-Y command menu state. None = closed; Some(i) = open, with row i
+    // selected. Phase 15 adds the hold-Y radial overlay alongside this.
+    let mut command_menu: Option<usize> = None;
+
+    // Start-button pause menu (Save / Quit / Delete-save-and-reset). When
+    // open, every other input mode is suspended and multi-turn actions
+    // stop ticking. Replaces the previous "Start quits immediately".
+    let mut pause_menu: Option<usize> = None;
+
+    // Select-button info hub: tabbed read-only overlay. L/R cycle
+    // between tabs (Inventory, Skills, ... extensible). View-only for
+    // now; drop / examine verbs hook off the selected row in future
+    // phases.
+    let mut info_menu: Option<InfoMenuState> = None;
+
+    // Phase 14 death gate. Set when player_needs().is_dead() flips
+    // true (any need at 0 with DEATH_ENABLED on). Highest input
+    // priority — blocks all other modes. A=new run, Start=quit.
+    let mut dead: Option<DeathCause> = None;
+
+    // Phase 15 hold-Y radial. y_press_at is set on the press edge
+    // (detected per-frame by watching input.is_held(Y) transition).
+    // If Y stays held past HOLD_THRESHOLD, radial_open flips true; a
+    // dpad press while radial_open fires the bound verb, closes the
+    // radial, and sets radial_consumed so the eventual Y release
+    // doesn't ALSO open the vertical menu (the tap-fallback). A quick
+    // press+release (Y up before HOLD_THRESHOLD, no direction chosen)
+    // = tap = open vertical menu.
+    let mut y_press_at: Option<Instant> = None;
+    let mut radial_open: bool = false;
+    let mut radial_consumed: bool = false;
+
+    // Dev tool: X-button toggles a CP437 glyph palette overlay so we
+    // can audit which bytes have which sprites in our custom atlas.
+    // Browse with dpad; the header shows the highlighted byte's value
+    // so we can pick replacements for the items.rs / world.rs glyph
+    // fields.
+    let mut glyph_palette: Option<u8> = None;
+
+    #[cfg(not(target_arch = "arm"))]
+    let debug = debug_console::DebugConsole::spawn();
+
     let palette = Palette::default();
-    let mut prev_meta_header = meta.header.clone();
-    let mut prev_run_header: Option<SaveHeader> = loaded_run_header;
 
     // B-style per-cell diff renderer. `prev_cells` mirrors what we last painted
     // into `framebuf`; each frame we recompute the visible cells and only blit
     // the ones that differ. None entries force a paint on the first frame.
+    //
+    // CDDA follow-cam: when the camera shifts, we memmove the CPU framebuffer
+    // by the same offset and shift `prev_cells` to match, so the "diff" loop
+    // only repaints newly-revealed edge cells. The shifted texture must then
+    // be uploaded full-rect (the streaming texture has no equivalent memmove).
+    // See plan: ~/.claude/plans/lets-start-planning-our-dynamic-starfish.md.
     let viewport_cells = (WORLD_W * WORLD_H) as usize;
     let mut prev_cells: Vec<Option<Cell>> = vec![None; viewport_cells];
     let _ = framebuf.fill_rect(None, palette.letterbox);
 
+    // Tracked across frames so each frame can compute (dx, dy) cell deltas
+    // for the scroll-shift path. Initialised to a sentinel that forces the
+    // first frame to fall through the non-scroll path (cam_x == cam_x_prev).
+    let mut cam_x_prev: i64 = (world.player_pos().x as i64) - WORLD_W as i64 / 2;
+    let mut cam_y_prev: i64 = (world.player_pos().y as i64) - WORLD_H as i64 / 2;
+
     let mut fps_count: u32 = 0;
     let mut fps_window = Instant::now();
     let mut timing_accum = FrameTiming::default();
-    let mut dialogue: Option<Dialogue> = if world.oasis_intro_complete || world.region != Region::Oasis {
-        None
-    } else {
-        Some(Dialogue::new(
-            "Oasis Keeper",
-            vec!["The well is choked with reeds. Cut three and bring them back."],
-        ))
-    };
-    let mut inventory_open = false;
     let mut prev_frame: Option<Instant> = None;
 
     'main: loop {
         let frame_start = Instant::now();
-        let dt = prev_frame
+        let _dt = prev_frame
             .map(|p| frame_start.saturating_duration_since(p))
             .unwrap_or_default();
         prev_frame = Some(frame_start);
-        if world.region == Region::Oasis {
-            world.tick_oasis(dt);
-        }
 
         for event in events.poll_iter() {
             match event {
@@ -166,90 +483,465 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         input.poll_gamepad();
 
-        for action in input.drain() {
-            if inventory_open {
-                match action {
-                    Action::Y | Action::B => inventory_open = false,
-                    Action::Start => break 'main,
-                    _ => {}
+        // Hold-Y radial detection (phase 15). Watch the press/release
+        // edges of Y via is_held; the queued press events go through
+        // the input loop below as usual but the Y key itself is
+        // suppressed there so this state machine owns the menu open
+        // semantics for Y.
+        let y_held = input.is_held(Action::Y);
+        if y_press_at.is_none() && y_held {
+            // Press edge.
+            y_press_at = Some(frame_start);
+            radial_open = false;
+            radial_consumed = false;
+        } else if y_press_at.is_some() && !y_held {
+            // Release edge.
+            if !radial_open && !radial_consumed {
+                // Quick tap with no direction chosen -> open vertical
+                // menu (preserves the existing tap-Y behavior).
+                if command_menu.is_none() && pause_menu.is_none() && dead.is_none() {
+                    command_menu = Some(0);
                 }
+            }
+            y_press_at = None;
+            radial_open = false;
+            radial_consumed = false;
+        } else if let Some(t0) = y_press_at {
+            // Still held; promote to radial once past threshold and
+            // no higher-priority mode is on screen.
+            if !radial_open
+                && frame_start.saturating_duration_since(t0) >= HOLD_THRESHOLD
+                && pause_menu.is_none()
+                && dead.is_none()
+                && command_menu.is_none()
+            {
+                radial_open = true;
+            }
+        }
+
+        for input_action in input.drain() {
+            // Y press events are owned by the hold-Y radial state
+            // machine above; drop them here so they don't double-fire
+            // any menu open.
+            if input_action == Action::Y {
                 continue;
             }
 
-            if dialogue.is_some() {
-                match action {
-                    Action::A => {
-                        if let Some(d) = dialogue.as_mut() {
-                            if d.advance() {
-                                dialogue = None;
+            // Radial overlay (phase 15). Active while Y is held past
+            // HOLD_THRESHOLD. Dpad direction fires the bound verb and
+            // closes; everything else is dropped (so the player
+            // doesn't accidentally walk while choosing).
+            if radial_open {
+                let dir = match input_action {
+                    Action::Up => Some(RadialDir::Up),
+                    Action::Down => Some(RadialDir::Down),
+                    Action::Left => Some(RadialDir::Left),
+                    Action::Right => Some(RadialDir::Right),
+                    _ => None,
+                };
+                if let Some(d) = dir {
+                    if let Some((_, id, name)) =
+                        RADIAL_BINDINGS.iter().find(|(rd, _, _)| *rd == d)
+                    {
+                        match action::evaluate(&world, *id) {
+                            action::Availability::Available { .. } => {
+                                let action::ExecuteOutcome::Done(msg) =
+                                    action::execute(&mut world, *id);
+                                log_info!("[radial] {}", msg);
+                            }
+                            action::Availability::Unavailable { reason } => {
+                                log_info!("[radial] can't '{}': {}", name, reason);
                             }
                         }
                     }
-                    Action::Y => inventory_open = true,
+                    radial_open = false;
+                    radial_consumed = true;
+                }
+                continue;
+            }
+
+            // Death gate: highest-priority mode once the player has
+            // expired. Only A (new run) and Start (quit) do anything;
+            // everything else is silently dropped so the player can't
+            // wander off the death screen by accident.
+            if dead.is_some() {
+                match input_action {
+                    Action::A => {
+                        let _ = std::fs::remove_file(save_dir.join(RUN_FILE));
+                        world = World::new(WORLD_W, WORLD_H);
+                        prev_run_header = None;
+                        last_dawn_idx = dawns_elapsed(world.clock_seconds);
+                        command_menu = None;
+                        info_menu = None;
+                        dead = None;
+                        log_info!("[death] new run started");
+                    }
                     Action::Start => break 'main,
-                    Action::Select => save_game(
-                        &save_dir,
-                        &mut meta,
-                        &world,
-                        &mut prev_meta_header,
-                        &mut prev_run_header,
-                    ),
                     _ => {}
                 }
                 continue;
             }
 
-            let pre_region = world.region;
-            let mut world_action = true;
-            match action {
+            // Pause menu is the highest-priority input mode below the
+            // death gate. While open, every other state (active_action,
+            // command_menu, world) is frozen. Multi-turn actions also
+            // stop ticking — see the "if pause_menu.is_none()" guard
+            // further down.
+            if let Some(selected) = pause_menu {
+                let count = PAUSE_OPTIONS.len();
+                match input_action {
+                    Action::Up => {
+                        pause_menu = Some(selected.saturating_sub(1));
+                    }
+                    Action::Down => {
+                        pause_menu = Some((selected + 1).min(count - 1));
+                    }
+                    Action::A => {
+                        let (chosen, _) = PAUSE_OPTIONS[selected];
+                        match chosen {
+                            PauseAction::Save => {
+                                save_game(
+                                    &save_dir,
+                                    &mut meta,
+                                    &world,
+                                    &mut prev_meta_header,
+                                    &mut prev_run_header,
+                                );
+                                pause_menu = None;
+                            }
+                            PauseAction::Quit => break 'main,
+                            PauseAction::ResetSave => {
+                                let _ = std::fs::remove_file(save_dir.join(META_FILE));
+                                let _ = std::fs::remove_file(save_dir.join(RUN_FILE));
+                                world = World::new(WORLD_W, WORLD_H);
+                                meta = MetaSave::empty(SaveHeader::fresh(None));
+                                prev_meta_header = meta.header.clone();
+                                prev_run_header = None;
+                                last_dawn_idx = dawns_elapsed(world.clock_seconds);
+                                command_menu = None;
+                                pause_menu = None;
+                                log_info!("[menu] save deleted; in-memory state reset");
+                            }
+                            PauseAction::GlyphPalette => {
+                                pause_menu = None;
+                                glyph_palette = Some(0);
+                            }
+                        }
+                    }
+                    Action::B | Action::Start => {
+                        pause_menu = None;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            // Dev glyph-palette overlay (X). Highest non-pause priority
+            // so it overlays whatever else is open.
+            if let Some(cursor) = glyph_palette {
+                match input_action {
+                    Action::Up => glyph_palette = Some(cursor.wrapping_sub(16)),
+                    Action::Down => glyph_palette = Some(cursor.wrapping_add(16)),
+                    Action::Left => glyph_palette = Some(cursor.wrapping_sub(1)),
+                    Action::Right => glyph_palette = Some(cursor.wrapping_add(1)),
+                    Action::B => glyph_palette = None,
+                    Action::Start => pause_menu = Some(0),
+                    _ => {}
+                }
+                continue;
+            }
+
+            // Info hub (Select). Tabbed, read-only for slice 1.
+            // L/R cycle tabs, dpad navigates within the current tab,
+            // B/Select closes. Sits between pause menu and command
+            // menu in priority.
+            if let Some(ref mut state) = info_menu {
+                let row_count = info_tab_row_count(&world, state.tab);
+                match input_action {
+                    Action::L => {
+                        state.tab = state.tab.prev();
+                        state.selected = 0;
+                    }
+                    Action::R => {
+                        state.tab = state.tab.next();
+                        state.selected = 0;
+                    }
+                    Action::Up => {
+                        if row_count > 0 {
+                            state.selected = state.selected.saturating_sub(1);
+                        }
+                    }
+                    Action::Down => {
+                        if row_count > 0 {
+                            state.selected = (state.selected + 1).min(row_count - 1);
+                        }
+                    }
+                    Action::A => {
+                        // Only the Crafting tab consumes A (queues a
+                        // recipe); Inventory and Skills are read-only.
+                        if state.tab == InfoTab::Crafting {
+                            if let Some(recipe) = crafting::RECIPES.get(state.selected) {
+                                match action::evaluate(&world, recipe.action) {
+                                    action::Availability::Available { .. } => {
+                                        let action::ExecuteOutcome::Done(msg) =
+                                            action::execute(&mut world, recipe.action);
+                                        log_info!("[craft] {}", msg);
+                                        info_menu = None;
+                                    }
+                                    action::Availability::Unavailable { reason } => {
+                                        log_info!(
+                                            "[craft] can't '{}': {}",
+                                            recipe.name,
+                                            reason
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Action::B | Action::Select => {
+                        info_menu = None;
+                    }
+                    Action::Start => {
+                        pause_menu = Some(0);
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            // Multi-turn-action mode: world is auto-ticking the queued
+            // verb. The only inputs that mean anything are B (cancel),
+            // Select (toggle view mode), and Start (open pause menu).
+            // Everything else is dropped so the player can't move/menu
+            // mid-pitch.
+            if world.active_action.is_some() {
+                match input_action {
+                    Action::B => {
+                        world.cancel_multi_turn();
+                        log_info!("[action] cancelled");
+                    }
+                    Action::Select => {
+                        world.toggle_multi_turn_view();
+                        let mode = world
+                            .active_action
+                            .as_ref()
+                            .map(|a| a.view_mode)
+                            .unwrap_or(ViewMode::ProgressBar);
+                        log_info!("[action] view mode = {:?}", mode);
+                    }
+                    Action::Start => {
+                        pause_menu = Some(0);
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            // Menu mode: dpad navigates, A confirms (if available), B/Y
+            // closes. Everything else is dropped so the world doesn't tick
+            // while the player is browsing the catalog.
+            if let Some(selected) = command_menu {
+                match input_action {
+                    Action::Up => {
+                        command_menu = Some(selected.saturating_sub(1));
+                    }
+                    Action::Down => {
+                        let max = action::ALL_ACTIONS.len().saturating_sub(1);
+                        command_menu = Some((selected + 1).min(max));
+                    }
+                    Action::A => {
+                        let id = action::ALL_ACTIONS[selected].id;
+                        match action::evaluate(&world, id) {
+                            action::Availability::Available { .. } => {
+                                let action::ExecuteOutcome::Done(msg) =
+                                    action::execute(&mut world, id);
+                                log_info!("[menu] {}", msg);
+                                command_menu = None;
+                            }
+                            action::Availability::Unavailable { reason } => {
+                                // Stay open so the player can pick another.
+                                log_info!(
+                                    "[menu] can't '{}': {}",
+                                    action::ALL_ACTIONS[selected].name,
+                                    reason
+                                );
+                            }
+                        }
+                    }
+                    Action::B => {
+                        command_menu = None;
+                    }
+                    Action::Start => {
+                        pause_menu = Some(0);
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            match input_action {
                 Action::Up => world.try_move_player(0, -1),
                 Action::Down => world.try_move_player(0, 1),
                 Action::Left => world.try_move_player(-1, 0),
                 Action::Right => world.try_move_player(1, 0),
-                Action::A => handle_interaction(&mut world, &mut meta, &mut dialogue),
-                Action::Y => {
-                    inventory_open = true;
-                    world_action = false;
+                Action::A => {
+                    // Route through the same dispatcher the command
+                    // menu uses so Pickup's cost + side-effects stay
+                    // in one place (action.rs).
+                    let action::ExecuteOutcome::Done(msg) =
+                        action::execute(&mut world, action::ActionId::Pickup);
+                    log_debug!("{}", msg);
                 }
-                Action::Start => break 'main,
+                Action::Start => {
+                    pause_menu = Some(0);
+                }
                 Action::Select => {
-                    save_game(
-                        &save_dir,
-                        &mut meta,
-                        &world,
-                        &mut prev_meta_header,
-                        &mut prev_run_header,
-                    );
-                    world_action = false;
+                    info_menu = Some(InfoMenuState {
+                        tab: InfoTab::Inventory,
+                        selected: 0,
+                    });
                 }
-                _ => {
-                    world_action = false;
-                }
-            }
-            // Only tick the wilderness when the player took a world-affecting
-            // action *from inside* the wilderness. A portal step transitions
-            // them in but doesn't burn a tick on the destination.
-            if world_action
-                && pre_region == Region::Wilderness
-                && world.region == Region::Wilderness
-            {
-                world.tick_wilderness();
+                _ => {}
             }
         }
 
-        // Camera in world coords. While the world fits the viewport we anchor
-        // at (0, 0); when the world grows beyond the viewport, switch this to
-        //   let cam_x = player.x as i64 - WORLD_W as i64 / 2;
-        //   let cam_y = player.y as i64 - WORLD_H as i64 / 2;
-        // and the renderer below stays unchanged.
-        let cam_x: i64 = 0;
-        let cam_y: i64 = 0;
+        // Multi-turn action tick. Runs per-frame; advance rate depends
+        // on view_mode. Completed steps trigger action::complete_step
+        // (which fires the verb's consume-from-pack and structure-place
+        // effects). Interrupts (need < critical threshold) cancel the
+        // entire queue. Pause menu blocks ticking so the world stops
+        // when the player opens the menu mid-pitch.
+        let multi_view = world.active_action.as_ref().map(|a| a.view_mode);
+        if pause_menu.is_none() && dead.is_none() {
+            if let Some(view_mode) = multi_view {
+                let advance = match view_mode {
+                    ViewMode::ProgressBar => MULTI_TURN_GAME_SEC_PER_FRAME,
+                    ViewMode::TimeSkip => world
+                        .active_action
+                        .as_ref()
+                        .map(|a| a.total_remaining_secs())
+                        .unwrap_or(0),
+                };
+                let result = world.tick_multi_turn(advance);
+                for step_id in result.completed_steps {
+                    if let Some(msg) = action::complete_step(&mut world, step_id) {
+                        log_info!("[action] {}", msg);
+                    }
+                }
+                if result.interrupted {
+                    log_info!("[action] interrupted (need critical)");
+                }
+            }
+        }
+
+        #[cfg(not(target_arch = "arm"))]
+        debug.drain(|cmd| debug_console::apply_debug_command(&mut world, cmd));
+
+        // Death detection. Runs after action+tick so an action that
+        // pushed a need to 0 surfaces this frame. is_dead() is the
+        // gate (honors DEATH_ENABLED); from_needs picks which need
+        // killed us for the epitaph. Cancel any active multi-turn
+        // queue so the death overlay isn't competing with a ticking
+        // pitch-tent banner.
+        if dead.is_none() {
+            let needs_now = world.player_needs();
+            if needs_now.is_dead() {
+                if let Some(cause) = DeathCause::from_needs(&needs_now) {
+                    if world.active_action.is_some() {
+                        world.cancel_multi_turn();
+                    }
+                    command_menu = None;
+                    info_menu = None;
+                    log_info!("[death] {:?}", cause);
+                    dead = Some(cause);
+                }
+            }
+        }
+
+        // Auto-save on dawn crossing. Detects forward crossings via
+        // `dawns_elapsed` increments. Debug commands can rewind time, in
+        // which case we silently resync without firing save (and the
+        // subsequent forward crossing fires normally).
+        let now_dawn_idx = dawns_elapsed(world.clock_seconds);
+        if now_dawn_idx > last_dawn_idx {
+            log_info!(
+                "auto-save: crossed dawn (day {} -> {})",
+                last_dawn_idx,
+                now_dawn_idx
+            );
+            // Daily skill-XP caps reset at each dawn so the player can
+            // train each skill again. Reset before saving so the save
+            // captures the post-reset state.
+            let mut skills = world.player_skills();
+            skills.reset_daily_caps();
+            world.set_player_skills(skills);
+            save_game(
+                &save_dir,
+                &mut meta,
+                &world,
+                &mut prev_meta_header,
+                &mut prev_run_header,
+            );
+        }
+        last_dawn_idx = now_dawn_idx;
+
+        // Camera in world coords — player-centered follow-cam. The viewport
+        // top-left in world coords is (player - half_viewport); the player
+        // always appears at the center cell of the viewport.
         let player = world.player_pos();
         let pwx = player.x as i64;
         let pwy = player.y as i64;
-        let in_oasis = world.region == Region::Oasis;
-        let keeper = world.keeper_pos();
-        let ui_cells = build_ui_cells(&world, dialogue.as_ref(), inventory_open, &palette);
+        let cam_x: i64 = pwx - WORLD_W as i64 / 2;
+        let cam_y: i64 = pwy - WORLD_H as i64 / 2;
+
+        // Detect camera shift for the scroll-blit path below.
+        let dx_cells = (cam_x - cam_x_prev) as i32;
+        let dy_cells = (cam_y - cam_y_prev) as i32;
+        let scrolled = dx_cells != 0 || dy_cells != 0;
+        if scrolled {
+            shift_framebuffer(&mut framebuf, dx_cells, dy_cells);
+            shift_prev_cells(&mut prev_cells, WORLD_W, WORLD_H, dx_cells, dy_cells);
+        }
+        cam_x_prev = cam_x;
+        cam_y_prev = cam_y;
+        let needs = world.player_needs();
+        let (clock_h, clock_m) = world.clock_hm();
+        let day = world.day_count();
+        let is_night = world.is_night();
+        let tint = brightness_at(world.clock_seconds);
+        let player_skills = world.player_skills();
+        let mut ui_cells = build_ui_cells(
+            &palette,
+            needs,
+            day,
+            clock_h,
+            clock_m,
+            is_night,
+            player_skills,
+        );
+        draw_here_line(&mut ui_cells, &world, &palette);
+        if let Some(active) = world.active_action.as_ref() {
+            draw_multi_turn_banner(&mut ui_cells, active, &palette);
+        }
+        if let Some(selected) = command_menu {
+            draw_command_menu(&mut ui_cells, &world, selected, &palette);
+        }
+        if let Some(state) = info_menu.as_ref() {
+            draw_info_menu(&mut ui_cells, &world, state, &palette);
+        }
+        if let Some(cursor) = glyph_palette {
+            draw_glyph_palette(&mut ui_cells, cursor, &palette);
+        }
+        if radial_open {
+            draw_radial_menu(&mut ui_cells, &world, &palette);
+        }
+        if let Some(selected) = pause_menu {
+            draw_pause_menu(&mut ui_cells, selected, &palette);
+        }
+        if let Some(cause) = dead {
+            draw_death_screen(&mut ui_cells, cause, &palette);
+        }
 
         let draw_start = Instant::now();
         let mut changed_cells = 0;
@@ -261,21 +953,122 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for vx in 0..WORLD_W as i32 {
                 let wx = cam_x + vx as i64;
                 let wy = cam_y + vy as i64;
-                let portal_glyph = if in_oasis { b'>' } else { b'<' };
-                let (mut glyph, mut fg, bg) = match world.tile_at(wx, wy) {
-                    Tile::Floor => (b'.', palette.floor_fg, palette.floor_bg),
-                    Tile::Wall => (b'#', palette.wall_fg, palette.wall_bg),
-                    Tile::Portal => (portal_glyph, palette.portal_fg, palette.floor_bg),
+                // Base terrain glyph via TerrainDef (one source of truth
+                // for glyph + fg + bg per kind; see world.rs).
+                let terrain = world.tile_at(wx, wy);
+                let terrain_def = terrain.def();
+                let mut glyph = terrain_def.glyph;
+                // Per-cell color gradient for walkable terrain: small
+                // hash-driven RGB offset on fg+bg so the floor reads as
+                // organic texture rather than a flat region. Unwalkable
+                // terrain (trees, water) stays flat-saturated so it
+                // pierces the floor as a visual landmark.
+                let apply_gradient =
+                    matches!(terrain, TerrainKind::Grass | TerrainKind::BareDirt | TerrainKind::SandShore);
+                let (fg_arr, bg_arr) = if apply_gradient {
+                    floor_with_gradient(terrain_def, wx as i32, wy as i32, world.seed)
+                } else {
+                    (terrain_def.fg, terrain_def.bg)
                 };
-                if wx == pwx && wy == pwy {
-                    glyph = b'@';
-                    fg = palette.player_fg;
-                } else if in_oasis && wx == keeper.x as i64 && wy == keeper.y as i64 {
-                    glyph = b'&';
-                    fg = palette.keeper_fg;
-                } else if in_oasis && world.is_unharvested_reed_at(wx as i32, wy as i32) {
-                    glyph = b'"';
-                    fg = palette.reed_fg;
+                let mut fg = Color::RGB(fg_arr[0], fg_arr[1], fg_arr[2]);
+                let bg = Color::RGB(bg_arr[0], bg_arr[1], bg_arr[2]);
+                // Sparse grass tufts: hash-driven so ~25% of grass
+                // cells show the 0x9C tuft sprite; the rest render as
+                // blank background. Deterministic across reloads via
+                // world.seed.
+                if terrain == TerrainKind::Grass
+                    && !grass_dot_visible(wx as i32, wy as i32, world.seed)
+                {
+                    glyph = b' ';
+                }
+                // Per-cell tree-variant pick from TREE_VARIANT_GLYPHS
+                // so the forest has visual variety instead of a row of
+                // identical spades. Tint is also picked per-cell from
+                // TREE_TINT_VARIANTS so adjacent trees have slightly
+                // different greens (with the occasional autumn-brown).
+                if terrain == TerrainKind::TreeTrunk {
+                    let gi = tree_variant_index(wx as i32, wy as i32, world.seed);
+                    glyph = TREE_VARIANT_GLYPHS[gi % TREE_VARIANT_GLYPHS.len()];
+                    let ci = tree_tint_index(wx as i32, wy as i32, world.seed);
+                    let t = TREE_TINT_VARIANTS[ci % TREE_TINT_VARIANTS.len()];
+                    fg = Color::RGB(t[0], t[1], t[2]);
+                }
+                let cell_state = world.cell_at(wx, wy);
+                let visible = cell_state.map(|c| c.visible).unwrap_or(false);
+                let explored = cell_state.map(|c| c.explored).unwrap_or(false);
+                let light_intensity = cell_state.map(|c| c.light_intensity).unwrap_or(0);
+
+                // Items + player only render when the cell is currently
+                // visible. Memory of explored-but-unseen cells shows
+                // terrain only.
+                if visible {
+                    if let Some(top) = cell_state.and_then(|c| c.items.last()) {
+                        // Lit fires override the kind's default glyph so
+                        // a lit-firewood reads as fire (orange '*') rather
+                        // than a wood pile ('=' brown).
+                        let (g, [r, gn, b]) = match top.metadata {
+                            items::ItemMetadata::Lit { .. } => (b'*', [230, 140, 60]),
+                            _ => top.kind.glyph_color(),
+                        };
+                        glyph = g;
+                        // Blendable items mix their fg ~45% toward the
+                        // (per-cell-gradiented) terrain fg, so twigs /
+                        // grass / moss / mud read as part of the floor
+                        // texture. Stones / firewood / herbs / tools
+                        // stay full-saturation and pierce the floor.
+                        let is_blendable =
+                            !matches!(top.metadata, items::ItemMetadata::Lit { .. })
+                                && top.kind.def().blends_with_terrain;
+                        fg = if is_blendable {
+                            blend_to_terrain([r, gn, b], fg_arr, 0.45)
+                        } else {
+                            Color::RGB(r, gn, b)
+                        };
+                    }
+                    if wx == pwx && wy == pwy {
+                        glyph = b'@';
+                        fg = palette.player_fg;
+                    }
+                }
+
+                // Three visibility levels modulate brightness:
+                //   visible:   full color + day/night tint
+                //   explored:  fixed dim (25%) regardless of clock
+                //   neither:   black
+                let cell_brightness = if visible {
+                    tint
+                } else if explored {
+                    0.25
+                } else {
+                    0.0
+                };
+                // Light-source contribution at night: cells inside a
+                // lit disc get BOTH a brightness boost (so a fire-lit
+                // cell isn't dim) AND a warm yellow blend, each scaled
+                // by per-cell intensity. Intensity falls off linearly
+                // with distance to the source, so the disc gradients
+                // from bright-warm at the source to dark-cold at the
+                // edge instead of being a uniform patch.
+                //
+                // The boost adds to brightness BEFORE the scalar dim
+                // multiply (otherwise night's 0.4 floor would crush
+                // the warm color back to grey).
+                const LIGHT_TINT: [u8; 3] = [255, 200, 100];
+                const LIGHT_BRIGHTNESS_BOOST_MAX: f32 = 0.6;
+                const LIGHT_TINT_MIX_MAX: f32 = 0.5;
+                let light = if is_night && visible {
+                    light_intensity as f32 / 255.0
+                } else {
+                    0.0
+                };
+                let effective_brightness =
+                    (cell_brightness + light * LIGHT_BRIGHTNESS_BOOST_MAX).min(1.0);
+                let mut fg = tint_color(fg, effective_brightness);
+                let mut bg = tint_color(bg, effective_brightness);
+                if light > 0.0 {
+                    let mix = light * LIGHT_TINT_MIX_MAX;
+                    fg = blend_to_terrain(LIGHT_TINT, [fg.r, fg.g, fg.b], mix);
+                    bg = blend_to_terrain(LIGHT_TINT, [bg.r, bg.g, bg.b], mix);
                 }
                 let mut cell = Cell { glyph, fg, bg };
                 let i = (vy as u32 * WORLD_W + vx as u32) as usize;
@@ -297,7 +1090,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         timing_accum.changed_cells += changed_cells;
 
         let upload_start = Instant::now();
-        if changed_cells > 0 {
+        if scrolled {
+            // Scroll frame: the CPU surface contents shifted in-place via
+            // shift_framebuffer, but the streaming texture's contents
+            // haven't moved. Re-upload the whole framebuffer so the
+            // texture matches. Edge-strip blits and any in-place cell
+            // changes are already baked into `framebuf` by the compose
+            // loop above.
+            let pitch = framebuf.pitch() as usize;
+            let pixels = framebuf.without_lock().expect("CPU surface");
+            present_tex.update(None, pixels, pitch)?;
+        } else if changed_cells > 0 {
             let dirty = Rect::new(
                 dirty_min_x * CELL_SIZE as i32,
                 dirty_min_y * CELL_SIZE as i32,
@@ -327,72 +1130,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         fps_count += 1;
         if fps_window.elapsed() >= TIMING_LOG_INTERVAL {
-            eprintln!("fps: {}", fps_count);
-            eprintln!("{}", timing_accum.summary());
+            log_verbose!("fps: {}", fps_count);
+            log_verbose!("{}", timing_accum.summary());
             fps_count = 0;
             fps_window = Instant::now();
             timing_accum = FrameTiming::default();
         }
     }
 
-    eprintln!("shutdown: exiting Holy Land main loop");
+    log_info!("shutdown: exiting Survival main loop");
     let _ = std::io::stderr().flush();
     Ok(())
-}
-
-impl Dialogue {
-    fn new(speaker: &'static str, pages: Vec<&'static str>) -> Self {
-        Self {
-            speaker,
-            pages,
-            page: 0,
-        }
-    }
-
-    fn text(&self) -> &'static str {
-        self.pages[self.page]
-    }
-
-    fn advance(&mut self) -> bool {
-        self.page += 1;
-        self.page >= self.pages.len()
-    }
-}
-
-fn handle_interaction(world: &mut World, meta: &mut MetaSave, dialogue: &mut Option<Dialogue>) {
-    if world.player_is_adjacent_to_keeper() {
-        if world.oasis_intro_complete {
-            *dialogue = Some(Dialogue::new(
-                "Oasis Keeper",
-                vec!["Small work keeps a place alive."],
-            ));
-        } else if world.reed_count() >= REEDS_REQUIRED {
-            world.consume_reeds(REEDS_REQUIRED);
-            complete_starter_oasis(world, meta);
-            *dialogue = Some(Dialogue::new(
-                "Oasis Keeper",
-                vec!["Good. The oasis can breathe again."],
-            ));
-        } else {
-            *dialogue = Some(Dialogue::new(
-                "Oasis Keeper",
-                vec!["Bring me three reeds from the water's edge."],
-            ));
-        }
-    } else if world.try_harvest_reed_near_player() {
-        *dialogue = Some(Dialogue::new("Reeds", vec!["You cut a bundle of reeds."]));
-    }
-}
-
-fn complete_starter_oasis(world: &mut World, meta: &mut MetaSave) {
-    world.oasis_intro_complete = true;
-    if !meta.oasis_intro_complete {
-        meta.oasis_intro_complete = true;
-        meta.xp += 1;
-    }
-    if !meta.unlocks.iter().any(|u| u == STARTER_OASIS_UNLOCK) {
-        meta.unlocks.push(STARTER_OASIS_UNLOCK.to_string());
-    }
 }
 
 fn save_game(
@@ -402,16 +1150,15 @@ fn save_game(
     prev_meta_header: &mut SaveHeader,
     prev_run_header: &mut Option<SaveHeader>,
 ) {
-    meta.oasis_intro_complete = world.oasis_intro_complete;
     let new_meta_header = SaveHeader::fresh(Some(prev_meta_header));
     let mut next_meta = meta.clone();
     next_meta.header = new_meta_header.clone();
     if let Err(e) = save::save_atomic(&save_dir.join(META_FILE), &next_meta) {
-        eprintln!("meta save failed: {}", e);
+        log_info!("meta save failed: {}", e);
     } else {
         *meta = next_meta;
         *prev_meta_header = new_meta_header;
-        eprintln!("meta saved (counter={})", prev_meta_header.save_counter);
+        log_debug!("meta saved (counter={})", prev_meta_header.save_counter);
     }
 
     let pos = world.player_pos();
@@ -419,132 +1166,911 @@ fn save_game(
     let mut run = RunSave::empty(new_run_header.clone());
     run.player_x = pos.x;
     run.player_y = pos.y;
-    run.reeds_harvested = 0;
-    run.harvested_reeds = world.harvested_reeds();
-    run.inventory = world.inventory.to_save();
-    run.region = world.region.save_key().to_string();
+    run.pack = world.player_pack().to_save();
+    run.cell_items = world
+        .snapshot_cell_items()
+        .into_iter()
+        .map(|(x, y, items)| CellItemsSave {
+            x,
+            y,
+            items: items.iter().map(|i| i.to_save()).collect(),
+        })
+        .collect();
+    run.clock_seconds = world.clock_seconds;
+    let n = world.player_needs();
+    run.needs = NeedsSave {
+        thirst: n.thirst,
+        hunger: n.hunger,
+        sleep: n.sleep,
+        warmth: n.warmth,
+        thirst_acc_secs: n.thirst_acc_secs,
+        hunger_acc_secs: n.hunger_acc_secs,
+        sleep_acc_secs: n.sleep_acc_secs,
+        warmth_acc_secs: n.warmth_acc_secs,
+    };
+    run.explored_cells = world.snapshot_explored();
+    let player_skills = world.player_skills();
+    run.skills = SkillsSave {
+        fire_making: SkillSave {
+            value: player_skills.fire_making.value,
+            daily_xp: player_skills.fire_making.daily_xp,
+        },
+    };
+    run.rng_state = world.rng.state;
+    run.terrain_mutations = world
+        .snapshot_terrain_mutations()
+        .into_iter()
+        .map(|(x, y, k)| TerrainMutationSave {
+            x,
+            y,
+            kind: k.save_key().to_string(),
+        })
+        .collect();
+    run.active_action = world.active_action.as_ref().map(|active| ActiveActionSave {
+        steps: active
+            .steps
+            .iter()
+            .map(|s| ActionStepSave {
+                id: s.id.save_key().to_string(),
+                elapsed_secs: s.elapsed_secs,
+                target_secs: s.target_secs,
+            })
+            .collect(),
+        view_mode: match active.view_mode {
+            ViewMode::ProgressBar => "progress_bar",
+            ViewMode::TimeSkip => "time_skip",
+        }
+        .to_string(),
+    });
     if let Err(e) = save::save_atomic(&save_dir.join(RUN_FILE), &run) {
-        eprintln!("run save failed: {}", e);
+        log_info!("run save failed: {}", e);
     } else {
         *prev_run_header = Some(new_run_header);
-        eprintln!("run saved at ({}, {})", run.player_x, run.player_y);
+        log_debug!(
+            "run saved at ({}, {}) — pack {}g, {} non-empty cells",
+            run.player_x,
+            run.player_y,
+            run.pack
+                .contents
+                .iter()
+                .map(|i| (i.weight_g_each as u64) * (i.count as u64))
+                .sum::<u64>(),
+            run.cell_items.len()
+        );
     }
 }
 
+/// CP437 byte glyphs used in the HUD; can't be embedded in Rust string
+/// literals because the source is UTF-8 and `put_text` writes raw bytes.
+const HUD_GLYPH_THIRST: u8 = 0x14; // custom mug sprite
+const HUD_GLYPH_HUNGER: u8 = 0xE0; // custom chicken-leg sprite (matches Ration)
+const HUD_GLYPH_SLEEP: u8 = 0xE9; // custom bed sprite
+const HUD_GLYPH_WARMTH: u8 = 0x0F; // ☼ sun / fire
+
 fn build_ui_cells(
-    world: &World,
-    dialogue: Option<&Dialogue>,
-    inventory_open: bool,
     palette: &Palette,
+    needs: Needs,
+    day: u64,
+    clock_h: u8,
+    clock_m: u8,
+    is_night: bool,
+    skills: Skills,
 ) -> Vec<Option<Cell>> {
     let mut cells = vec![None; (WORLD_W * WORLD_H) as usize];
-    let hud = if world.oasis_intro_complete {
-        "Oasis restored".to_string()
+
+    // Row 1 left: "Day N HH:MM day|night".
+    let suffix = if is_night { "night" } else { "day" };
+    let left = format!("Day {} {:02}:{:02} {}", day, clock_h, clock_m, suffix);
+    put_text(&mut cells, 1, 1, &left, palette.hud_fg, palette.hud_bg);
+
+    // Row 1 right: four CP437 need meters, each with its own symbol
+    // fg so the atlas-colored sprites (mug, chicken leg, sun) tint
+    // toward their natural hue. Critical state (any need < 25)
+    // overrides both symbol and digit fgs to need_critical_fg so the
+    // warning reads at a glance.
+    let critical = needs
+        .thirst
+        .min(needs.hunger)
+        .min(needs.sleep)
+        .min(needs.warmth)
+        < 25;
+    let digit_fg = if critical {
+        palette.need_critical_fg
     } else {
-        format!("Reeds {}/{}", world.reed_count(), REEDS_REQUIRED)
+        palette.hud_fg
     };
-    put_text(&mut cells, 25, 1, &hud, palette.hud_fg, palette.hud_bg);
-    let region_label = match world.region {
-        Region::Oasis => "Oasis",
-        Region::Wilderness => "Wilderness",
-    };
-    put_text(&mut cells, 1, 1, region_label, palette.hud_fg, palette.hud_bg);
-
-    if inventory_open {
-        draw_inventory_panel(&mut cells, world, palette);
-        return cells;
+    // Per-symbol tints (overridden by critical_fg when critical).
+    let pick = |normal: Color| if critical { palette.need_critical_fg } else { normal };
+    let meters: [(u8, Color, u8); 4] = [
+        (HUD_GLYPH_THIRST, pick(Color::RGB(180, 140, 90)), needs.thirst),
+        (HUD_GLYPH_HUNGER, pick(Color::RGB(220, 180, 110)), needs.hunger),
+        // Near-white fg lets the atlas's intrinsic colors come
+        // through if the bed sprite is pre-painted (e.g. brown frame
+        // + red blanket). If the atlas bed is grayscale instead, we
+        // need to implement luminance-banded tinting.
+        (HUD_GLYPH_SLEEP, pick(Color::RGB(240, 240, 240)), needs.sleep),
+        (HUD_GLYPH_WARMTH, pick(Color::RGB(240, 195, 80)), needs.warmth),
+    ];
+    // Pre-compute total width so we right-align.
+    let total_w: usize = meters
+        .iter()
+        .map(|(_, _, v)| 1 + v.to_string().len())
+        .sum::<usize>()
+        + (meters.len() - 1); // single-space gap between meters
+    let mut x = WORLD_W as i32 - total_w as i32 - 1;
+    for (i, (glyph, sym_fg, value)) in meters.iter().enumerate() {
+        put_cell(
+            &mut cells,
+            x,
+            1,
+            Cell {
+                glyph: *glyph,
+                fg: *sym_fg,
+                bg: palette.hud_bg,
+            },
+        );
+        x += 1;
+        let s = value.to_string();
+        put_text(&mut cells, x, 1, &s, digit_fg, palette.hud_bg);
+        x += s.len() as i32;
+        if i + 1 < meters.len() {
+            x += 1; // space between meters
+        }
     }
 
-    if let Some(dialogue) = dialogue {
-        draw_panel(&mut cells, 1, 22, 38, 7, palette.panel_fg, palette.panel_bg);
-        put_text(
-            &mut cells,
-            3,
-            23,
-            dialogue.speaker,
-            palette.keeper_fg,
-            palette.panel_bg,
-        );
-        put_wrapped_text(
-            &mut cells,
-            3,
-            25,
-            34,
-            dialogue.text(),
-            palette.panel_fg,
-            palette.panel_bg,
-        );
-        put_text(&mut cells, 31, 28, "A next", palette.hud_fg, palette.panel_bg);
-    }
+    // Row 2 left: Fire Making skill readout. Single-skill HUD for slice 1.
+    let fm = skills.get(SkillKind::FireMaking);
+    let line = format!("{} {}%", SkillKind::FireMaking.display_name(), fm.value);
+    put_text(&mut cells, 1, 2, &line, palette.hud_fg, palette.hud_bg);
 
     cells
 }
 
-fn draw_inventory_panel(cells: &mut [Option<Cell>], world: &World, palette: &Palette) {
-    let x = 8;
-    let y = 5;
-    let w = 24;
-    let h = 20;
-    draw_panel(cells, x, y, w, h, palette.panel_fg, palette.panel_bg);
-    put_text(
+/// Per-cell ±8 RGB offset on a walkable terrain's `(fg, bg)` based on a
+/// hash of `(x, y, world.seed)`. The result is the terrain's base
+/// color jittered slightly per cell so the floor reads as gradient
+/// texture instead of a flat region. Three independent hashes for R,
+/// G, B keep the variation organic rather than monochromatic.
+fn floor_with_gradient(
+    def: world::TerrainDef,
+    x: i32,
+    y: i32,
+    seed: u64,
+) -> ([u8; 3], [u8; 3]) {
+    let base = (x as i64)
+        .wrapping_mul(73_856_093)
+        .wrapping_add((y as i64).wrapping_mul(19_349_663))
+        .wrapping_add(seed as i64);
+    // Three uncorrelated mixers per channel.
+    let mr = base.wrapping_mul(2_654_435_761_i64) as i32;
+    let mg = base.wrapping_mul(40_503_i64) ^ 0x9E37_79B9;
+    let mb = base.wrapping_mul(2_246_822_519_i64) as i32;
+    // Offset range: ±8 per channel. The mod-17 maps to 0..=16; we
+    // subtract 8 to center on zero.
+    let dr = ((mr.rem_euclid(17)) - 8) as i16;
+    let dg = ((mg as i32).rem_euclid(17) - 8) as i16;
+    let db = ((mb.rem_euclid(17)) - 8) as i16;
+    let fg = [
+        (def.fg[0] as i16 + dr).clamp(0, 255) as u8,
+        (def.fg[1] as i16 + dg).clamp(0, 255) as u8,
+        (def.fg[2] as i16 + db).clamp(0, 255) as u8,
+    ];
+    let bg = [
+        (def.bg[0] as i16 + dr / 2).clamp(0, 255) as u8,
+        (def.bg[1] as i16 + dg / 2).clamp(0, 255) as u8,
+        (def.bg[2] as i16 + db / 2).clamp(0, 255) as u8,
+    ];
+    (fg, bg)
+}
+
+/// Linearly mix an item color toward a terrain fg. `mix` is the
+/// fraction of the item color retained (0.0 = pure terrain, 1.0 = pure
+/// item). Used for `blends_with_terrain` items so organic detritus
+/// merges into the floor texture instead of clashing.
+fn blend_to_terrain(item_rgb: [u8; 3], terrain_fg: [u8; 3], mix: f32) -> Color {
+    let m = mix.clamp(0.0, 1.0);
+    let one = 1.0 - m;
+    let r = (item_rgb[0] as f32 * m + terrain_fg[0] as f32 * one) as u8;
+    let g = (item_rgb[1] as f32 * m + terrain_fg[1] as f32 * one) as u8;
+    let b = (item_rgb[2] as f32 * m + terrain_fg[2] as f32 * one) as u8;
+    Color::RGB(r, g, b)
+}
+
+/// Index into `TREE_VARIANT_GLYPHS` for a given cell. Deterministic
+/// per `(x, y, world.seed)` so the same cell always shows the same
+/// tree silhouette. Differs from the grass-dot hash via different
+/// mixer constants so neighboring cells don't visually correlate.
+fn tree_variant_index(x: i32, y: i32, seed: u64) -> usize {
+    let h = (x as i64)
+        .wrapping_mul(467_213)
+        .wrapping_add((y as i64).wrapping_mul(2_654_435_761))
+        .wrapping_add(seed as i64);
+    let mixed = (h as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    (mixed >> 28) as usize
+}
+
+/// Index into `TREE_TINT_VARIANTS` for a given cell. Uses different
+/// mixer constants from `tree_variant_index` so a cell's silhouette
+/// pick and its tint pick are decorrelated — same atlas glyph can
+/// appear in any tint, and vice versa.
+fn tree_tint_index(x: i32, y: i32, seed: u64) -> usize {
+    let h = (x as i64)
+        .wrapping_mul(2_246_822_519_i64)
+        .wrapping_add((y as i64).wrapping_mul(40_503))
+        .wrapping_add((seed as i64).wrapping_mul(73_856_093));
+    let mixed = (h as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    (mixed >> 28) as usize
+}
+
+/// Returns true for ~25% of grass cells, deterministically per
+/// `(x, y, world.seed)`. Used by the render loop to render a sparse
+/// pattern of tufts across grass rather than a wall of glyphs.
+fn grass_dot_visible(x: i32, y: i32, seed: u64) -> bool {
+    // Mixing constants: Knuth's multiplicative hash + two large primes
+    // for spatial decorrelation, then a final golden-ratio shuffle so
+    // adjacent cells don't show banding.
+    let h = (x as i64)
+        .wrapping_mul(73_856_093)
+        .wrapping_add((y as i64).wrapping_mul(19_349_663))
+        .wrapping_add(seed as i64);
+    let mixed = (h as u64).wrapping_mul(2_654_435_761);
+    (mixed >> 24) % 100 < 25
+}
+
+/// Bottom-left "what's underfoot" line. Reads the player's current
+/// cell's `items` and prints a comma-separated list (with stack counts
+/// and `(pitched)` markers) on the last row. Renders nothing when the
+/// cell is empty so empty grass doesn't get visual chrome.
+///
+/// Width budget: starts at col 1, ends before col 39. Truncates with
+/// `...` if the join overflows.
+fn draw_here_line(cells: &mut [Option<Cell>], world: &World, palette: &Palette) {
+    let pos = world.player_pos();
+    let Some(cell) = world.cell_at(pos.x as i64, pos.y as i64) else {
+        return;
+    };
+    if cell.items.is_empty() {
+        return;
+    }
+    let parts: Vec<String> = cell.items.iter().map(|i| i.display_label()).collect();
+    let mut joined = parts.join(", ");
+    let max = (WORLD_W as usize).saturating_sub(2);
+    if joined.len() > max {
+        joined.truncate(max.saturating_sub(3));
+        joined.push_str("...");
+    }
+    let row = WORLD_H as i32 - 1;
+    put_text(cells, 1, row, &joined, palette.hud_fg, palette.hud_bg);
+}
+
+/// Positioning + interior anchors for any UI panel (pause menu, command
+/// menu, multi-turn banner). Two construction forms cover slice-1
+/// needs; add more if a future panel doesn't fit centered-or-anchored.
+struct PanelLayout {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+}
+
+impl PanelLayout {
+    fn anchored(x: i32, y: i32, w: i32, h: i32) -> Self {
+        Self { x, y, w, h }
+    }
+    fn centered(w: i32, h: i32) -> Self {
+        Self {
+            x: ((WORLD_W as i32) - w) / 2,
+            y: ((WORLD_H as i32) - h) / 2,
+            w,
+            h,
+        }
+    }
+    fn centered_x_at(y: i32, w: i32, h: i32) -> Self {
+        Self {
+            x: ((WORLD_W as i32) - w) / 2,
+            y,
+            w,
+            h,
+        }
+    }
+    fn inner_x(&self) -> i32 {
+        self.x + 2
+    }
+    fn inner_right(&self) -> i32 {
+        self.x + self.w - 2
+    }
+    fn title_y(&self) -> i32 {
+        self.y + 1
+    }
+    /// First row of body content. Convention: leave one blank row
+    /// between title and body for visual breathing room.
+    fn first_row_y(&self) -> i32 {
+        self.y + 3
+    }
+    fn footer_y(&self) -> i32 {
+        self.y + self.h - 2
+    }
+}
+
+/// Draw a bordered window with a title (top) and footer (bottom). Body
+/// content is the caller's responsibility — use `draw_menu_row` for the
+/// canonical cursor + label + right-aligned-status row pattern, or
+/// call `put_text` / `put_cell` directly for one-off shapes like the
+/// multi-turn progress bar.
+fn draw_panel_frame(
+    cells: &mut [Option<Cell>],
+    layout: &PanelLayout,
+    title: &str,
+    footer: &str,
+    palette: &Palette,
+) {
+    draw_panel(
         cells,
-        x + 2,
-        y + 1,
-        "Inventory",
-        palette.keeper_fg,
+        layout.x,
+        layout.y,
+        layout.w,
+        layout.h,
+        palette.panel_fg,
         palette.panel_bg,
     );
+    put_text(
+        cells,
+        layout.inner_x(),
+        layout.title_y(),
+        title,
+        palette.panel_title_fg,
+        palette.panel_bg,
+    );
+    put_text(
+        cells,
+        layout.inner_x(),
+        layout.footer_y(),
+        footer,
+        palette.panel_dim_fg,
+        palette.panel_bg,
+    );
+}
 
-    let list_x = x + 2;
-    let list_y = y + 3;
-    let max_rows = (h - 5) as usize;
-    if world.inventory.is_empty() {
+/// Canonical menu row: cursor (>/blank) + label + optional right-aligned
+/// status. The right-side text is truncated to fit the remaining inner
+/// width with `…` so a long reason can't overflow the box.
+fn draw_menu_row(
+    cells: &mut [Option<Cell>],
+    layout: &PanelLayout,
+    row_y: i32,
+    is_selected: bool,
+    label: &str,
+    label_fg: Color,
+    right_status: Option<(&str, Color)>,
+    palette: &Palette,
+) {
+    let cursor = if is_selected { b'>' } else { b' ' };
+    put_cell(
+        cells,
+        layout.inner_x(),
+        row_y,
+        Cell {
+            glyph: cursor,
+            fg: palette.panel_title_fg,
+            bg: palette.panel_bg,
+        },
+    );
+    put_text(
+        cells,
+        layout.inner_x() + 2,
+        row_y,
+        label,
+        label_fg,
+        palette.panel_bg,
+    );
+    if let Some((status, status_fg)) = right_status {
+        // Available width = inner width minus cursor (1) + space (1) +
+        // label + separator (2). Floor at 4 so very long labels still
+        // leave a stub for the status.
+        let max_status_len = (layout.w as i32 - 4 - label.len() as i32 - 2).max(4) as usize;
+        let truncated: String = status.chars().take(max_status_len).collect();
+        let status_x = layout.inner_right() - truncated.len() as i32;
+        put_text(cells, status_x, row_y, &truncated, status_fg, palette.panel_bg);
+    }
+}
+
+/// Dev overlay: render every CP437 byte (0x00–0xFF) in a 16x16 grid so
+/// we can audit what's actually in our custom atlas. The cursor byte
+/// is inverted (bg <-> fg) and shown in the header. Dpad navigates
+/// (wraps); B/X closes.
+fn draw_glyph_palette(cells: &mut [Option<Cell>], cursor: u8, palette: &Palette) {
+    let layout = PanelLayout::centered(36, 24);
+    let cur_row = cursor >> 4;
+    let cur_col = cursor & 0x0F;
+    let title = format!(
+        "CP437 0x{:02X} (row {:X}, col {:X})",
+        cursor, cur_row, cur_col
+    );
+    draw_panel_frame(
+        cells,
+        &layout,
+        &title,
+        "dpad: navigate   B: close",
+        palette,
+    );
+
+    // The grid sits at first_row_y, taking 16 rows x 16 columns. We
+    // also draw thin row/column labels in hex above and beside the
+    // grid so the player can read coords without counting.
+    let grid_x = layout.inner_x() + 2; // leave 2 cols for row labels
+    let grid_y = layout.first_row_y() + 1; // row above is column header
+
+    // Column header row.
+    for col in 0..16u8 {
         put_text(
             cells,
-            list_x,
-            list_y,
-            "(empty)",
-            palette.panel_fg,
+            grid_x + col as i32,
+            grid_y - 1,
+            &format!("{:X}", col),
+            palette.panel_dim_fg,
             palette.panel_bg,
         );
-    } else {
-        for (row, (item, count)) in world.inventory.iter().take(max_rows).enumerate() {
-            let row_y = list_y + row as i32;
+    }
+
+    // Row labels + cells.
+    for row in 0..16u8 {
+        put_text(
+            cells,
+            layout.inner_x(),
+            grid_y + row as i32,
+            &format!("{:X}", row),
+            palette.panel_dim_fg,
+            palette.panel_bg,
+        );
+        for col in 0..16u8 {
+            let byte = (row << 4) | col;
+            let is_cursor = byte == cursor;
+            // Render the glyph at its real byte index. Inversion on
+            // the cursor cell (bg as fg, fg as bg) so it stands out.
+            let (fg, bg) = if is_cursor {
+                (palette.panel_bg, palette.panel_fg)
+            } else {
+                (palette.panel_fg, palette.panel_bg)
+            };
             put_cell(
                 cells,
-                list_x,
-                row_y,
-                Cell {
-                    glyph: item.glyph(),
-                    fg: item_fg(item, palette),
-                    bg: palette.panel_bg,
-                },
-            );
-            let label = format!(" {} x{}", item.name(), count);
-            put_text(
-                cells,
-                list_x + 1,
-                row_y,
-                &label,
-                palette.panel_fg,
-                palette.panel_bg,
+                grid_x + col as i32,
+                grid_y + row as i32,
+                Cell { glyph: byte, fg, bg },
             );
         }
     }
+}
 
+// ---- Info hub (Select-button tabbed overlay) -------------------------
+
+fn info_tab_row_count(world: &World, tab: InfoTab) -> usize {
+    match tab {
+        InfoTab::Inventory => world.player_pack().contents.len(),
+        InfoTab::Crafting => crafting::RECIPES.len(),
+        InfoTab::Skills => 1, // Fire Making; slice-2 adds more skills
+    }
+}
+
+fn draw_info_menu(
+    cells: &mut [Option<Cell>],
+    world: &World,
+    state: &InfoMenuState,
+    palette: &Palette,
+) {
+    let layout = PanelLayout::centered(36, 22);
+    let footer = "L/R: tabs   B/Select: close";
+    // Title row is rendered manually below so we can highlight the
+    // current tab.
+    draw_panel_frame(cells, &layout, "", footer, palette);
+
+    // Tab strip on the title row: "Inventory | Skills" with the active
+    // tab in panel-fg + others dimmed.
+    let mut x = layout.inner_x();
+    for (i, &tab) in INFO_TABS.iter().enumerate() {
+        let active = tab == state.tab;
+        let fg = if active {
+            palette.panel_title_fg
+        } else {
+            palette.panel_dim_fg
+        };
+        let label = tab.label();
+        put_text(cells, x, layout.title_y(), label, fg, palette.panel_bg);
+        x += label.len() as i32;
+        if i + 1 < INFO_TABS.len() {
+            put_text(cells, x, layout.title_y(), " | ", palette.panel_dim_fg, palette.panel_bg);
+            x += 3;
+        }
+    }
+
+    // Body branches on the active tab.
+    match state.tab {
+        InfoTab::Inventory => draw_info_inventory(cells, &layout, world, state.selected, palette),
+        InfoTab::Crafting => draw_info_crafting(cells, &layout, world, state.selected, palette),
+        InfoTab::Skills => draw_info_skills(cells, &layout, world, state.selected, palette),
+    }
+}
+
+/// Crafting tab. Lists the slice-1 recipe catalog with green/red
+/// glyphs per requirement; the same `action::evaluate` dispatcher used
+/// by the command menu decides availability so the two stay in sync.
+fn draw_info_crafting(
+    cells: &mut [Option<Cell>],
+    layout: &PanelLayout,
+    world: &World,
+    selected: usize,
+    palette: &Palette,
+) {
+    let max_rows = (layout.footer_y() - layout.first_row_y() - 1).max(1) as usize;
+    let visible = crafting::RECIPES.iter().take(max_rows);
+    for (i, recipe) in visible.enumerate() {
+        let row_y = layout.first_row_y() + i as i32;
+        let is_selected = i == selected;
+        let avail = action::evaluate(world, recipe.action);
+        let (right, dim) = match avail {
+            action::Availability::Available { cost_game_seconds } => {
+                (format!("ok {}s", cost_game_seconds), false)
+            }
+            action::Availability::Unavailable { reason } => (reason.to_string(), true),
+        };
+        let fg = if dim {
+            palette.panel_dim_fg
+        } else {
+            palette.panel_fg
+        };
+        draw_menu_row(
+            cells,
+            layout,
+            row_y,
+            is_selected,
+            recipe.name,
+            fg,
+            Some((&right, palette.panel_dim_fg)),
+            palette,
+        );
+    }
+
+    // Footer-adjacent hint. Selecting a row with A queues the recipe.
+    let hint = if let Some(recipe) = crafting::RECIPES.get(selected) {
+        format!("A: craft  ({})", recipe.name)
+    } else {
+        String::new()
+    };
     put_text(
         cells,
-        x + 2,
-        y + h - 2,
-        "Y/B close",
+        layout.inner_x(),
+        layout.footer_y() - 1,
+        &hint,
         palette.hud_fg,
         palette.panel_bg,
     );
 }
 
-fn item_fg(item: Item, palette: &Palette) -> Color {
-    match item {
-        Item::Reed => palette.reed_fg,
+fn draw_info_inventory(
+    cells: &mut [Option<Cell>],
+    layout: &PanelLayout,
+    world: &World,
+    selected: usize,
+    palette: &Palette,
+) {
+    let pack = world.player_pack();
+    if pack.contents.is_empty() {
+        put_text(
+            cells,
+            layout.inner_x(),
+            layout.first_row_y(),
+            "(pack empty)",
+            palette.panel_dim_fg,
+            palette.panel_bg,
+        );
+        return;
+    }
+
+    let max_rows = (layout.footer_y() - layout.first_row_y() - 1).max(1) as usize;
+    let visible = pack.contents.iter().take(max_rows);
+    for (i, item) in visible.enumerate() {
+        let row_y = layout.first_row_y() + i as i32;
+        let is_selected = i == selected;
+        let label = item.display_label();
+        let weight = fmt_weight(item.total_weight_g());
+        draw_menu_row(
+            cells,
+            layout,
+            row_y,
+            is_selected,
+            &label,
+            palette.panel_fg,
+            Some((&weight, palette.panel_dim_fg)),
+            palette,
+        );
+    }
+
+    // Pack-total summary on the row just above the footer.
+    let total = fmt_weight(pack.total_weight_g());
+    let cap = fmt_weight(pack.capacity_g);
+    let summary = format!("Pack {} / {}", total, cap);
+    put_text(
+        cells,
+        layout.inner_x(),
+        layout.footer_y() - 1,
+        &summary,
+        palette.hud_fg,
+        palette.panel_bg,
+    );
+}
+
+fn draw_info_skills(
+    cells: &mut [Option<Cell>],
+    layout: &PanelLayout,
+    world: &World,
+    selected: usize,
+    palette: &Palette,
+) {
+    let skills = world.player_skills();
+    // Slice-1 has just Fire Making; slice-2 extends the iter() chain
+    // with Cookery/Foraging/Fishing/etc.
+    let rows: Vec<(SkillKind, &skill::Skill)> = vec![(
+        SkillKind::FireMaking,
+        skills.get(SkillKind::FireMaking),
+    )];
+
+    for (i, (kind, s)) in rows.into_iter().enumerate() {
+        let row_y = layout.first_row_y() + i as i32;
+        let is_selected = i == selected;
+        let label = kind.display_name();
+        let value = format!("{}%", s.value);
+        draw_menu_row(
+            cells,
+            layout,
+            row_y,
+            is_selected,
+            label,
+            palette.panel_fg,
+            Some((&value, palette.panel_dim_fg)),
+            palette,
+        );
+        // Sub-line: daily XP toward next level.
+        let xp_line = format!("  daily XP {}", s.daily_xp);
+        put_text(
+            cells,
+            layout.inner_x(),
+            row_y + 1,
+            &xp_line,
+            palette.panel_dim_fg,
+            palette.panel_bg,
+        );
+    }
+}
+
+fn fmt_weight(g: u32) -> String {
+    if g >= 1000 {
+        format!("{:.1} kg", g as f32 / 1000.0)
+    } else {
+        format!("{} g", g)
+    }
+}
+
+/// Phase 15 hold-Y radial. Compact 25x5 panel with the 4 RADIAL_BINDINGS
+/// arranged cardinally; unavailable verbs greyed via panel_dim_fg so
+/// the player sees at a glance which they can fire right now.
+fn draw_radial_menu(cells: &mut [Option<Cell>], world: &World, palette: &Palette) {
+    let layout = PanelLayout::centered(25, 5);
+    draw_panel_frame(cells, &layout, "radial", "release Y", palette);
+
+    let inner_left = layout.inner_x();
+    let inner_right = layout.inner_right();
+    let inner_top = layout.first_row_y();
+    let mid_row = inner_top + 1;
+    let bot_row = inner_top + 2;
+    let inner_w = inner_right - inner_left + 1;
+
+    let pick_fg = |id: action::ActionId| -> Color {
+        match action::evaluate(world, id) {
+            action::Availability::Available { .. } => palette.panel_fg,
+            action::Availability::Unavailable { .. } => palette.panel_dim_fg,
+        }
+    };
+
+    for &(dir, id, name) in &RADIAL_BINDINGS {
+        let fg = pick_fg(id);
+        match dir {
+            RadialDir::Up => {
+                // Top row, center.
+                let x = inner_left + (inner_w - name.len() as i32) / 2;
+                put_text(cells, x, inner_top, name, fg, palette.panel_bg);
+            }
+            RadialDir::Down => {
+                let x = inner_left + (inner_w - name.len() as i32) / 2;
+                put_text(cells, x, bot_row, name, fg, palette.panel_bg);
+            }
+            RadialDir::Left => {
+                put_text(cells, inner_left, mid_row, name, fg, palette.panel_bg);
+            }
+            RadialDir::Right => {
+                let x = inner_right - name.len() as i32 + 1;
+                put_text(cells, x, mid_row, name, fg, palette.panel_bg);
+            }
+        }
+    }
+}
+
+fn draw_death_screen(cells: &mut [Option<Cell>], cause: DeathCause, palette: &Palette) {
+    let layout = PanelLayout::centered(32, 7);
+    draw_panel_frame(
+        cells,
+        &layout,
+        "* DEAD *",
+        "A: new run    Start: quit",
+        palette,
+    );
+    let row_y = layout.first_row_y();
+    draw_menu_row(
+        cells,
+        &layout,
+        row_y,
+        true,
+        cause.epitaph(),
+        palette.need_critical_fg,
+        None,
+        palette,
+    );
+}
+
+fn draw_pause_menu(cells: &mut [Option<Cell>], selected: usize, palette: &Palette) {
+    let layout = PanelLayout::centered(28, 9);
+    draw_panel_frame(
+        cells,
+        &layout,
+        "Paused",
+        "A: confirm   B/Start: back",
+        palette,
+    );
+
+    for (i, (action, label)) in PAUSE_OPTIONS.iter().enumerate() {
+        let row_y = layout.first_row_y() + i as i32;
+        let is_selected = i == selected;
+        // ResetSave row is always tinted red — destructive option
+        // visibility shouldn't depend on the selection cursor.
+        let label_fg = match (is_selected, action) {
+            (_, PauseAction::ResetSave) => palette.need_critical_fg,
+            (true, _) => palette.panel_fg,
+            (false, _) => palette.hud_fg,
+        };
+        draw_menu_row(
+            cells,
+            &layout,
+            row_y,
+            is_selected,
+            label,
+            label_fg,
+            None,
+            palette,
+        );
+    }
+}
+
+fn draw_multi_turn_banner(
+    cells: &mut [Option<Cell>],
+    active: &world::ActiveAction,
+    palette: &Palette,
+) {
+    let Some(step) = active.current_step() else {
+        return;
+    };
+    let total_remaining = active.total_remaining_secs();
+    let mode_tag = match active.view_mode {
+        ViewMode::ProgressBar => "watching",
+        ViewMode::TimeSkip => "time-skip",
+    };
+    // Compact h=5 layout (no blank rows around the body — banner
+    // intentionally doesn't dominate the screen during a 300-sec pitch):
+    //   +--- pitch_tent ---+
+    //   | [###......]  ... |   body row
+    //   | B cancel ...     |   footer row
+    //   +------------------+
+    let layout = PanelLayout::centered_x_at(4, 34, 5);
+    let footer = format!("B cancel    Select toggle ({})", mode_tag);
+    draw_panel_frame(cells, &layout, step.id.save_key(), &footer, palette);
+
+    let body_y = layout.y + 2;
+    let bar_w: i32 = 12;
+    let filled = if step.target_secs == 0 {
+        bar_w
+    } else {
+        ((step.elapsed_secs as i64 * bar_w as i64) / step.target_secs as i64) as i32
+    };
+    for i in 0..bar_w {
+        let glyph = if i < filled { 0xDB } else { 0xB1 }; // █ vs ▒
+        put_cell(
+            cells,
+            layout.inner_x() + i,
+            body_y,
+            Cell {
+                glyph,
+                fg: palette.panel_fg,
+                bg: palette.panel_bg,
+            },
+        );
+    }
+    let remaining_m = total_remaining / 60;
+    let remaining_s = total_remaining % 60;
+    let remaining = format!(" {}:{:02} remaining", remaining_m, remaining_s);
+    put_text(
+        cells,
+        layout.inner_x() + bar_w,
+        body_y,
+        &remaining,
+        palette.hud_fg,
+        palette.panel_bg,
+    );
+}
+
+fn draw_command_menu(
+    cells: &mut [Option<Cell>],
+    world: &World,
+    selected: usize,
+    palette: &Palette,
+) {
+    let layout = PanelLayout::anchored(2, 4, 36, 21);
+    draw_panel_frame(
+        cells,
+        &layout,
+        "Actions",
+        "A: confirm   B/Y: close",
+        palette,
+    );
+
+    for (i, ca) in action::ALL_ACTIONS.iter().enumerate() {
+        let row_y = layout.first_row_y() + i as i32;
+        let is_selected = i == selected;
+
+        let avail = action::evaluate(world, ca.id);
+        let available = matches!(avail, action::Availability::Available { .. });
+        // Selected + available -> full panel fg (highlight).
+        // Selected + unavailable -> critical red (you tried to confirm
+        //     a verb that can't run; this color reinforces the bounce).
+        // Unselected + available -> panel fg.
+        // Unselected + unavailable -> dim fg (greyed-out catalog row).
+        let label_fg = match (is_selected, available) {
+            (true, false) => palette.need_critical_fg,
+            (_, true) => palette.panel_fg,
+            (false, false) => palette.panel_dim_fg,
+        };
+
+        let (status_text, status_fg) = match avail {
+            action::Availability::Available { cost_game_seconds } => {
+                (format!("{}s", cost_game_seconds), palette.panel_fg)
+            }
+            action::Availability::Unavailable { reason } => {
+                (reason.to_string(), palette.panel_dim_fg)
+            }
+        };
+
+        draw_menu_row(
+            cells,
+            &layout,
+            row_y,
+            is_selected,
+            ca.name,
+            label_fg,
+            Some((&status_text, status_fg)),
+            palette,
+        );
+    }
+
+    // Description for the selected row, one line above the footer.
+    let desc_y = layout.footer_y() - 1;
+    if let Some(sel) = action::ALL_ACTIONS.get(selected) {
+        let max_desc_len = (layout.w as usize).saturating_sub(4);
+        let desc: String = sel.description.chars().take(max_desc_len).collect();
+        put_text(
+            cells,
+            layout.inner_x(),
+            desc_y,
+            &desc,
+            palette.hud_fg,
+            palette.panel_bg,
+        );
     }
 }
 
@@ -573,32 +2099,13 @@ fn draw_panel(
     }
 }
 
-fn put_wrapped_text(
-    cells: &mut [Option<Cell>],
-    x: i32,
-    y: i32,
-    width: i32,
-    text: &str,
-    fg: Color,
-    bg: Color,
-) {
-    let mut cx = x;
-    let mut cy = y;
-    for word in text.split_whitespace() {
-        let word_len = word.len() as i32;
-        if cx > x && cx + word_len > x + width {
-            cx = x;
-            cy += 1;
-        }
-        if cx > x {
-            put_cell(cells, cx, cy, Cell { glyph: b' ', fg, bg });
-            cx += 1;
-        }
-        for b in word.bytes() {
-            put_cell(cells, cx, cy, Cell { glyph: b, fg, bg });
-            cx += 1;
-        }
-    }
+fn tint_color(c: Color, t: f32) -> Color {
+    Color::RGBA(
+        (c.r as f32 * t) as u8,
+        (c.g as f32 * t) as u8,
+        (c.b as f32 * t) as u8,
+        c.a,
+    )
 }
 
 fn put_text(cells: &mut [Option<Cell>], x: i32, y: i32, text: &str, fg: Color, bg: Color) {
@@ -662,20 +2169,101 @@ fn pace_frame(frame_start: Instant, elapsed: Duration) -> Duration {
     sleep_start.elapsed()
 }
 
+/// In-place 2D shift of a CPU `Surface`'s pixels by `(-dx_cells*CELL_SIZE,
+/// -dy_cells*CELL_SIZE)` pixels — when the camera moves by `(+dx, +dy)`
+/// cells, the *content* on screen moves by `(-dx, -dy)`. Pixels that
+/// scroll off the edge are discarded; pixels exposed at the new edge are
+/// left untouched (the compose loop will repaint them via `prev_cells`
+/// being `None` there).
+///
+/// Uses `slice::copy_within` so overlapping regions are memmove-safe.
+/// Row iteration direction picks correctly for either vertical scroll
+/// direction.
+fn shift_framebuffer(framebuf: &mut Surface, dx_cells: i32, dy_cells: i32) {
+    if dx_cells == 0 && dy_cells == 0 {
+        return;
+    }
+    let w_px = framebuf.width() as i32;
+    let h_px = framebuf.height() as i32;
+    let cell = CELL_SIZE as i32;
+    // Content shift is the negative of camera shift.
+    let content_dx = -dx_cells * cell;
+    let content_dy = -dy_cells * cell;
+    if content_dx.abs() >= w_px || content_dy.abs() >= h_px {
+        // Whole framebuffer scrolled off; nothing to preserve.
+        return;
+    }
+    let pitch = framebuf.pitch() as usize;
+    framebuf.with_lock_mut(|pixels| {
+        // Region of pixels that survives the shift.
+        let src_x = (-content_dx).max(0) as usize;
+        let src_y = (-content_dy).max(0) as usize;
+        let dst_x = content_dx.max(0) as usize;
+        let dst_y = content_dy.max(0) as usize;
+        let copy_w = (w_px - content_dx.abs()) as usize;
+        let copy_h = (h_px - content_dy.abs()) as usize;
+        let bytes_per_row = copy_w * 4;
+        let row_iter: Box<dyn Iterator<Item = usize>> = if dst_y > src_y {
+            // Content moves down; iterate bottom-up to avoid clobber.
+            Box::new((0..copy_h).rev())
+        } else {
+            Box::new(0..copy_h)
+        };
+        for i in row_iter {
+            let sy = src_y + i;
+            let dy = dst_y + i;
+            let src_off = sy * pitch + src_x * 4;
+            let dst_off = dy * pitch + dst_x * 4;
+            pixels.copy_within(src_off..src_off + bytes_per_row, dst_off);
+        }
+    });
+}
+
+/// Mirror of `shift_framebuffer` for the `prev_cells` viewport-indexed
+/// cache. A scrolled cell's identity matches what's already painted at
+/// the new viewport coord; cells whose source was off-viewport are reset
+/// to `None` so the compose loop repaints them.
+fn shift_prev_cells(prev: &mut [Option<Cell>], w: u32, h: u32, dx_cells: i32, dy_cells: i32) {
+    if dx_cells == 0 && dy_cells == 0 {
+        return;
+    }
+    let w_i = w as i32;
+    let h_i = h as i32;
+    if dx_cells.abs() >= w_i || dy_cells.abs() >= h_i {
+        for slot in prev.iter_mut() {
+            *slot = None;
+        }
+        return;
+    }
+    // For each new (vx, vy) the source is (vx + dx, vy + dy) in the
+    // *old* viewport. Anything outside [0, w) × [0, h) is a freshly
+    // exposed edge cell and must be `None`.
+    let old: Vec<Option<Cell>> = prev.to_vec();
+    for new_vy in 0..h_i {
+        for new_vx in 0..w_i {
+            let dst_i = (new_vy as u32 * w + new_vx as u32) as usize;
+            let src_vx = new_vx + dx_cells;
+            let src_vy = new_vy + dy_cells;
+            if src_vx < 0 || src_vx >= w_i || src_vy < 0 || src_vy >= h_i {
+                prev[dst_i] = None;
+            } else {
+                let src_i = (src_vy as u32 * w + src_vx as u32) as usize;
+                prev[dst_i] = old[src_i];
+            }
+        }
+    }
+}
+
 struct Palette {
     letterbox: Color,
     player_fg: Color,
-    keeper_fg: Color,
-    reed_fg: Color,
-    floor_fg: Color,
-    floor_bg: Color,
-    wall_fg: Color,
-    wall_bg: Color,
-    portal_fg: Color,
     hud_fg: Color,
     hud_bg: Color,
+    need_critical_fg: Color,
     panel_fg: Color,
     panel_bg: Color,
+    panel_dim_fg: Color,
+    panel_title_fg: Color,
 }
 
 impl Default for Palette {
@@ -683,17 +2271,13 @@ impl Default for Palette {
         Self {
             letterbox: Color::RGB(8, 6, 4),
             player_fg: Color::RGB(240, 232, 200),
-            keeper_fg: Color::RGB(210, 170, 95),
-            reed_fg: Color::RGB(118, 170, 88),
-            floor_fg: Color::RGB(70, 60, 45),
-            floor_bg: Color::RGB(20, 17, 13),
-            wall_fg: Color::RGB(140, 110, 75),
-            wall_bg: Color::RGB(35, 28, 20),
-            portal_fg: Color::RGB(230, 200, 120),
             hud_fg: Color::RGB(190, 205, 160),
             hud_bg: Color::RGB(20, 17, 13),
+            need_critical_fg: Color::RGB(220, 110, 90),
             panel_fg: Color::RGB(218, 205, 170),
             panel_bg: Color::RGB(28, 22, 17),
+            panel_dim_fg: Color::RGB(110, 100, 80),
+            panel_title_fg: Color::RGB(230, 200, 120),
         }
     }
 }

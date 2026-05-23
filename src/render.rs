@@ -13,6 +13,14 @@ pub fn load_atlas(png_bytes: &[u8]) -> Result<Surface<'static>, String> {
     let (w, h) = (img.width(), img.height());
     let mut data = img.into_raw();
 
+    // Magenta is the chromakey: those pixels become transparent. Every
+    // other pixel's RGB is PRESERVED so the atlas's color and grayscale
+    // detail survive the load. The blit in `draw_glyph` color-mod's the
+    // result by fg, so:
+    //   white-on-magenta sprite x colored fg -> tinted silhouette
+    //     (unchanged behavior for standard CP437 chars)
+    //   colored sprite x white fg            -> atlas colors preserved
+    //   grayscale sprite x colored fg        -> shaded tint
     for chunk in data.chunks_exact_mut(4) {
         let r = chunk[0];
         let g = chunk[1];
@@ -20,11 +28,8 @@ pub fn load_atlas(png_bytes: &[u8]) -> Result<Surface<'static>, String> {
         let is_magenta = r > 240 && g < 16 && b > 240;
         if is_magenta {
             chunk[3] = 0;
-        } else {
-            chunk[0] = 255;
-            chunk[1] = 255;
-            chunk[2] = 255;
         }
+        // else: keep RGB + alpha exactly as the artist intended.
     }
 
     // image::to_rgba8 = byte order R,G,B,A = pixel ABGR8888 on LE.

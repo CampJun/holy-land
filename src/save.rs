@@ -1,9 +1,9 @@
-// Portable, sync-friendly save format. Format and discipline locked here in
-// Session 3 — every save we ever write going forward must be loadable via the
-// migration chain below.
+// Portable, sync-friendly save format. Format and discipline locked in
+// Session 3 (Holy Land); the *machinery* survives the survival redesign even
+// as the field contents change.
 //
 // Format: CBOR (cross-platform, language-agnostic, deterministic). Every save
-// starts with `SaveHeader`; the rest is type-specific. Forward-compat is by
+// starts with `SaveHeader`; the rest is type-specific. Forward-compat by
 // `#[serde(default)]` on every non-header field so older binaries skip unknown
 // fields silently and newer binaries fill in defaults for absent fields.
 //
@@ -15,9 +15,13 @@
 //      migration code is needed — `#[serde(default)]` handles it.
 //   4. If the change reshapes an existing field, the migration must do a
 //      Value-level read (ciborium::Value) and convert before final deser.
+//
+// Phase-2 gut: dropped Holy Land run/meta fields (essence/demon_currency,
+// shrine_unlocked, oasis_intro_complete, reeds, ground_items, region). Schema
+// version stays at 1 for now; phase 19's "Save schema v2" card bumps it to 2
+// once needs/clock/inventory/chunks land.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
@@ -54,13 +58,7 @@ pub struct MetaSave {
     #[serde(default)]
     pub xp: u64,
     #[serde(default)]
-    pub demon_currency: u64,
-    #[serde(default)]
-    pub deity_affinity: BTreeMap<String, i32>,
-    #[serde(default)]
     pub unlocks: Vec<String>,
-    #[serde(default)]
-    pub oasis_intro_complete: bool,
 }
 
 impl MetaSave {
@@ -68,10 +66,7 @@ impl MetaSave {
         Self {
             header,
             xp: 0,
-            demon_currency: 0,
-            deity_affinity: BTreeMap::new(),
             unlocks: Vec::new(),
-            oasis_intro_complete: false,
         }
     }
 }
@@ -83,21 +78,107 @@ pub struct RunSave {
     pub player_x: i32,
     #[serde(default)]
     pub player_y: i32,
-    // Legacy: pre-inventory builds tracked this counter directly. Newer
-    // builds write the authoritative state in `inventory` and only read this
-    // field as a fallback when `inventory` is absent (saves from old builds).
+    // Phase 3 (additive; schema stays v1 because the new fields all carry
+    // `#[serde(default)]`):
     #[serde(default)]
-    pub reeds_harvested: u8,
+    pub pack: PackSave,
     #[serde(default)]
-    pub harvested_reeds: Vec<[i32; 2]>,
+    pub cell_items: Vec<CellItemsSave>,
+    // Phase 4 (additive):
     #[serde(default)]
-    pub inventory: BTreeMap<String, u32>,
-    #[serde(default = "default_region")]
-    pub region: String,
+    pub clock_seconds: u64,
+    #[serde(default)]
+    pub needs: NeedsSave,
+    // Phase 6 (additive): explored cells from FOV memory. Sparse
+    // (Vec<(x, y)>) since slice 1 is one chunk; can switch to bit-packed
+    // per chunk later if explored sets get big.
+    #[serde(default)]
+    pub explored_cells: Vec<(i32, i32)>,
+    // Phase 9 (additive): mid-action queue snapshot so a save during a
+    // PitchTent / SetupCamp resumes correctly on load.
+    #[serde(default)]
+    pub active_action: Option<ActiveActionSave>,
+    // Phase 10 (additive): skills + RNG state.
+    #[serde(default)]
+    pub skills: SkillsSave,
+    /// xorshift32 state, persisted so skill-check outcomes can't be
+    /// save-scummed by reloading. 0 falls back to "seed from world.seed
+    /// at load time" on legacy saves.
+    #[serde(default)]
+    pub rng_state: u32,
+    // Phase 11b (additive): cells whose terrain has been mutated since
+    // chunkgen produced them (e.g. ChopTree converts TreeTrunk -> Grass).
+    // On load these are re-applied AFTER chunkgen so a chopped tree
+    // stays chopped across save/load.
+    #[serde(default)]
+    pub terrain_mutations: Vec<TerrainMutationSave>,
 }
 
-fn default_region() -> String {
-    "oasis".to_string()
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TerrainMutationSave {
+    #[serde(default)]
+    pub x: i32,
+    #[serde(default)]
+    pub y: i32,
+    /// `TerrainKind::save_key()` string. Unknown keys are dropped on
+    /// load (forward-compat).
+    #[serde(default)]
+    pub kind: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct SkillsSave {
+    #[serde(default)]
+    pub fire_making: SkillSave,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct SkillSave {
+    #[serde(default)]
+    pub value: u8,
+    #[serde(default)]
+    pub daily_xp: u8,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ActiveActionSave {
+    #[serde(default)]
+    pub steps: Vec<ActionStepSave>,
+    /// "progress_bar" | "time_skip". Defaults to progress_bar on
+    /// unknown values for forward-compat.
+    #[serde(default)]
+    pub view_mode: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ActionStepSave {
+    /// `ActionId::save_key()` string. Unknown ids are dropped on load.
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub elapsed_secs: u32,
+    #[serde(default)]
+    pub target_secs: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct NeedsSave {
+    #[serde(default)]
+    pub thirst: u8,
+    #[serde(default)]
+    pub hunger: u8,
+    #[serde(default)]
+    pub sleep: u8,
+    #[serde(default)]
+    pub warmth: u8,
+    #[serde(default)]
+    pub thirst_acc_secs: u32,
+    #[serde(default)]
+    pub hunger_acc_secs: u32,
+    #[serde(default)]
+    pub sleep_acc_secs: u32,
+    #[serde(default)]
+    pub warmth_acc_secs: u32,
 }
 
 impl RunSave {
@@ -106,12 +187,91 @@ impl RunSave {
             header,
             player_x: 0,
             player_y: 0,
-            reeds_harvested: 0,
-            harvested_reeds: Vec::new(),
-            inventory: BTreeMap::new(),
-            region: default_region(),
+            pack: PackSave::default(),
+            cell_items: Vec::new(),
+            clock_seconds: 0,
+            needs: NeedsSave::default(),
+            explored_cells: Vec::new(),
+            active_action: None,
+            skills: SkillsSave::default(),
+            rng_state: 0,
+            terrain_mutations: Vec::new(),
         }
     }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PackSave {
+    #[serde(default)]
+    pub capacity_g: u32,
+    #[serde(default)]
+    pub contents: Vec<ItemInstanceSave>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ItemInstanceSave {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub count: u16,
+    #[serde(default)]
+    pub weight_g_each: u32,
+    #[serde(default)]
+    pub charges: Option<u16>,
+    #[serde(default)]
+    pub metadata: ItemMetadataSave,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub enum ItemMetadataSave {
+    #[default]
+    None,
+    Waterskin {
+        water_uses: u8,
+    },
+    /// Item is placed in the world (pitched tent, unrolled bedroll).
+    Pitched,
+    /// A lit fire with remaining fuel in game-seconds.
+    Lit {
+        fuel_seconds: u32,
+    },
+    /// CookingPan placed on a fire. Contents are encoded via two flat
+    /// string fields (`contents_kind` + `input`) plus the elapsed-secs
+    /// and seasonings u8 so adding a new PanContents variant later is
+    /// purely additive (unknown contents_kind -> Empty on load).
+    PannedOnFire {
+        #[serde(default)]
+        contents_kind: String,
+        #[serde(default)]
+        input: String,
+        #[serde(default)]
+        elapsed_secs: u32,
+        #[serde(default)]
+        seasonings: u8,
+        #[serde(default)]
+        fuel_seconds: u32,
+    },
+    /// Cooked food. `base`/`state` are stringly-typed so new variants
+    /// plug in without bumping schema; unknown strings fall back to
+    /// sensible defaults at load time.
+    Cooked {
+        #[serde(default)]
+        base: String,
+        #[serde(default)]
+        state: String,
+        #[serde(default)]
+        seasonings: u8,
+    },
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CellItemsSave {
+    #[serde(default)]
+    pub x: i32,
+    #[serde(default)]
+    pub y: i32,
+    #[serde(default)]
+    pub items: Vec<ItemInstanceSave>,
 }
 
 pub fn save_atomic<T: Serialize>(path: &Path, data: &T) -> io::Result<()> {
@@ -180,23 +340,93 @@ fn now_unix_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crafting::{CookableKind, CookedState, PanContents, Seasonings, ModifierTag};
+    use crate::items::{ItemInstance, ItemKind, ItemMetadata};
+
+    #[test]
+    fn panned_on_fire_metadata_round_trips_through_cbor() {
+        // Mid-cook fish with a herb seasoning, 1100 fuel-seconds left.
+        let pan = ItemInstance::unique(
+            ItemKind::CookingPan,
+            1_000,
+            None,
+            ItemMetadata::PannedOnFire {
+                contents: PanContents::Cooking {
+                    input: CookableKind::Fish,
+                    elapsed_secs: 47,
+                    seasonings: {
+                        let mut s = Seasonings::empty();
+                        s.set(ModifierTag::Herb);
+                        s
+                    },
+                },
+                fuel_seconds: 1_100,
+            },
+        );
+        let saved = pan.to_save();
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&saved, &mut bytes).unwrap();
+        let decoded: ItemInstanceSave = ciborium::from_reader(&*bytes).unwrap();
+        let restored = ItemInstance::from_save(&decoded).unwrap();
+        match restored.metadata {
+            ItemMetadata::PannedOnFire { contents, fuel_seconds } => {
+                assert_eq!(fuel_seconds, 1_100);
+                match contents {
+                    PanContents::Cooking { input, elapsed_secs, seasonings } => {
+                        assert_eq!(input, CookableKind::Fish);
+                        assert_eq!(elapsed_secs, 47);
+                        assert!(seasonings.has(ModifierTag::Herb));
+                    }
+                    other => panic!("expected Cooking, got {:?}", other),
+                }
+            }
+            other => panic!("expected PannedOnFire, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cooked_metadata_round_trips_with_seasonings_and_state() {
+        let mut s = Seasonings::empty();
+        s.set(ModifierTag::Herb);
+        let cooked = ItemInstance::unique(
+            ItemKind::Cooked,
+            400,
+            None,
+            ItemMetadata::Cooked {
+                base: CookableKind::Fish,
+                state: CookedState::Burnt,
+                seasonings: s,
+            },
+        );
+        let saved = cooked.to_save();
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&saved, &mut bytes).unwrap();
+        let decoded: ItemInstanceSave = ciborium::from_reader(&*bytes).unwrap();
+        let restored = ItemInstance::from_save(&decoded).unwrap();
+        match restored.metadata {
+            ItemMetadata::Cooked { base, state, seasonings } => {
+                assert_eq!(base, CookableKind::Fish);
+                assert_eq!(state, CookedState::Burnt);
+                assert!(seasonings.has(ModifierTag::Herb));
+            }
+            other => panic!("expected Cooked, got {:?}", other),
+        }
+    }
 
     #[test]
     fn round_trip_meta() {
-        let dir = std::env::temp_dir().join(format!("holyland-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("survival-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("meta.cbor");
 
         let mut meta = MetaSave::empty(SaveHeader::fresh(None));
         meta.xp = 42;
-        meta.oasis_intro_complete = true;
-        meta.unlocks.push("starter_oasis".to_string());
+        meta.unlocks.push("first_fire".to_string());
         save_atomic(&path, &meta).unwrap();
 
         let loaded = load_meta(&path).unwrap();
         assert_eq!(loaded.xp, 42);
-        assert!(loaded.oasis_intro_complete);
-        assert_eq!(loaded.unlocks, vec!["starter_oasis"]);
+        assert_eq!(loaded.unlocks, vec!["first_fire"]);
         assert_eq!(loaded.header.schema_version, SCHEMA_VERSION);
         assert_eq!(loaded.header.device_id, meta.header.device_id);
 
@@ -205,36 +435,190 @@ mod tests {
 
     #[test]
     fn round_trip_run() {
-        let dir = std::env::temp_dir().join(format!("holyland-run-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("survival-run-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("run.cbor");
 
         let header = SaveHeader::fresh(None);
-        let mut inventory = BTreeMap::new();
-        inventory.insert("reed".to_string(), 2);
         let run = RunSave {
             header,
             player_x: 5,
             player_y: 7,
-            reeds_harvested: 0,
-            harvested_reeds: vec![[8, 5], [9, 5]],
-            inventory,
-            region: "wilderness".to_string(),
+            pack: PackSave::default(),
+            cell_items: Vec::new(),
+            clock_seconds: 50_400,
+            needs: NeedsSave {
+                thirst: 75,
+                hunger: 75,
+                sleep: 75,
+                warmth: 100,
+                thirst_acc_secs: 0,
+                hunger_acc_secs: 0,
+                sleep_acc_secs: 0,
+                warmth_acc_secs: 0,
+            },
+            explored_cells: Vec::new(),
+            active_action: None,
+            skills: SkillsSave::default(),
+            rng_state: 0xDEADBEEF,
+            terrain_mutations: Vec::new(),
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
         assert_eq!(loaded.player_x, 5);
         assert_eq!(loaded.player_y, 7);
-        assert_eq!(loaded.harvested_reeds, vec![[8, 5], [9, 5]]);
-        assert_eq!(loaded.inventory.get("reed"), Some(&2));
-        assert_eq!(loaded.region, "wilderness");
+        assert_eq!(loaded.pack.capacity_g, 0);
+        assert!(loaded.pack.contents.is_empty());
+        assert!(loaded.cell_items.is_empty());
+        assert_eq!(loaded.clock_seconds, 50_400);
+        assert_eq!(loaded.needs.warmth, 100);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn round_trip_run_with_pack_and_cell_items() {
+        let dir = std::env::temp_dir().join(format!("survival-run-full-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("run.cbor");
+
+        let header = SaveHeader::fresh(None);
+        let pack = PackSave {
+            capacity_g: 15_000,
+            contents: vec![
+                ItemInstanceSave {
+                    kind: "axe".to_string(),
+                    count: 1,
+                    weight_g_each: 1000,
+                    charges: None,
+                    metadata: ItemMetadataSave::None,
+                },
+                ItemInstanceSave {
+                    kind: "waterskin".to_string(),
+                    count: 1,
+                    weight_g_each: 1200,
+                    charges: Some(4),
+                    metadata: ItemMetadataSave::Waterskin { water_uses: 4 },
+                },
+                ItemInstanceSave {
+                    kind: "twig".to_string(),
+                    count: 7,
+                    weight_g_each: 5,
+                    charges: None,
+                    metadata: ItemMetadataSave::None,
+                },
+            ],
+        };
+        let cell_items = vec![CellItemsSave {
+            x: 21,
+            y: 15,
+            items: vec![ItemInstanceSave {
+                kind: "stone".to_string(),
+                count: 1,
+                weight_g_each: 200,
+                charges: None,
+                metadata: ItemMetadataSave::None,
+            }],
+        }];
+        let run = RunSave {
+            header,
+            player_x: 21,
+            player_y: 15,
+            pack,
+            cell_items,
+            clock_seconds: 0,
+            needs: NeedsSave::default(),
+            explored_cells: vec![(21, 15), (22, 16)],
+            active_action: Some(ActiveActionSave {
+                steps: vec![ActionStepSave {
+                    id: "pitch_tent".to_string(),
+                    elapsed_secs: 42,
+                    target_secs: 300,
+                }],
+                view_mode: "time_skip".to_string(),
+            }),
+            skills: SkillsSave {
+                fire_making: SkillSave {
+                    value: 23,
+                    daily_xp: 6,
+                },
+            },
+            rng_state: 0xC0FFEE,
+            terrain_mutations: vec![TerrainMutationSave {
+                x: 5,
+                y: 7,
+                kind: "grass".to_string(),
+            }],
+        };
+        save_atomic(&path, &run).unwrap();
+        let loaded = load_run(&path).unwrap();
+        assert_eq!(loaded.pack.capacity_g, 15_000);
+        assert_eq!(loaded.explored_cells, vec![(21, 15), (22, 16)]);
+        let active = loaded.active_action.expect("active_action round-trip");
+        assert_eq!(active.steps.len(), 1);
+        assert_eq!(active.steps[0].id, "pitch_tent");
+        assert_eq!(active.steps[0].elapsed_secs, 42);
+        assert_eq!(active.view_mode, "time_skip");
+        assert_eq!(loaded.skills.fire_making.value, 23);
+        assert_eq!(loaded.skills.fire_making.daily_xp, 6);
+        assert_eq!(loaded.rng_state, 0xC0FFEE);
+        assert_eq!(loaded.terrain_mutations.len(), 1);
+        assert_eq!(loaded.terrain_mutations[0].kind, "grass");
+        assert_eq!(loaded.pack.contents.len(), 3);
+        assert_eq!(loaded.pack.contents[0].kind, "axe");
+        assert_eq!(loaded.pack.contents[1].kind, "waterskin");
+        assert!(matches!(
+            loaded.pack.contents[1].metadata,
+            ItemMetadataSave::Waterskin { water_uses: 4 }
+        ));
+        assert_eq!(loaded.pack.contents[2].count, 7);
+        assert_eq!(loaded.cell_items.len(), 1);
+        assert_eq!(loaded.cell_items[0].x, 21);
+        assert_eq!(loaded.cell_items[0].items[0].kind, "stone");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn loads_old_run_save_without_pack_fields() {
+        // Simulate a pre-phase-3 save by serializing only the header +
+        // position fields, then deserializing into the new RunSave shape.
+        // The #[serde(default)] attrs on pack/cell_items must fill in
+        // safely so old saves stay loadable.
+        #[derive(Serialize)]
+        struct LegacyRun {
+            header: SaveHeader,
+            player_x: i32,
+            player_y: i32,
+        }
+        let dir = std::env::temp_dir().join(format!("survival-legacy-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.cbor");
+
+        let legacy = LegacyRun {
+            header: SaveHeader::fresh(None),
+            player_x: 3,
+            player_y: 4,
+        };
+        save_atomic(&path, &legacy).unwrap();
+
+        let loaded = load_run(&path).unwrap();
+        assert_eq!(loaded.player_x, 3);
+        assert_eq!(loaded.player_y, 4);
+        assert_eq!(loaded.pack.capacity_g, 0);
+        assert!(loaded.pack.contents.is_empty());
+        assert!(loaded.cell_items.is_empty());
+        // Phase-4 fields must default safely on legacy saves too.
+        assert_eq!(loaded.clock_seconds, 0);
+        assert_eq!(loaded.needs.thirst, 0);
+        assert_eq!(loaded.needs.warmth, 0);
 
         fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn rejects_future_schema() {
-        let dir = std::env::temp_dir().join(format!("holyland-fut-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("survival-fut-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("future.cbor");
 
@@ -259,26 +643,5 @@ mod tests {
         assert_eq!(h3.save_counter, 3);
         assert_eq!(h1.device_id, h2.device_id);
         assert_eq!(h2.device_id, h3.device_id);
-    }
-
-    #[test]
-    fn starter_oasis_unlock_is_not_duplicated() {
-        let mut meta = MetaSave::empty(SaveHeader::fresh(None));
-        complete_starter_oasis(&mut meta);
-        complete_starter_oasis(&mut meta);
-
-        assert!(meta.oasis_intro_complete);
-        assert_eq!(meta.unlocks, vec!["starter_oasis"]);
-        assert_eq!(meta.xp, 1);
-    }
-
-    fn complete_starter_oasis(meta: &mut MetaSave) {
-        if !meta.oasis_intro_complete {
-            meta.oasis_intro_complete = true;
-            meta.xp += 1;
-        }
-        if !meta.unlocks.iter().any(|u| u == "starter_oasis") {
-            meta.unlocks.push("starter_oasis".to_string());
-        }
     }
 }

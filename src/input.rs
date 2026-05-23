@@ -17,6 +17,12 @@ pub enum Action {
     Y,
     L,
     R,
+    /// Outer-left shoulder ("L2"). Bound on desktop (X key) for future use;
+    /// not currently mapped by the Miyoo kernel keymap.
+    L2,
+    /// Outer-right shoulder ("R2"). Bound on desktop (V key); not mapped on
+    /// Miyoo.
+    R2,
     Start,
     Select,
 }
@@ -48,7 +54,7 @@ impl Input {
             Event::KeyDown { keycode: Some(kc), repeat: false, .. } => {
                 match keycode_to_action(*kc) {
                     Some(action) => self.press(action),
-                    None => eprintln!("input: unmapped keycode {:?}", kc),
+                    None => crate::log_debug!("input: unmapped keycode {:?}", kc),
                 }
             }
             Event::KeyUp { keycode: Some(kc), .. } => {
@@ -108,6 +114,12 @@ impl Input {
         }
     }
 
+    /// Is `a` currently held? Used for press-vs-tap-vs-hold detection
+    /// in main.rs (phase 15 hold-Y radial).
+    pub fn is_held(&self, a: Action) -> bool {
+        self.held.contains(&a)
+    }
+
     pub fn drain(&mut self) -> Vec<Action> {
         let mut out = std::mem::take(&mut self.queued);
         let now = Instant::now();
@@ -129,27 +141,59 @@ fn is_movement(a: Action) -> bool {
     matches!(a, Action::Up | Action::Down | Action::Left | Action::Right)
 }
 
+/// Desktop keyboard mapping (per user-locked spec):
+///   Arrow keys -> dpad (Up/Down/Left/Right)
+///   A S D F   -> face buttons A B X Y
+///   Z X C V   -> shoulder buttons L L2 R R2
+///   Escape    -> Start (quit-current-game)
+///   L/R Shift -> Select (manual save)
+///
+/// The desktop layout intentionally does NOT inherit the Miyoo kernel
+/// keymap (Space, LCtrl, LShift, etc.) because LShift means X-face on
+/// Miyoo and Select on desktop — keeping them merged would be confusing.
+#[cfg(not(target_arch = "arm"))]
 fn keycode_to_action(kc: Keycode) -> Option<Action> {
-    // Two layers per row: desktop convention, then Miyoo Mini Plus / Onion
-    // kernel-keymap convention (A=Space, B=LCtrl, X=LShift, Y=LAlt, L=Tab,
-    // R=Backspace, Start=Enter, Select=RCtrl, Menu=Esc). On the Miyoo ARM
-    // build, the shutdown/menu path has also been observed as raw keycode 116
-    // (SDL's T), so treat it as a clean quit there.
     Some(match kc {
-        Keycode::Up | Keycode::W | Keycode::K => Action::Up,
-        Keycode::Down | Keycode::S | Keycode::J => Action::Down,
-        Keycode::Left | Keycode::A | Keycode::H => Action::Left,
-        Keycode::Right | Keycode::D | Keycode::L => Action::Right,
-        Keycode::Z | Keycode::Space => Action::A,
-        Keycode::X | Keycode::LCtrl => Action::B,
-        Keycode::C | Keycode::LShift => Action::X,
-        Keycode::V | Keycode::LAlt => Action::Y,
-        Keycode::Q | Keycode::Tab => Action::L,
-        Keycode::E | Keycode::Backspace => Action::R,
-        Keycode::Return | Keycode::Escape => Action::Start,
-        #[cfg(target_arch = "arm")]
-        Keycode::T => Action::Start,
-        Keycode::RShift | Keycode::RCtrl => Action::Select,
+        Keycode::Up => Action::Up,
+        Keycode::Down => Action::Down,
+        Keycode::Left => Action::Left,
+        Keycode::Right => Action::Right,
+        Keycode::A => Action::A,
+        Keycode::S => Action::B,
+        Keycode::D => Action::X,
+        Keycode::F => Action::Y,
+        Keycode::Z => Action::L,
+        Keycode::X => Action::L2,
+        Keycode::C => Action::R,
+        Keycode::V => Action::R2,
+        Keycode::Escape => Action::Start,
+        Keycode::LShift | Keycode::RShift => Action::Select,
+        _ => return None,
+    })
+}
+
+/// Miyoo Mini Plus / Onion kernel keymap. The kernel emits these keycodes
+/// when the physical buttons are pressed (per AGENTS.md): A=Space,
+/// B=LCtrl, X=LShift, Y=LAlt, L=Tab, R=Backspace, Start=Enter,
+/// Select=RCtrl, Menu=Esc. The dpad emits arrow keycodes. Raw keycode 116
+/// (SDL's T) has also been observed for the menu/shutdown path and is
+/// treated as a clean quit.
+#[cfg(target_arch = "arm")]
+fn keycode_to_action(kc: Keycode) -> Option<Action> {
+    Some(match kc {
+        Keycode::Up => Action::Up,
+        Keycode::Down => Action::Down,
+        Keycode::Left => Action::Left,
+        Keycode::Right => Action::Right,
+        Keycode::Space => Action::A,
+        Keycode::LCtrl => Action::B,
+        Keycode::LShift => Action::X,
+        Keycode::LAlt => Action::Y,
+        Keycode::Tab => Action::L,
+        Keycode::Backspace => Action::R,
+        Keycode::Return | Keycode::T => Action::Start,
+        Keycode::RCtrl => Action::Select,
+        Keycode::Escape => Action::Start,
         _ => return None,
     })
 }
@@ -167,6 +211,8 @@ fn button_to_action(b: Button) -> Option<Action> {
         Button::North => Action::Y,
         Button::LeftTrigger => Action::L,
         Button::RightTrigger => Action::R,
+        Button::LeftTrigger2 => Action::L2,
+        Button::RightTrigger2 => Action::R2,
         Button::Start => Action::Start,
         Button::Select => Action::Select,
         _ => return None,
