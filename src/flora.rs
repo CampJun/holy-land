@@ -17,6 +17,7 @@ pub enum TreeSpecies {
     Rowan,
 }
 
+#[allow(dead_code)] // exposed for tests + future ManagedSpecies surfaces
 pub const ALL_TREE_SPECIES: &[TreeSpecies] = &[
     TreeSpecies::Oak,
     TreeSpecies::Hazel,

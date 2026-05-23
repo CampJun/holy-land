@@ -1859,6 +1859,16 @@ mod tests {
         // overlap the player's radius-3 night FOV, so we can pin down
         // "player FOV only" vs "fire FOV only" cells unambiguously.
         let pos = world.player_pos();
+        // Clear the corridor between the fire and the cells we want to
+        // observe — Phase E's noise chunkgen can drop trees or Gorse
+        // along (pos.x + 1..15, pos.y) and shadow the fire's FOV.
+        for dx in 0..=15 {
+            if let Some(cell) = world.cell_at_mut((pos.x + dx) as i64, pos.y as i64) {
+                cell.terrain = TerrainKind::Grass;
+                cell.decoration = crate::flora::Decoration::None;
+                cell.tree_species = None;
+            }
+        }
         if let Some(cell) = world.cell_at_mut((pos.x + 9) as i64, pos.y as i64) {
             cell.items.push(ItemInstance::unique(
                 ItemKind::Firewood,
@@ -1908,6 +1918,15 @@ mod tests {
         // Lit fire 5 east with just enough fuel to die inside the next
         // tick. From the fire's pos, its disc reaches +10 east; from the
         // player's, those cells are well outside the night radius-3 FOV.
+        // Clear the eastern corridor so chunkgen-placed blockers don't
+        // shadow the fire's FOV.
+        for dx in 0..=12 {
+            if let Some(cell) = world.cell_at_mut((pos.x + dx) as i64, pos.y as i64) {
+                cell.terrain = TerrainKind::Grass;
+                cell.decoration = crate::flora::Decoration::None;
+                cell.tree_species = None;
+            }
+        }
         if let Some(cell) = world.cell_at_mut((pos.x + 5) as i64, pos.y as i64) {
             cell.items.push(ItemInstance::unique(
                 ItemKind::Firewood,
