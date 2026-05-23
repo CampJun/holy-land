@@ -395,6 +395,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if run.rng_state != 0 {
             world.rng = Rng::from_state(run.rng_state);
         }
+        // Combat foundation: per-actor speed. Saves written before this
+        // field existed default to BASELINE via #[serde(default)], so
+        // loading is a one-liner — no zero-guard needed.
+        world.set_player_speed(run.speed);
         // Phase-11b: restore terrain mutations (chopped trees, etc.)
         // after chunkgen has produced the chunk defaults.
         if !run.terrain_mutations.is_empty() {
@@ -1312,6 +1316,7 @@ fn save_game(
         },
     };
     run.rng_state = world.rng.state;
+    run.speed = world.player_speed();
     run.terrain_mutations = world
         .snapshot_terrain_mutations()
         .into_iter()
