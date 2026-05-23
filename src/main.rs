@@ -1,4 +1,5 @@
 mod action;
+mod calendar;
 mod chunkgen;
 mod crafting;
 #[cfg(not(target_arch = "arm"))]
@@ -312,6 +313,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if run.clock_seconds > 0 {
             world.clock_seconds = run.clock_seconds;
         }
+        // Schema-v2 calendar_day. Defaults to START_DAY on saves
+        // written before this field existed (via #[serde(default)]),
+        // so a non-default value always reflects an explicit write.
+        world.calendar_day = run.calendar_day;
         if run.needs.warmth > 0
             || run.needs.thirst > 0
             || run.needs.hunger > 0
@@ -911,6 +916,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let is_night = world.is_night();
         let tint = brightness_at(world.clock_seconds);
         let player_skills = world.player_skills();
+        let calendar_day = world.calendar_day;
         let mut ui_cells = build_ui_cells(
             &palette,
             needs,
@@ -919,6 +925,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             clock_m,
             is_night,
             player_skills,
+            calendar_day,
         );
         draw_here_line(&mut ui_cells, &world, &palette);
         if let Some(active) = world.active_action.as_ref() {
@@ -1177,6 +1184,7 @@ fn save_game(
         })
         .collect();
     run.clock_seconds = world.clock_seconds;
+    run.calendar_day = world.calendar_day;
     let n = world.player_needs();
     run.needs = NeedsSave {
         thirst: n.thirst,
@@ -1255,6 +1263,7 @@ fn build_ui_cells(
     clock_m: u8,
     is_night: bool,
     skills: Skills,
+    calendar_day: u32,
 ) -> Vec<Option<Cell>> {
     let mut cells = vec![None; (WORLD_W * WORLD_H) as usize];
 
@@ -1262,6 +1271,16 @@ fn build_ui_cells(
     let suffix = if is_night { "night" } else { "day" };
     let left = format!("Day {} {:02}:{:02} {}", day, clock_h, clock_m, suffix);
     put_text(&mut cells, 1, 1, &left, palette.hud_fg, palette.hud_bg);
+
+    // Row 2 right: calendar date + season label, e.g. "21 Mar Spring".
+    // Right-aligned so it sits opposite the Fire Making skill readout
+    // on Row 2 left. Updated only when the calendar advances; the
+    // dirty-cell diff path skips redraws on unchanged frames.
+    let (_year, month, dom) = calendar::date_of(calendar_day);
+    let season = calendar::season_of(calendar_day);
+    let date_str = format!("{} {} {}", dom, month.short_label(), season.label());
+    let dx = WORLD_W as i32 - date_str.len() as i32 - 1;
+    put_text(&mut cells, dx, 2, &date_str, palette.hud_fg, palette.hud_bg);
 
     // Row 1 right: four CP437 need meters, each with its own symbol
     // fg so the atlas-colored sprites (mug, chicken leg, sun) tint

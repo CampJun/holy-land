@@ -18,6 +18,7 @@ use hecs::{Entity, World as Ecs};
 use serde::{Deserialize, Serialize};
 
 use crate::action::ActionId;
+use crate::calendar::{self, Season};
 use crate::items::{starting_pack, ItemInstance, ItemKind, ItemMetadata, Pack};
 use crate::needs::{Needs, NeedsEnv};
 use crate::skill::{Rng, Skills};
@@ -410,6 +411,11 @@ pub struct World {
     /// change here; on load the entries get re-applied after chunkgen
     /// regenerates the chunk's defaults. Keyed on world coords.
     pub terrain_mutations: HashMap<(i32, i32), TerrainKind>,
+    /// In-game calendar day, 1-indexed since 1 Jan 1300 (so spawn day =
+    /// 80 = 21 Mar 1300). Advances each midnight crossing inside
+    /// `advance_time_raw`. Drives `season_of` for the seasons/flora
+    /// cluster.
+    pub calendar_day: u32,
 }
 
 /// In-flight multi-turn action queue. `steps[0]` is the currently-running
@@ -510,6 +516,7 @@ impl World {
             active_action: None,
             rng: Rng::from_world_seed(DEFAULT_SEED),
             terrain_mutations: HashMap::new(),
+            calendar_day: calendar::START_DAY,
         };
         // First-frame FOV so the renderer doesn't draw a black screen on
         // the very first paint.
@@ -692,6 +699,11 @@ impl World {
         self.clock_seconds / DAY_LENGTH_SECONDS + 1
     }
 
+    /// Current season. Pure function of `calendar_day`.
+    pub fn season(&self) -> Season {
+        calendar::season_of(self.calendar_day)
+    }
+
     fn needs_env(&self) -> NeedsEnv {
         NeedsEnv {
             is_night: self.is_night(),
@@ -727,7 +739,15 @@ impl World {
             return;
         }
         let was_night = self.is_night();
+        let before = self.clock_seconds;
         self.clock_seconds = self.clock_seconds.saturating_add(secs as u64);
+        // Calendar day advances at each midnight (24h) crossing. Use
+        // floor-division on before/after so multi-day jumps from debug
+        // commands or long sleeps land on the right calendar_day.
+        let midnights = self.clock_seconds / DAY_LENGTH_SECONDS - before / DAY_LENGTH_SECONDS;
+        if midnights > 0 {
+            self.calendar_day = self.calendar_day.saturating_add(midnights as u32);
+        }
         let env = self.needs_env();
         let mut needs = self.player_needs();
         needs.tick(secs, env);
@@ -1926,6 +1946,51 @@ mod tests {
             world.active_action.as_ref().unwrap().view_mode,
             ViewMode::ProgressBar
         );
+    }
+
+    #[test]
+    fn calendar_day_starts_at_spring_start() {
+        let world = World::new(CHUNK_W, CHUNK_H);
+        assert_eq!(world.calendar_day, crate::calendar::START_DAY);
+        assert_eq!(world.season(), crate::calendar::Season::Spring);
+    }
+
+    #[test]
+    fn calendar_day_advances_on_midnight_crossing() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let start_day = world.calendar_day;
+        // Spawn at 14:00 — 10 hours to midnight. Advance 11h to cross
+        // it. advance_time_raw skips need-penalty amplification.
+        world.advance_time_raw(11 * 3600);
+        assert_eq!(
+            world.calendar_day,
+            start_day + 1,
+            "midnight crossing must bump calendar_day"
+        );
+    }
+
+    #[test]
+    fn calendar_day_handles_multi_day_jump() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let start_day = world.calendar_day;
+        // Skip exactly two midnight crossings (~48h from 14:00). The
+        // debug console can do larger jumps; sleep can do ~8h max but
+        // a long inactive session compounds. Test the floor-division
+        // shape so multi-day skips don't undercount.
+        world.advance_time_raw(2 * 24 * 3600);
+        assert_eq!(world.calendar_day, start_day + 2);
+    }
+
+    #[test]
+    fn season_changes_when_calendar_crosses_boundary() {
+        use crate::calendar::Season;
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // START_DAY = 80 = first day of Spring. Walk forward to day 172
+        // (first day of Summer).
+        world.calendar_day = 171; // last Spring
+        assert_eq!(world.season(), Season::Spring);
+        world.calendar_day = 172;
+        assert_eq!(world.season(), Season::Summer);
     }
 
     #[test]
