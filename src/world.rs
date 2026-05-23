@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::action::ActionId;
 use crate::calendar::{self, Season};
+use crate::flora::{Decoration, TreeSpecies};
 use crate::items::{starting_pack, ItemInstance, ItemKind, ItemMetadata, Pack};
 use crate::needs::{Needs, NeedsEnv};
 use crate::skill::{Rng, Skills};
@@ -245,19 +246,6 @@ impl GroundCover {
 /// burnt-out groves) — see assets/CP437_MAP.md.
 pub const TREE_VARIANT_GLYPHS: &[u8] = &[0x05, 0x06, 0x17, 0x18];
 
-/// Tint colors applied per-cell to tree canopies so adjacent trees
-/// have slightly different hues. Atlas pixel × variant fg / 255 →
-/// shaded canopy in that base hue. Five entries cover summer-forest
-/// palette: bright green, deep green, olive, yellow-green, and one
-/// autumn-brown for accent. Hash mixer picks per cell.
-pub const TREE_TINT_VARIANTS: &[[u8; 3]] = &[
-    [85, 140, 55],   // bright forest green
-    [60, 100, 40],   // dark green
-    [110, 145, 60],  // olive
-    [130, 160, 50],  // yellow-green
-    [140, 100, 45],  // autumn brown (rare accent)
-];
-
 /// Iteration order for `TerrainKind::from_save_key`. Keep in sync with
 /// the enum variants — adding a kind here makes from_save_key find it.
 const ALL_TERRAINS: &[TerrainKind] = &[
@@ -434,6 +422,13 @@ pub struct CellState {
     /// and never lands here. Chunkgen places LeafLitter; the Phase-D
     /// lifecycle scheduler manages FallenLeaves spawn/clear.
     pub ground_cover: GroundCover,
+    /// Tree species when `terrain == TreeTrunk`. None elsewhere. Drives
+    /// per-cell canopy tint (Phase C replaces the species-agnostic
+    /// TREE_TINT_VARIANTS lottery) and mast drops in Phase D.
+    pub tree_species: Option<TreeSpecies>,
+    /// Undergrowth overlay (Fern/Moss/Bramble/Bracken/Gorse/Sapling/
+    /// Mushroom). Gorse blocks pass + LOS; the others pass through.
+    pub decoration: Decoration,
 }
 
 impl CellState {
@@ -445,6 +440,8 @@ impl CellState {
             explored: false,
             light_intensity: 0,
             ground_cover: GroundCover::None,
+            tree_species: None,
+            decoration: Decoration::None,
         }
     }
 }
@@ -636,6 +633,33 @@ impl World {
         chunk.cells[(ly * CHUNK_W + lx) as usize].terrain
     }
 
+    /// True if the cell at `(wx, wy)` is walkable: terrain must be
+    /// walkable AND any decoration must not block pass (Gorse stops
+    /// movement). Unloaded / OOB cells are not walkable.
+    pub fn cell_walkable_at(&self, wx: i64, wy: i64) -> bool {
+        let terrain_ok = self.tile_at(wx, wy).def().walkable;
+        if !terrain_ok {
+            return false;
+        }
+        match self.cell_at(wx, wy) {
+            Some(c) => !c.decoration.blocks_pass(),
+            None => false,
+        }
+    }
+
+    /// True if the cell at `(wx, wy)` blocks line of sight: either
+    /// the terrain blocks sight OR a decoration there blocks (Gorse).
+    /// Unloaded / OOB cells block sight by default.
+    pub fn cell_blocks_sight_at(&self, wx: i64, wy: i64) -> bool {
+        if self.tile_at(wx, wy).def().blocks_sight {
+            return true;
+        }
+        match self.cell_at(wx, wy) {
+            Some(c) => c.decoration.blocks_sight(),
+            None => true,
+        }
+    }
+
     pub fn cell_at(&self, wx: i64, wy: i64) -> Option<&CellState> {
         let (cc, lx, ly) = Self::chunk_coord_for(wx, wy);
         let chunk = self.chunks.get(&cc)?;
@@ -736,7 +760,7 @@ impl World {
         // move would be rejected.
         let (target_cc, _, _) = Self::chunk_coord_for(nx as i64, ny as i64);
         self.ensure_chunk_ring(target_cc);
-        if self.tile_at(nx as i64, ny as i64).def().walkable {
+        if self.cell_walkable_at(nx as i64, ny as i64) {
             self.set_player_pos(Position { x: nx, y: ny });
             self.spend_action_time(COST_MOVE_TILE);
             self.recompute_fov();
@@ -1239,7 +1263,7 @@ impl World {
             for dx in -radius..=radius {
                 let wx = origin.x as i64 + dx as i64;
                 let wy = origin.y as i64 + dy as i64;
-                if self.tile_at(wx, wy).def().blocks_sight {
+                if self.cell_blocks_sight_at(wx, wy) {
                     blockers[blocker_idx(dx, dy)] = true;
                 }
             }

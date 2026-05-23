@@ -147,6 +147,13 @@ pub struct TerrainMutationSave {
 pub struct SkillsSave {
     #[serde(default)]
     pub fire_making: SkillSave,
+    // Phase-C: Foraging skill. Defaults to all-zero on saves written
+    // before this field existed; the load path falls back to
+    // `Skills::starting()` for any save where fire_making is also zero
+    // (pre-phase-10), so the new field never sets a brand-new player's
+    // skill to 0 by accident.
+    #[serde(default)]
+    pub foraging: SkillSave,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -571,6 +578,7 @@ mod tests {
                     value: 23,
                     daily_xp: 6,
                 },
+                foraging: SkillSave::default(),
             },
             rng_state: 0xC0FFEE,
             terrain_mutations: vec![TerrainMutationSave {

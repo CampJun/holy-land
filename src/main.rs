@@ -4,6 +4,7 @@ mod chunkgen;
 mod crafting;
 #[cfg(not(target_arch = "arm"))]
 mod debug_console;
+mod flora;
 mod fov;
 mod input;
 mod items;
@@ -34,7 +35,7 @@ use save::{
 use skill::{Rng, Skill, SkillKind, Skills};
 use world::{
     brightness_at, dawns_elapsed, GroundCover, Position, TerrainKind, ViewMode, World,
-    MULTI_TURN_GAME_SEC_PER_FRAME, TREE_TINT_VARIANTS, TREE_VARIANT_GLYPHS,
+    MULTI_TURN_GAME_SEC_PER_FRAME, TREE_VARIANT_GLYPHS,
 };
 
 const WORLD_W: u32 = 40;
@@ -369,13 +370,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // zero defaults; treat all-zero as "no data, keep the freshly
         // built Skills::starting()" so loaded games don't suddenly
         // start with Fire Making 0.
-        let saved_skill = run.skills.fire_making;
-        if saved_skill.value > 0 || saved_skill.daily_xp > 0 {
+        let saved_fm = run.skills.fire_making;
+        if saved_fm.value > 0 || saved_fm.daily_xp > 0 {
+            let saved_fo = run.skills.foraging;
+            // Saves written before Phase C carry foraging=all-zero. Fall
+            // back to the starting Foraging value so an existing player
+            // doesn't get their (never-touched) foraging stat read as 0.
+            let foraging = if saved_fo.value > 0 || saved_fo.daily_xp > 0 {
+                Skill {
+                    value: saved_fo.value,
+                    daily_xp: saved_fo.daily_xp,
+                }
+            } else {
+                Skills::starting().foraging
+            };
             world.set_player_skills(Skills {
                 fire_making: Skill {
-                    value: saved_skill.value,
-                    daily_xp: saved_skill.daily_xp,
+                    value: saved_fm.value,
+                    daily_xp: saved_fm.daily_xp,
                 },
+                foraging,
             });
         }
         if run.rng_state != 0 {
@@ -1011,17 +1025,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     glyph = b' ';
                 }
-                // Per-cell tree-variant pick from TREE_VARIANT_GLYPHS
-                // so the forest has visual variety instead of a row of
-                // identical spades. Tint is also picked per-cell from
-                // TREE_TINT_VARIANTS so adjacent trees have slightly
-                // different greens (with the occasional autumn-brown).
+                // Tree rendering: glyph + tint by species + season. The
+                // per-cell `cell.tree_species` (set by chunkgen) picks
+                // the species glyph; the per-species canopy_fg table
+                // picks the seasonal tint. Cells with no species (only
+                // hit if a save predates Phase C) fall back to the
+                // per-cell hash + species-agnostic TREE_VARIANT_GLYPHS
+                // catalog for visual variety.
                 if terrain == TerrainKind::TreeTrunk {
-                    let gi = tree_variant_index(wx as i32, wy as i32, world.seed);
-                    glyph = TREE_VARIANT_GLYPHS[gi % TREE_VARIANT_GLYPHS.len()];
-                    let ci = tree_tint_index(wx as i32, wy as i32, world.seed);
-                    let t = TREE_TINT_VARIANTS[ci % TREE_TINT_VARIANTS.len()];
-                    fg = Color::RGB(t[0], t[1], t[2]);
+                    let species = world.cell_at(wx, wy).and_then(|c| c.tree_species);
+                    match species {
+                        Some(sp) => {
+                            glyph = sp.canopy_glyph();
+                            let t = sp.canopy_fg(season);
+                            fg = Color::RGB(t[0], t[1], t[2]);
+                        }
+                        None => {
+                            let gi = tree_variant_index(wx as i32, wy as i32, world.seed);
+                            glyph = TREE_VARIANT_GLYPHS[gi % TREE_VARIANT_GLYPHS.len()];
+                        }
+                    }
                 }
                 let cell_state = world.cell_at(wx, wy);
                 let visible = cell_state.map(|c| c.visible).unwrap_or(false);
@@ -1225,6 +1248,10 @@ fn save_game(
         fire_making: SkillSave {
             value: player_skills.fire_making.value,
             daily_xp: player_skills.fire_making.daily_xp,
+        },
+        foraging: SkillSave {
+            value: player_skills.foraging.value,
+            daily_xp: player_skills.foraging.daily_xp,
         },
     };
     run.rng_state = world.rng.state;
@@ -1439,19 +1466,6 @@ fn tree_variant_index(x: i32, y: i32, seed: u64) -> usize {
         .wrapping_add((y as i64).wrapping_mul(2_654_435_761))
         .wrapping_add(seed as i64);
     let mixed = (h as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    (mixed >> 28) as usize
-}
-
-/// Index into `TREE_TINT_VARIANTS` for a given cell. Uses different
-/// mixer constants from `tree_variant_index` so a cell's silhouette
-/// pick and its tint pick are decorrelated — same atlas glyph can
-/// appear in any tint, and vice versa.
-fn tree_tint_index(x: i32, y: i32, seed: u64) -> usize {
-    let h = (x as i64)
-        .wrapping_mul(2_246_822_519_i64)
-        .wrapping_add((y as i64).wrapping_mul(40_503))
-        .wrapping_add((seed as i64).wrapping_mul(73_856_093));
-    let mixed = (h as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     (mixed >> 28) as usize
 }
 

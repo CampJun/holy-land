@@ -27,6 +27,7 @@
 // function will produce phase-12+ wilderness chunks when the player
 // crosses chunk boundaries.
 
+use crate::flora::ALL_TREE_SPECIES;
 use crate::items::{ItemInstance, ItemKind, ItemMetadata};
 use crate::skill::Rng;
 use crate::world::{CellState, Chunk, ChunkCoord, GroundCover, TerrainKind, CHUNK_H, CHUNK_W};
@@ -89,6 +90,17 @@ pub fn generate_chunk(coord: ChunkCoord, world_seed: u64) -> Chunk {
             ItemMetadata::None,
         ));
         herb_placed += 1;
+    }
+
+    // Step 3.25: tag every TreeTrunk cell with a species. Uniform
+    // random for Phase C; Phase E replaces with noise-weighted
+    // selection driven by canopy/moisture fields. Deterministic
+    // per (world_seed, chunk_coord) because `rng` is.
+    for cell in cells.iter_mut() {
+        if cell.terrain == TerrainKind::TreeTrunk {
+            let pick = (rng.next_u32() as usize) % ALL_TREE_SPECIES.len();
+            cell.tree_species = Some(ALL_TREE_SPECIES[pick]);
+        }
     }
 
     // Step 3.5: LeafLitter ground-cover on every Grass cell within 1
@@ -503,6 +515,34 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn every_tree_cell_has_a_species() {
+        let chunk = generate_chunk(ChunkCoord { cx: 0, cy: 0 }, 0xC0FFEE);
+        for c in chunk.cells.iter() {
+            if c.terrain == TerrainKind::TreeTrunk {
+                assert!(
+                    c.tree_species.is_some(),
+                    "TreeTrunk cell missing tree_species — chunkgen must tag every tree"
+                );
+            } else {
+                assert!(
+                    c.tree_species.is_none(),
+                    "non-tree cell has tree_species = {:?}",
+                    c.tree_species
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn species_round_trips_with_same_seed() {
+        let a = generate_chunk(ChunkCoord { cx: 0, cy: 0 }, 0xC0FFEE);
+        let b = generate_chunk(ChunkCoord { cx: 0, cy: 0 }, 0xC0FFEE);
+        for (ca, cb) in a.cells.iter().zip(b.cells.iter()) {
+            assert_eq!(ca.tree_species, cb.tree_species);
         }
     }
 

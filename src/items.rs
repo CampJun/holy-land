@@ -41,6 +41,17 @@ pub enum ItemKind {
     /// flavor lives in `ItemMetadata::Cooked { base, state, seasonings }`.
     /// Display_label spells out the human-readable name.
     Cooked,
+    // ---- Phase C: undergrowth harvest yields + tree mast ----
+    Moss,
+    FernFrond,
+    FernRoot,
+    /// Gorse cuttings bundled for fire — kindling, burns hot+fast.
+    GorseFaggot,
+    BrackenStraw,
+    BrambleFruit,
+    Hazelnut,
+    Acorn,
+    RowanBerry,
 }
 
 /// All per-kind metadata in one place. Adding a new `ItemKind` variant is
@@ -88,6 +99,15 @@ const ALL_KINDS: &[ItemKind] = &[
     ItemKind::Ration,
     ItemKind::Fish,
     ItemKind::Cooked,
+    ItemKind::Moss,
+    ItemKind::FernFrond,
+    ItemKind::FernRoot,
+    ItemKind::GorseFaggot,
+    ItemKind::BrackenStraw,
+    ItemKind::BrambleFruit,
+    ItemKind::Hazelnut,
+    ItemKind::Acorn,
+    ItemKind::RowanBerry,
 ];
 
 impl ItemKind {
@@ -280,6 +300,88 @@ impl ItemKind {
                 glyph: b'%',
                 color: [200, 150, 90],
                 default_weight_g: 400,
+                blends_with_terrain: false,
+            },
+            // Phase C: undergrowth harvest yields.
+            ItemKind::Moss => ItemDef {
+                save_key: "moss",
+                name: "moss",
+                is_fungible: true,
+                glyph: 0x07,
+                color: [80, 130, 80],
+                default_weight_g: 10,
+                blends_with_terrain: true,
+            },
+            ItemKind::FernFrond => ItemDef {
+                save_key: "fern_frond",
+                name: "fern frond",
+                is_fungible: true,
+                glyph: 0xF0,
+                color: [90, 145, 70],
+                default_weight_g: 15,
+                blends_with_terrain: true,
+            },
+            ItemKind::FernRoot => ItemDef {
+                save_key: "fern_root",
+                name: "fern root",
+                is_fungible: true,
+                glyph: b'/',
+                color: [140, 100, 60],
+                default_weight_g: 40,
+                blends_with_terrain: false,
+            },
+            ItemKind::GorseFaggot => ItemDef {
+                save_key: "gorse_faggot",
+                name: "gorse faggot",
+                is_fungible: true,
+                glyph: 0x16,
+                color: [200, 170, 60],
+                default_weight_g: 250,
+                blends_with_terrain: false,
+            },
+            ItemKind::BrackenStraw => ItemDef {
+                save_key: "bracken_straw",
+                name: "bracken straw",
+                is_fungible: true,
+                glyph: b'"',
+                color: [160, 110, 50],
+                default_weight_g: 5,
+                blends_with_terrain: true,
+            },
+            ItemKind::BrambleFruit => ItemDef {
+                save_key: "bramble_fruit",
+                name: "bramble fruit",
+                is_fungible: true,
+                glyph: 0xFA,
+                color: [140, 60, 95],
+                default_weight_g: 25,
+                blends_with_terrain: false,
+            },
+            ItemKind::Hazelnut => ItemDef {
+                save_key: "hazelnut",
+                name: "hazelnut",
+                is_fungible: true,
+                glyph: b'o',
+                color: [180, 130, 70],
+                default_weight_g: 8,
+                blends_with_terrain: false,
+            },
+            ItemKind::Acorn => ItemDef {
+                save_key: "acorn",
+                name: "acorn",
+                is_fungible: true,
+                glyph: b'o',
+                color: [150, 110, 60],
+                default_weight_g: 12,
+                blends_with_terrain: false,
+            },
+            ItemKind::RowanBerry => ItemDef {
+                save_key: "rowan_berry",
+                name: "rowan berry",
+                is_fungible: true,
+                glyph: 0xFA,
+                color: [200, 70, 50],
+                default_weight_g: 10,
                 blends_with_terrain: false,
             },
         }
