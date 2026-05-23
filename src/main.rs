@@ -1,8 +1,10 @@
 mod action;
+mod calendar;
 mod chunkgen;
 mod crafting;
 #[cfg(not(target_arch = "arm"))]
 mod debug_console;
+mod flora;
 mod fov;
 mod input;
 mod items;
@@ -27,13 +29,13 @@ use items::{ItemInstance, Pack};
 use needs::Needs;
 use render::{draw_glyph, load_atlas, CELL_SIZE};
 use save::{
-    ActionStepSave, ActiveActionSave, CellItemsSave, MetaSave, NeedsSave, RunSave, SaveHeader,
-    SkillSave, SkillsSave, TerrainMutationSave,
+    ActionStepSave, ActiveActionSave, CellItemsSave, DecorationMutationSave, MetaSave, NeedsSave,
+    RunSave, SaveHeader, SkillSave, SkillsSave, TerrainMutationSave, TreeSpeciesMutationSave,
 };
 use skill::{Rng, Skill, SkillKind, Skills};
 use world::{
-    brightness_at, dawns_elapsed, Position, TerrainKind, ViewMode, World,
-    MULTI_TURN_GAME_SEC_PER_FRAME, TREE_TINT_VARIANTS, TREE_VARIANT_GLYPHS,
+    brightness_at, dawns_elapsed, GroundCover, Position, TerrainKind, ViewMode, World,
+    MULTI_TURN_GAME_SEC_PER_FRAME, TREE_VARIANT_GLYPHS,
 };
 
 const WORLD_W: u32 = 40;
@@ -312,6 +314,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if run.clock_seconds > 0 {
             world.clock_seconds = run.clock_seconds;
         }
+        // Schema-v2 calendar_day. Defaults to START_DAY on saves
+        // written before this field existed (via #[serde(default)]),
+        // so a non-default value always reflects an explicit write.
+        world.calendar_day = run.calendar_day;
         if run.needs.warmth > 0
             || run.needs.thirst > 0
             || run.needs.hunger > 0
@@ -364,13 +370,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // zero defaults; treat all-zero as "no data, keep the freshly
         // built Skills::starting()" so loaded games don't suddenly
         // start with Fire Making 0.
-        let saved_skill = run.skills.fire_making;
-        if saved_skill.value > 0 || saved_skill.daily_xp > 0 {
+        let saved_fm = run.skills.fire_making;
+        if saved_fm.value > 0 || saved_fm.daily_xp > 0 {
+            let saved_fo = run.skills.foraging;
+            // Saves written before Phase C carry foraging=all-zero. Fall
+            // back to the starting Foraging value so an existing player
+            // doesn't get their (never-touched) foraging stat read as 0.
+            let foraging = if saved_fo.value > 0 || saved_fo.daily_xp > 0 {
+                Skill {
+                    value: saved_fo.value,
+                    daily_xp: saved_fo.daily_xp,
+                }
+            } else {
+                Skills::starting().foraging
+            };
             world.set_player_skills(Skills {
                 fire_making: Skill {
-                    value: saved_skill.value,
-                    daily_xp: saved_skill.daily_xp,
+                    value: saved_fm.value,
+                    daily_xp: saved_fm.daily_xp,
                 },
+                foraging,
             });
         }
         if run.rng_state != 0 {
@@ -385,6 +404,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .filter_map(|tm| world::TerrainKind::from_save_key(&tm.kind).map(|k| (tm.x, tm.y, k)))
                 .collect();
             world.restore_terrain_mutations(snapshot);
+        }
+        // Phase-D: restore tree_species + decoration mutations. Empty
+        // `species_key` decodes as None (chopped cell); unknown
+        // species keys also collapse to None (forward-compat). These
+        // overlay the chunkgen defaults that ensure_chunk_loaded just
+        // re-applied via restore_terrain_mutations above.
+        if !run.tree_species_mutations.is_empty() {
+            let snap: Vec<(i32, i32, Option<flora::TreeSpecies>)> = run
+                .tree_species_mutations
+                .iter()
+                .map(|m| {
+                    let species = if m.species_key.is_empty() {
+                        None
+                    } else {
+                        flora::TreeSpecies::from_save_key(&m.species_key)
+                    };
+                    (m.x, m.y, species)
+                })
+                .collect();
+            world.restore_tree_species_mutations(snap);
+        }
+        if !run.decoration_mutations.is_empty() {
+            let snap: Vec<(i32, i32, flora::Decoration)> = run
+                .decoration_mutations
+                .iter()
+                .map(|m| (m.x, m.y, m.decoration))
+                .collect();
+            world.restore_decoration_mutations(snap);
         }
         // After restoring position, ensure the chunk ring around the
         // loaded player coord is in memory — otherwise the first FOV
@@ -876,6 +923,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut skills = world.player_skills();
             skills.reset_daily_caps();
             world.set_player_skills(skills);
+            // Phase D lifecycle ticks. Saplings mature; future cards
+            // add FallenLeaves spawn, mast drops, mushroom expiry.
+            world.promote_saplings_on_dawn();
+            // FOV may need a refresh if a sapling just became a tree
+            // (the new TreeTrunk blocks sight). Cheap on the dirty
+            // path.
+            world.recompute_fov();
             save_game(
                 &save_dir,
                 &mut meta,
@@ -911,6 +965,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let is_night = world.is_night();
         let tint = brightness_at(world.clock_seconds);
         let player_skills = world.player_skills();
+        let calendar_day = world.calendar_day;
         let mut ui_cells = build_ui_cells(
             &palette,
             needs,
@@ -919,6 +974,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             clock_m,
             is_night,
             player_skills,
+            calendar_day,
         );
         draw_here_line(&mut ui_cells, &world, &palette);
         if let Some(active) = world.active_action.as_ref() {
@@ -949,6 +1005,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut dirty_min_y = WORLD_H as i32;
         let mut dirty_max_x = 0;
         let mut dirty_max_y = 0;
+        let season = world.season();
         for vy in 0..WORLD_H as i32 {
             for vx in 0..WORLD_W as i32 {
                 let wx = cam_x + vx as i64;
@@ -965,12 +1022,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // pierces the floor as a visual landmark.
                 let apply_gradient =
                     matches!(terrain, TerrainKind::Grass | TerrainKind::BareDirt | TerrainKind::SandShore);
+                let base_fg = terrain_def.fg(season);
+                let base_bg = terrain_def.bg(season);
                 let (fg_arr, bg_arr) = if apply_gradient {
-                    floor_with_gradient(terrain_def, wx as i32, wy as i32, world.seed)
+                    floor_with_gradient(base_fg, base_bg, wx as i32, wy as i32, world.seed)
                 } else {
-                    (terrain_def.fg, terrain_def.bg)
+                    (base_fg, base_bg)
                 };
                 let mut fg = Color::RGB(fg_arr[0], fg_arr[1], fg_arr[2]);
+                // Ground-cover lerps: stored variants paint over the
+                // seasonal terrain bg. Snow is render-time-only based on
+                // (Winter && terrain.is_outdoor()) and lerps on top of
+                // any stored ground_cover, so a winter LeafLitter cell
+                // still whitens while the brown underneath survives
+                // until spring.
+                let stored_cover = world
+                    .cell_at(wx, wy)
+                    .map(|c| c.ground_cover)
+                    .unwrap_or(GroundCover::None);
+                let bg_arr = match stored_cover {
+                    GroundCover::None => bg_arr,
+                    GroundCover::LeafLitter => lerp_rgb(bg_arr, [60, 45, 25], 0.25),
+                };
+                // Autumn FallenLeaves: render-time-only effect on
+                // outdoor grass cells adjacent to a deciduous tree.
+                // Lerps on TOP of any stored cover (LeafLitter under
+                // FallenLeaves looks like a deeper organic mat).
+                let bg_arr = if matches!(season, calendar::Season::Autumn)
+                    && terrain.is_outdoor()
+                    && has_deciduous_neighbor(&world, wx, wy)
+                {
+                    lerp_rgb(bg_arr, [140, 70, 30], 0.35)
+                } else {
+                    bg_arr
+                };
+                let bg_arr = if matches!(season, calendar::Season::Winter) && terrain.is_outdoor() {
+                    lerp_rgb(bg_arr, [230, 235, 245], 0.60)
+                } else {
+                    bg_arr
+                };
                 let bg = Color::RGB(bg_arr[0], bg_arr[1], bg_arr[2]);
                 // Sparse grass tufts: hash-driven so ~25% of grass
                 // cells show the 0x9C tuft sprite; the rest render as
@@ -981,17 +1071,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     glyph = b' ';
                 }
-                // Per-cell tree-variant pick from TREE_VARIANT_GLYPHS
-                // so the forest has visual variety instead of a row of
-                // identical spades. Tint is also picked per-cell from
-                // TREE_TINT_VARIANTS so adjacent trees have slightly
-                // different greens (with the occasional autumn-brown).
+                // Tree rendering: glyph + tint by species + season. The
+                // per-cell `cell.tree_species` (set by chunkgen) picks
+                // the species glyph; the per-species canopy_fg table
+                // picks the seasonal tint. Cells with no species (only
+                // hit if a save predates Phase C) fall back to the
+                // per-cell hash + species-agnostic TREE_VARIANT_GLYPHS
+                // catalog for visual variety.
                 if terrain == TerrainKind::TreeTrunk {
-                    let gi = tree_variant_index(wx as i32, wy as i32, world.seed);
-                    glyph = TREE_VARIANT_GLYPHS[gi % TREE_VARIANT_GLYPHS.len()];
-                    let ci = tree_tint_index(wx as i32, wy as i32, world.seed);
-                    let t = TREE_TINT_VARIANTS[ci % TREE_TINT_VARIANTS.len()];
-                    fg = Color::RGB(t[0], t[1], t[2]);
+                    let species = world.cell_at(wx, wy).and_then(|c| c.tree_species);
+                    match species {
+                        Some(sp) => {
+                            glyph = sp.canopy_glyph();
+                            let t = sp.canopy_fg(season);
+                            fg = Color::RGB(t[0], t[1], t[2]);
+                        }
+                        None => {
+                            let gi = tree_variant_index(wx as i32, wy as i32, world.seed);
+                            glyph = TREE_VARIANT_GLYPHS[gi % TREE_VARIANT_GLYPHS.len()];
+                        }
+                    }
                 }
                 let cell_state = world.cell_at(wx, wy);
                 let visible = cell_state.map(|c| c.visible).unwrap_or(false);
@@ -1000,8 +1099,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Items + player only render when the cell is currently
                 // visible. Memory of explored-but-unseen cells shows
-                // terrain only.
+                // terrain only. Decoration overlay sits BETWEEN
+                // terrain and items: priority is `item > decoration >
+                // terrain`. A fern with a stone dropped on it still
+                // reads as a stone.
                 if visible {
+                    let decoration = cell_state
+                        .map(|c| c.decoration)
+                        .unwrap_or(flora::Decoration::None);
+                    if !matches!(decoration, flora::Decoration::None) {
+                        glyph = decoration.glyph();
+                        let [r, gn, b] = decoration.fg(season);
+                        fg = Color::RGB(r, gn, b);
+                    }
                     if let Some(top) = cell_state.and_then(|c| c.items.last()) {
                         // Lit fires override the kind's default glyph so
                         // a lit-firewood reads as fire (orange '*') rather
@@ -1177,6 +1287,7 @@ fn save_game(
         })
         .collect();
     run.clock_seconds = world.clock_seconds;
+    run.calendar_day = world.calendar_day;
     let n = world.player_needs();
     run.needs = NeedsSave {
         thirst: n.thirst,
@@ -1195,6 +1306,10 @@ fn save_game(
             value: player_skills.fire_making.value,
             daily_xp: player_skills.fire_making.daily_xp,
         },
+        foraging: SkillSave {
+            value: player_skills.foraging.value,
+            daily_xp: player_skills.foraging.daily_xp,
+        },
     };
     run.rng_state = world.rng.state;
     run.terrain_mutations = world
@@ -1204,6 +1319,24 @@ fn save_game(
             x,
             y,
             kind: k.save_key().to_string(),
+        })
+        .collect();
+    run.tree_species_mutations = world
+        .snapshot_tree_species_mutations()
+        .into_iter()
+        .map(|(x, y, sp)| TreeSpeciesMutationSave {
+            x,
+            y,
+            species_key: sp.map(|s| s.save_key().to_string()).unwrap_or_default(),
+        })
+        .collect();
+    run.decoration_mutations = world
+        .snapshot_decoration_mutations()
+        .into_iter()
+        .map(|(x, y, d)| DecorationMutationSave {
+            x,
+            y,
+            decoration: d,
         })
         .collect();
     run.active_action = world.active_action.as_ref().map(|active| ActiveActionSave {
@@ -1255,6 +1388,7 @@ fn build_ui_cells(
     clock_m: u8,
     is_night: bool,
     skills: Skills,
+    calendar_day: u32,
 ) -> Vec<Option<Cell>> {
     let mut cells = vec![None; (WORLD_W * WORLD_H) as usize];
 
@@ -1262,6 +1396,16 @@ fn build_ui_cells(
     let suffix = if is_night { "night" } else { "day" };
     let left = format!("Day {} {:02}:{:02} {}", day, clock_h, clock_m, suffix);
     put_text(&mut cells, 1, 1, &left, palette.hud_fg, palette.hud_bg);
+
+    // Row 2 right: calendar date + season label, e.g. "21 Mar Spring".
+    // Right-aligned so it sits opposite the Fire Making skill readout
+    // on Row 2 left. Updated only when the calendar advances; the
+    // dirty-cell diff path skips redraws on unchanged frames.
+    let (_year, month, dom) = calendar::date_of(calendar_day);
+    let season = calendar::season_of(calendar_day);
+    let date_str = format!("{} {} {}", dom, month.short_label(), season.label());
+    let dx = WORLD_W as i32 - date_str.len() as i32 - 1;
+    put_text(&mut cells, dx, 2, &date_str, palette.hud_fg, palette.hud_bg);
 
     // Row 1 right: four CP437 need meters, each with its own symbol
     // fg so the atlas-colored sprites (mug, chicken leg, sun) tint
@@ -1332,7 +1476,8 @@ fn build_ui_cells(
 /// texture instead of a flat region. Three independent hashes for R,
 /// G, B keep the variation organic rather than monochromatic.
 fn floor_with_gradient(
-    def: world::TerrainDef,
+    base_fg: [u8; 3],
+    base_bg: [u8; 3],
     x: i32,
     y: i32,
     seed: u64,
@@ -1351,16 +1496,50 @@ fn floor_with_gradient(
     let dg = ((mg as i32).rem_euclid(17) - 8) as i16;
     let db = ((mb.rem_euclid(17)) - 8) as i16;
     let fg = [
-        (def.fg[0] as i16 + dr).clamp(0, 255) as u8,
-        (def.fg[1] as i16 + dg).clamp(0, 255) as u8,
-        (def.fg[2] as i16 + db).clamp(0, 255) as u8,
+        (base_fg[0] as i16 + dr).clamp(0, 255) as u8,
+        (base_fg[1] as i16 + dg).clamp(0, 255) as u8,
+        (base_fg[2] as i16 + db).clamp(0, 255) as u8,
     ];
     let bg = [
-        (def.bg[0] as i16 + dr / 2).clamp(0, 255) as u8,
-        (def.bg[1] as i16 + dg / 2).clamp(0, 255) as u8,
-        (def.bg[2] as i16 + db / 2).clamp(0, 255) as u8,
+        (base_bg[0] as i16 + dr / 2).clamp(0, 255) as u8,
+        (base_bg[1] as i16 + dg / 2).clamp(0, 255) as u8,
+        (base_bg[2] as i16 + db / 2).clamp(0, 255) as u8,
     ];
     (fg, bg)
+}
+
+/// True if any of the 8 neighboring cells at `(wx, wy)` holds a
+/// TreeTrunk with a deciduous species. Drives the autumn FallenLeaves
+/// render-time overlay. Walks `World::cell_at` so it works across
+/// chunk seams when the ring is loaded.
+fn has_deciduous_neighbor(world: &World, wx: i64, wy: i64) -> bool {
+    for dy in -1..=1_i64 {
+        for dx in -1..=1_i64 {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            if let Some(cell) = world.cell_at(wx + dx, wy + dy) {
+                if cell.terrain == TerrainKind::TreeTrunk {
+                    if let Some(sp) = cell.tree_species {
+                        if sp.is_deciduous() {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Linear RGB blend from `a` toward `b` by `t` in [0.0, 1.0]. Used by
+/// the render path for ground-cover and Snow bg lerps. Surface-level
+/// color math runs fine on mmiyoo SDL2 (the broken bits are texture
+/// color mod, not surface composition).
+fn lerp_rgb(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round().clamp(0.0, 255.0) as u8;
+    [mix(a[0], b[0]), mix(a[1], b[1]), mix(a[2], b[2])]
 }
 
 /// Linearly mix an item color toward a terrain fg. `mix` is the
@@ -1386,19 +1565,6 @@ fn tree_variant_index(x: i32, y: i32, seed: u64) -> usize {
         .wrapping_add((y as i64).wrapping_mul(2_654_435_761))
         .wrapping_add(seed as i64);
     let mixed = (h as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    (mixed >> 28) as usize
-}
-
-/// Index into `TREE_TINT_VARIANTS` for a given cell. Uses different
-/// mixer constants from `tree_variant_index` so a cell's silhouette
-/// pick and its tint pick are decorrelated — same atlas glyph can
-/// appear in any tint, and vice versa.
-fn tree_tint_index(x: i32, y: i32, seed: u64) -> usize {
-    let h = (x as i64)
-        .wrapping_mul(2_246_822_519_i64)
-        .wrapping_add((y as i64).wrapping_mul(40_503))
-        .wrapping_add((seed as i64).wrapping_mul(73_856_093));
-    let mixed = (h as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     (mixed >> 28) as usize
 }
 

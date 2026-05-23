@@ -26,6 +26,7 @@ pub const XP_FAILURE: u8 = 1;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SkillKind {
     FireMaking,
+    Foraging,
 }
 
 impl SkillKind {
@@ -37,6 +38,7 @@ impl SkillKind {
     pub fn save_key(self) -> &'static str {
         match self {
             SkillKind::FireMaking => "fire_making",
+            SkillKind::Foraging => "foraging",
         }
     }
 
@@ -44,6 +46,7 @@ impl SkillKind {
     pub fn from_save_key(s: &str) -> Option<Self> {
         Some(match s {
             "fire_making" => SkillKind::FireMaking,
+            "foraging" => SkillKind::Foraging,
             _ => return None,
         })
     }
@@ -52,11 +55,12 @@ impl SkillKind {
     pub fn display_name(self) -> &'static str {
         match self {
             SkillKind::FireMaking => "Fire Making",
+            SkillKind::Foraging => "Foraging",
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Skill {
     pub value: u8,
     pub daily_xp: u8,
@@ -65,6 +69,8 @@ pub struct Skill {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Skills {
     pub fire_making: Skill,
+    #[serde(default)]
+    pub foraging: Skill,
 }
 
 impl Default for Skills {
@@ -75,10 +81,16 @@ impl Default for Skills {
 
 impl Skills {
     /// Slice-1 starting values: Fire Making 15 (per master plan).
+    /// Foraging starts at 10 — slightly below Fire Making since the
+    /// player has fewer pre-game opportunities to practice.
     pub fn starting() -> Self {
         Self {
             fire_making: Skill {
                 value: 15,
+                daily_xp: 0,
+            },
+            foraging: Skill {
+                value: 10,
                 daily_xp: 0,
             },
         }
@@ -87,12 +99,14 @@ impl Skills {
     pub fn get(&self, kind: SkillKind) -> &Skill {
         match kind {
             SkillKind::FireMaking => &self.fire_making,
+            SkillKind::Foraging => &self.foraging,
         }
     }
 
     pub fn get_mut(&mut self, kind: SkillKind) -> &mut Skill {
         match kind {
             SkillKind::FireMaking => &mut self.fire_making,
+            SkillKind::Foraging => &mut self.foraging,
         }
     }
 
@@ -100,6 +114,7 @@ impl Skills {
     /// daily XP counter so the player can train each skill again.
     pub fn reset_daily_caps(&mut self) {
         self.fire_making.daily_xp = 0;
+        self.foraging.daily_xp = 0;
     }
 }
 

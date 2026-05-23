@@ -17,9 +17,13 @@
 //      Value-level read (ciborium::Value) and convert before final deser.
 //
 // Phase-2 gut: dropped Holy Land run/meta fields (essence/demon_currency,
-// shrine_unlocked, oasis_intro_complete, reeds, ground_items, region). Schema
-// version stays at 1 for now; phase 19's "Save schema v2" card bumps it to 2
-// once needs/clock/inventory/chunks land.
+// shrine_unlocked, oasis_intro_complete, reeds, ground_items, region).
+//
+// Schema v2 (survival redesign): adds `calendar_day` to RunSave; the
+// seasons/flora cluster adds per-cell tree_species / decoration /
+// ground_cover (additive, ride this same bump). v1 saves are
+// friendly-rejected — no data migration. Players returning to the Holy
+// Land design check out the `holy-land-archive` git tag.
 
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -27,7 +31,9 @@ use std::io::{self, Write};
 use std::path::Path;
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: u32 = 1;
+use crate::calendar;
+
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SaveHeader {
@@ -112,6 +118,54 @@ pub struct RunSave {
     // stays chopped across save/load.
     #[serde(default)]
     pub terrain_mutations: Vec<TerrainMutationSave>,
+    // Schema-v2: in-game calendar day, 1-indexed since 1 Jan 1300. The
+    // seasons/flora cluster reads this for `season_of(calendar_day)` and
+    // the plant lifecycle scheduler. Default = START_DAY (21 Mar 1300)
+    // for new games and for any v2 save written before this field
+    // existed.
+    #[serde(default = "default_calendar_day")]
+    pub calendar_day: u32,
+    // Phase D: per-cell tree_species mutations (currently only "tree
+    // chopped → species cleared") and decoration mutations (harvests,
+    // sapling spawns, mushroom expiry). Sparse — chunkgen regenerates
+    // the deterministic baseline on load; these patches override.
+    #[serde(default)]
+    pub tree_species_mutations: Vec<TreeSpeciesMutationSave>,
+    #[serde(default)]
+    pub decoration_mutations: Vec<DecorationMutationSave>,
+}
+
+/// Per-cell tree_species override. `species_key` of empty string means
+/// "explicitly None" (a chopped cell). On load, unknown species keys
+/// load as None (forward-compat).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TreeSpeciesMutationSave {
+    #[serde(default)]
+    pub x: i32,
+    #[serde(default)]
+    pub y: i32,
+    /// `TreeSpecies::save_key` string, or empty for None (chopped).
+    #[serde(default)]
+    pub species_key: String,
+}
+
+/// Per-cell Decoration override. The Decoration enum is serde-derived
+/// in `src/flora.rs`; new variants added at the end are forward-compat
+/// (ciborium uses variant names, not order). Existing variants must
+/// not be renamed without a migration.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DecorationMutationSave {
+    #[serde(default)]
+    pub x: i32,
+    #[serde(default)]
+    pub y: i32,
+    /// Decoration value at this cell. Default = None.
+    #[serde(default)]
+    pub decoration: crate::flora::Decoration,
+}
+
+fn default_calendar_day() -> u32 {
+    calendar::START_DAY
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -130,6 +184,13 @@ pub struct TerrainMutationSave {
 pub struct SkillsSave {
     #[serde(default)]
     pub fire_making: SkillSave,
+    // Phase-C: Foraging skill. Defaults to all-zero on saves written
+    // before this field existed; the load path falls back to
+    // `Skills::starting()` for any save where fire_making is also zero
+    // (pre-phase-10), so the new field never sets a brand-new player's
+    // skill to 0 by accident.
+    #[serde(default)]
+    pub foraging: SkillSave,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -196,6 +257,9 @@ impl RunSave {
             skills: SkillsSave::default(),
             rng_state: 0,
             terrain_mutations: Vec::new(),
+            calendar_day: calendar::START_DAY,
+            tree_species_mutations: Vec::new(),
+            decoration_mutations: Vec::new(),
         }
     }
 }
@@ -309,9 +373,18 @@ pub fn load_run(path: &Path) -> io::Result<RunSave> {
     Ok(save)
 }
 
+/// v1 → v2 is a friendly-reject, not a data migration. The Holy Land
+/// design (v1) and the Survival redesign (v2) diverge enough that
+/// migrating a v1 oasis save into a v2 wilderness chunk would produce
+/// junk. Players who want to keep playing Holy Land can check out the
+/// `holy-land-archive` git tag; everyone else starts a new game.
+const V1_FRIENDLY_REJECT_MSG: &str =
+    "This save belongs to the Holy Land design. Start a new game to play the survival redesign.";
+
 fn check_schema(header: &SaveHeader) -> io::Result<()> {
     match header.schema_version {
         SCHEMA_VERSION => Ok(()),
+        1 => Err(io::Error::new(io::ErrorKind::Other, V1_FRIENDLY_REJECT_MSG)),
         v if v < SCHEMA_VERSION => Err(io::Error::new(
             io::ErrorKind::Other,
             format!(
@@ -462,6 +535,9 @@ mod tests {
             skills: SkillsSave::default(),
             rng_state: 0xDEADBEEF,
             terrain_mutations: Vec::new(),
+            calendar_day: 100,
+            tree_species_mutations: Vec::new(),
+            decoration_mutations: Vec::new(),
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
@@ -472,6 +548,7 @@ mod tests {
         assert!(loaded.cell_items.is_empty());
         assert_eq!(loaded.clock_seconds, 50_400);
         assert_eq!(loaded.needs.warmth, 100);
+        assert_eq!(loaded.calendar_day, 100);
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -542,6 +619,7 @@ mod tests {
                     value: 23,
                     daily_xp: 6,
                 },
+                foraging: SkillSave::default(),
             },
             rng_state: 0xC0FFEE,
             terrain_mutations: vec![TerrainMutationSave {
@@ -549,6 +627,9 @@ mod tests {
                 y: 7,
                 kind: "grass".to_string(),
             }],
+            calendar_day: calendar::START_DAY,
+            tree_species_mutations: Vec::new(),
+            decoration_mutations: Vec::new(),
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
@@ -612,6 +693,46 @@ mod tests {
         assert_eq!(loaded.clock_seconds, 0);
         assert_eq!(loaded.needs.thirst, 0);
         assert_eq!(loaded.needs.warmth, 0);
+        // Schema-v2 calendar_day defaults to START_DAY (21 Mar 1300).
+        assert_eq!(loaded.calendar_day, calendar::START_DAY);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn v1_save_friendly_rejected() {
+        // A v1 save (Holy Land era) must produce the friendly-reject
+        // message rather than crash or silently load. Build a minimal
+        // CBOR blob carrying just a v1 header — the survival redesign
+        // never migrates v1 data.
+        let dir = std::env::temp_dir().join(format!("survival-v1reject-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("v1.cbor");
+
+        let header = SaveHeader {
+            schema_version: 1,
+            build_version: "0.0.0".to_string(),
+            save_counter: 1,
+            device_id: Uuid::new_v4(),
+            timestamp: 0,
+        };
+        // A v1 RunSave likely had different fields, but the load path
+        // only inspects `header.schema_version`. A header-only blob is
+        // enough to trip the check.
+        let meta = MetaSave {
+            header,
+            xp: 0,
+            unlocks: Vec::new(),
+        };
+        save_atomic(&path, &meta).unwrap();
+
+        let err = load_meta(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("Holy Land design"),
+            "v1 reject must mention Holy Land; got {:?}",
+            err
+        );
+        assert!(err.to_string().contains("Start a new game"));
 
         fs::remove_dir_all(&dir).ok();
     }
