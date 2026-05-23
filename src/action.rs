@@ -74,6 +74,14 @@ pub enum ActionId {
     /// Lift a finished cook out of the pan into the pack (or onto the
     /// player's cell if pack is full). Returns the pan to Empty.
     TakeFromPan,
+    // ---- Phase D harvest verbs (target cell.decoration adjacent to
+    // the player). Each clears the decoration and drops yields into
+    // the pack. Foraging XP awarded on successful harvest.
+    HarvestMoss,
+    CutFern,
+    DigFern,
+    CutGorse,
+    CutBracken,
 }
 
 impl ActionId {
@@ -117,6 +125,12 @@ impl ActionId {
             ActionId::CookFish => 500,
             ActionId::SeasonPan => 500,
             ActionId::TakeFromPan => 500,
+            // Phase D harvest verbs (moves = old game-seconds × 100).
+            ActionId::HarvestMoss => 3_000,
+            ActionId::CutFern => 1_000,
+            ActionId::DigFern => 6_000,
+            ActionId::CutGorse => 12_000,
+            ActionId::CutBracken => 2_000,
         }
     }
 
@@ -145,6 +159,11 @@ impl ActionId {
             ActionId::CookFish => "cook_fish",
             ActionId::SeasonPan => "season_pan",
             ActionId::TakeFromPan => "take_from_pan",
+            ActionId::HarvestMoss => "harvest_moss",
+            ActionId::CutFern => "cut_fern",
+            ActionId::DigFern => "dig_fern",
+            ActionId::CutGorse => "cut_gorse",
+            ActionId::CutBracken => "cut_bracken",
         }
     }
 
@@ -170,6 +189,11 @@ impl ActionId {
             "cook_fish" => ActionId::CookFish,
             "season_pan" => ActionId::SeasonPan,
             "take_from_pan" => ActionId::TakeFromPan,
+            "harvest_moss" => ActionId::HarvestMoss,
+            "cut_fern" => ActionId::CutFern,
+            "dig_fern" => ActionId::DigFern,
+            "cut_gorse" => ActionId::CutGorse,
+            "cut_bracken" => ActionId::CutBracken,
             _ => return None,
         })
     }
@@ -260,6 +284,31 @@ pub const ALL_ACTIONS: &[ContextAction] = &[
         name: "Try fishing",
         description: "Cast a hand-line into an adjacent pond.",
     },
+    ContextAction {
+        id: ActionId::HarvestMoss,
+        name: "Harvest moss",
+        description: "Scrape moss from a stone or root (knife).",
+    },
+    ContextAction {
+        id: ActionId::CutFern,
+        name: "Cut fern",
+        description: "Slice fern fronds (knife).",
+    },
+    ContextAction {
+        id: ActionId::DigFern,
+        name: "Dig fern",
+        description: "Dig the fern up for root + fronds (knife).",
+    },
+    ContextAction {
+        id: ActionId::CutGorse,
+        name: "Cut gorse",
+        description: "Hack gorse into a faggot of kindling (axe).",
+    },
+    ContextAction {
+        id: ActionId::CutBracken,
+        name: "Cut bracken",
+        description: "Cut bracken straw for bedding (knife).",
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -327,6 +376,41 @@ pub fn evaluate(world: &World, id: ActionId) -> Availability {
         ActionId::CookFish => eval_cook_fish(world),
         ActionId::SeasonPan => eval_season_pan(world),
         ActionId::TakeFromPan => eval_take_from_pan(world),
+        ActionId::HarvestMoss => eval_harvest_decoration(
+            world,
+            |d| matches!(d, crate::flora::Decoration::Moss),
+            ActionId::HarvestMoss,
+            HARVEST_REQUIRES_KNIFE,
+            "no moss adjacent",
+        ),
+        ActionId::CutFern => eval_harvest_decoration(
+            world,
+            |d| matches!(d, crate::flora::Decoration::Fern { .. }),
+            ActionId::CutFern,
+            HARVEST_REQUIRES_KNIFE,
+            "no fern adjacent",
+        ),
+        ActionId::DigFern => eval_harvest_decoration(
+            world,
+            |d| matches!(d, crate::flora::Decoration::Fern { .. }),
+            ActionId::DigFern,
+            HARVEST_REQUIRES_KNIFE,
+            "no fern adjacent",
+        ),
+        ActionId::CutGorse => eval_harvest_decoration(
+            world,
+            |d| matches!(d, crate::flora::Decoration::Gorse { .. }),
+            ActionId::CutGorse,
+            HARVEST_REQUIRES_AXE,
+            "no gorse adjacent",
+        ),
+        ActionId::CutBracken => eval_harvest_decoration(
+            world,
+            |d| matches!(d, crate::flora::Decoration::Bracken { .. }),
+            ActionId::CutBracken,
+            HARVEST_REQUIRES_KNIFE,
+            "no bracken adjacent",
+        ),
     }
 }
 
@@ -540,6 +624,11 @@ pub fn execute(world: &mut World, id: ActionId) -> ExecuteOutcome {
         | ActionId::CookFish
         | ActionId::SeasonPan
         | ActionId::TakeFromPan => execute_queue_5s(world, id),
+        ActionId::HarvestMoss => execute_harvest_moss(world),
+        ActionId::CutFern => execute_cut_fern(world),
+        ActionId::DigFern => execute_dig_fern(world),
+        ActionId::CutGorse => execute_cut_gorse(world),
+        ActionId::CutBracken => execute_cut_bracken(world),
     }
 }
 
@@ -1419,10 +1508,32 @@ fn execute_chop_tree(world: &mut World) -> ExecuteOutcome {
         return ExecuteOutcome::Done("no tree to chop".to_string());
     };
 
-    // Fell: terrain converts; FOV recomputes (the tree no longer blocks
-    // sight). Drop a random pile of firewood on the now-grass cell so
-    // the player can carry it back for fires.
-    world.set_terrain_at(wx as i64, wy as i64, TerrainKind::Grass);
+    // Capture the species before clearing it so the sapling that
+    // replaces this cell is the same species — the regrowth loop
+    // expects "chop a Hazel, get a Hazel sapling, eventually grow a
+    // Hazel back."
+    let species = world
+        .cell_at(wx as i64, wy as i64)
+        .and_then(|c| c.tree_species);
+    let planted_day = world.calendar_day;
+
+    // Fell: terrain converts to BareDirt (Phase D: a chopped cell is a
+    // stump-and-disturbed-dirt patch, not pristine grass); the species
+    // tag clears; a sapling decoration takes over. FOV recomputes —
+    // the tree no longer blocks sight, but the sapling doesn't block
+    // either, so the new line-of-sight opens up immediately.
+    world.set_terrain_at(wx as i64, wy as i64, TerrainKind::BareDirt);
+    world.set_tree_species_at(wx as i64, wy as i64, None);
+    if let Some(sp) = species {
+        world.set_decoration_at(
+            wx as i64,
+            wy as i64,
+            crate::flora::Decoration::Sapling {
+                species: sp,
+                planted_day,
+            },
+        );
+    }
     let span = (FELLED_FIREWOOD_MAX - FELLED_FIREWOOD_MIN + 1) as u32;
     let count = FELLED_FIREWOOD_MIN as u16 + (world.rng.next_u32() % span) as u16;
     if let Some(cell) = world.cell_at_mut(wx as i64, wy as i64) {
@@ -1486,6 +1597,181 @@ fn execute_pick_herb(world: &mut World) -> ExecuteOutcome {
     }
 }
 
+// ---- Phase D: undergrowth harvest verbs ----
+
+/// Tool requirement for a harvest verb. Some verbs need a knife (most),
+/// others need an axe (gorse is woody enough to require an axe).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HarvestTool {
+    Knife,
+    Axe,
+}
+const HARVEST_REQUIRES_KNIFE: HarvestTool = HarvestTool::Knife;
+const HARVEST_REQUIRES_AXE: HarvestTool = HarvestTool::Axe;
+
+fn find_adjacent_decoration<F: Fn(crate::flora::Decoration) -> bool>(
+    world: &World,
+    pred: F,
+) -> Option<(i32, i32)> {
+    let p = world.player_pos();
+    // Include the player's own cell — harvesting moss you're standing
+    // on is valid even though "adjacent" implies 8-neighborhood. The
+    // 3x3 catchment matches the existing fire-materials search radius.
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            let wx = p.x + dx;
+            let wy = p.y + dy;
+            if let Some(cell) = world.cell_at(wx as i64, wy as i64) {
+                if pred(cell.decoration) {
+                    return Some((wx, wy));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn eval_harvest_decoration<F: Fn(crate::flora::Decoration) -> bool>(
+    world: &World,
+    pred: F,
+    id: ActionId,
+    tool: HarvestTool,
+    missing_reason: &'static str,
+) -> Availability {
+    let pack = world.player_pack();
+    let has_tool = match tool {
+        HarvestTool::Knife => pack.has_stack(ItemKind::Knife),
+        HarvestTool::Axe => pack.has_stack(ItemKind::Axe),
+    };
+    if !has_tool {
+        return Availability::Unavailable {
+            reason: match tool {
+                HarvestTool::Knife => "need a knife",
+                HarvestTool::Axe => "need an axe",
+            },
+        };
+    }
+    Availability::from_has(
+        find_adjacent_decoration(world, pred).is_some(),
+        world.moves_to_seconds(id.move_cost()),
+        missing_reason,
+    )
+}
+
+/// Helper: try to add a stack of `count` items into the pack. If the
+/// stack doesn't fit, the items are dropped on the cell at `(wx, wy)`
+/// instead — better to leave them on the ground than vanish them.
+fn deliver_stack(world: &mut World, wx: i32, wy: i32, kind: ItemKind, count: u16) {
+    if count == 0 {
+        return;
+    }
+    let def = kind.def();
+    let stack = ItemInstance::stack(
+        kind,
+        count,
+        def.default_weight_g,
+        None,
+        ItemMetadata::None,
+    );
+    let add_result = world.player_pack_mut().try_add(stack);
+    if let Err(returned) = add_result {
+        if let Some(cell) = world.cell_at_mut(wx as i64, wy as i64) {
+            cell.items.push(returned);
+        }
+    }
+}
+
+/// Award Foraging XP for a successful harvest. Mirrors the
+/// FireMaking award path used by `execute_start_fire`. Daily cap is
+/// honored; level-up logs but doesn't pop a UI yet.
+fn award_foraging_xp(world: &mut World, success: bool) {
+    let mut skills = world.player_skills();
+    let _leveled = crate::skill::award_xp(skills.get_mut(crate::skill::SkillKind::Foraging), success);
+    world.set_player_skills(skills);
+}
+
+fn execute_harvest_moss(world: &mut World) -> ExecuteOutcome {
+    if !world.player_pack().has_stack(ItemKind::Knife) {
+        return ExecuteOutcome::Done("need a knife".to_string());
+    }
+    let Some((wx, wy)) = find_adjacent_decoration(world, |d| {
+        matches!(d, crate::flora::Decoration::Moss)
+    }) else {
+        return ExecuteOutcome::Done("no moss adjacent".to_string());
+    };
+    let count = 1 + (world.rng.next_u32() % 2) as u16; // 1..=2
+    world.set_decoration_at(wx as i64, wy as i64, crate::flora::Decoration::None);
+    deliver_stack(world, wx, wy, ItemKind::Moss, count);
+    world.spend_moves(ActionId::HarvestMoss.move_cost());
+    award_foraging_xp(world, true);
+    ExecuteOutcome::Done(format!("harvested {} moss", count))
+}
+
+fn execute_cut_fern(world: &mut World) -> ExecuteOutcome {
+    if !world.player_pack().has_stack(ItemKind::Knife) {
+        return ExecuteOutcome::Done("need a knife".to_string());
+    }
+    let Some((wx, wy)) = find_adjacent_decoration(world, |d| {
+        matches!(d, crate::flora::Decoration::Fern { .. })
+    }) else {
+        return ExecuteOutcome::Done("no fern adjacent".to_string());
+    };
+    world.set_decoration_at(wx as i64, wy as i64, crate::flora::Decoration::None);
+    deliver_stack(world, wx, wy, ItemKind::FernFrond, 2);
+    world.spend_moves(ActionId::CutFern.move_cost());
+    // CutFern doesn't train Foraging — it's a brute-force cut, no skill.
+    ExecuteOutcome::Done("cut fern (+2 fronds)".to_string())
+}
+
+fn execute_dig_fern(world: &mut World) -> ExecuteOutcome {
+    if !world.player_pack().has_stack(ItemKind::Knife) {
+        return ExecuteOutcome::Done("need a knife".to_string());
+    }
+    let Some((wx, wy)) = find_adjacent_decoration(world, |d| {
+        matches!(d, crate::flora::Decoration::Fern { .. })
+    }) else {
+        return ExecuteOutcome::Done("no fern adjacent".to_string());
+    };
+    let frond_count = 1 + (world.rng.next_u32() % 2) as u16; // 1..=2
+    world.set_decoration_at(wx as i64, wy as i64, crate::flora::Decoration::None);
+    deliver_stack(world, wx, wy, ItemKind::FernRoot, 1);
+    deliver_stack(world, wx, wy, ItemKind::FernFrond, frond_count);
+    world.spend_moves(ActionId::DigFern.move_cost());
+    award_foraging_xp(world, true);
+    ExecuteOutcome::Done(format!("dug fern (+1 root, +{} fronds)", frond_count))
+}
+
+fn execute_cut_gorse(world: &mut World) -> ExecuteOutcome {
+    if !world.player_pack().has_stack(ItemKind::Axe) {
+        return ExecuteOutcome::Done("need an axe".to_string());
+    }
+    let Some((wx, wy)) = find_adjacent_decoration(world, |d| {
+        matches!(d, crate::flora::Decoration::Gorse { .. })
+    }) else {
+        return ExecuteOutcome::Done("no gorse adjacent".to_string());
+    };
+    world.set_decoration_at(wx as i64, wy as i64, crate::flora::Decoration::None);
+    deliver_stack(world, wx, wy, ItemKind::GorseFaggot, 1);
+    world.spend_moves(ActionId::CutGorse.move_cost());
+    world.recompute_fov();
+    ExecuteOutcome::Done("cut gorse (+1 faggot)".to_string())
+}
+
+fn execute_cut_bracken(world: &mut World) -> ExecuteOutcome {
+    if !world.player_pack().has_stack(ItemKind::Knife) {
+        return ExecuteOutcome::Done("need a knife".to_string());
+    }
+    let Some((wx, wy)) = find_adjacent_decoration(world, |d| {
+        matches!(d, crate::flora::Decoration::Bracken { .. })
+    }) else {
+        return ExecuteOutcome::Done("no bracken adjacent".to_string());
+    };
+    world.set_decoration_at(wx as i64, wy as i64, crate::flora::Decoration::None);
+    deliver_stack(world, wx, wy, ItemKind::BrackenStraw, 3);
+    world.spend_moves(ActionId::CutBracken.move_cost());
+    ExecuteOutcome::Done("cut bracken (+3 straw)".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1499,6 +1785,94 @@ mod tests {
         // dropping a Variant from ALL_ACTIONS when ActionId grows.
         let count = ALL_ACTIONS.len();
         assert!(count >= 13);
+    }
+
+    #[test]
+    fn cut_fern_clears_decoration_and_drops_fronds() {
+        use crate::flora::{Decoration, PlantState};
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let pos = world.player_pos();
+        // Drop a fern on the cell east of the player. Player has a
+        // knife in the starting pack.
+        let east_x = pos.x + 1;
+        let east_y = pos.y;
+        world.set_decoration_at(
+            east_x as i64,
+            east_y as i64,
+            Decoration::Fern {
+                state: PlantState::Mature,
+            },
+        );
+        assert!(
+            matches!(evaluate(&world, ActionId::CutFern), Availability::Available { .. }),
+            "CutFern should be available with knife + adjacent fern"
+        );
+        let outcome = execute(&mut world, ActionId::CutFern);
+        match outcome {
+            ExecuteOutcome::Done(ref msg) => assert!(msg.contains("fern"), "got {:?}", msg),
+        }
+        // Decoration cleared.
+        assert!(matches!(
+            world.cell_at(east_x as i64, east_y as i64).map(|c| c.decoration),
+            Some(Decoration::None)
+        ));
+        // Pack got 2 FernFronds.
+        let pack = world.player_pack();
+        let frond_count: u16 = pack
+            .contents
+            .iter()
+            .filter(|i| i.kind == ItemKind::FernFrond)
+            .map(|i| i.count)
+            .sum();
+        assert_eq!(frond_count, 2);
+    }
+
+    #[test]
+    fn cut_gorse_requires_axe_not_knife() {
+        use crate::flora::{Decoration, PlantState};
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let pos = world.player_pos();
+        world.set_decoration_at(
+            (pos.x + 1) as i64,
+            pos.y as i64,
+            Decoration::Gorse {
+                state: PlantState::Mature,
+            },
+        );
+        // Starting pack has knife + axe. Remove axe and re-check.
+        world.player_pack_mut().contents.retain(|i| i.kind != ItemKind::Axe);
+        assert!(
+            matches!(
+                evaluate(&world, ActionId::CutGorse),
+                Availability::Unavailable { reason: "need an axe" }
+            ),
+            "CutGorse must demand an axe even with a knife"
+        );
+    }
+
+    #[test]
+    fn chop_tree_spawns_a_sapling_of_the_same_species() {
+        use crate::flora::{Decoration, TreeSpecies};
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Force an Oak tree east of the player so we know the species
+        // we're chopping.
+        let pos = world.player_pos();
+        let east_x = pos.x + 1;
+        let east_y = pos.y;
+        world.set_terrain_at(east_x as i64, east_y as i64, TerrainKind::TreeTrunk);
+        world.set_tree_species_at(east_x as i64, east_y as i64, Some(TreeSpecies::Oak));
+        // Starting pack has an axe.
+        let outcome = execute(&mut world, ActionId::ChopTree);
+        match outcome {
+            ExecuteOutcome::Done(_) => {}
+        }
+        assert_eq!(world.tile_at(east_x as i64, east_y as i64), TerrainKind::BareDirt);
+        let cell = world.cell_at(east_x as i64, east_y as i64).expect("cell");
+        assert!(matches!(
+            cell.decoration,
+            Decoration::Sapling { species: TreeSpecies::Oak, .. }
+        ));
+        assert_eq!(cell.tree_species, None);
     }
 
     #[test]
@@ -1563,42 +1937,24 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_verbs_report_phase_in_reason() {
+    fn every_verb_evaluates_to_a_real_reason_or_available() {
+        // Phase 8 left behind a "stubs report phase XX" assertion that
+        // outlived its purpose — every verb is now live. The remaining
+        // useful coverage: each verb's evaluate() must return SOMETHING
+        // (Available or a non-empty Unavailable reason) without
+        // panicking. Catches dispatch table holes when a new ActionId
+        // is added but its evaluate arm is forgotten.
         let world = World::new(CHUNK_W, CHUNK_H);
-        // Verbs that are LIVE in phase 8 should report a real reason, not
-        // a phase number; verbs that are still stubs should name their
-        // unlocking phase.
-        let live = [
-            ActionId::Pickup,
-            ActionId::EatRation,
-            ActionId::EatHerb,
-            ActionId::DrinkWaterskin,
-            ActionId::DrinkFromStream,
-            ActionId::FillWaterskin,
-            ActionId::PitchTent,
-            ActionId::UnrollBedroll,
-            ActionId::SetupCamp,
-            ActionId::StartFire,
-            ActionId::FeedFire,
-            ActionId::ChopTree,
-            ActionId::PickHerb,
-            ActionId::Sleep,
-            ActionId::Fishing,
-        ];
         for action in ALL_ACTIONS {
-            if live.contains(&action.id) {
-                continue;
-            }
             match evaluate(&world, action.id) {
+                Availability::Available { .. } => {}
                 Availability::Unavailable { reason } => {
                     assert!(
-                        reason.starts_with("phase"),
-                        "{:?} reason should name its phase, got '{}'",
-                        action.id,
-                        reason
+                        !reason.is_empty(),
+                        "{:?} returned an empty unavail reason",
+                        action.id
                     );
                 }
-                other => panic!("{:?} expected stub Unavailable, got {:?}", action.id, other),
             }
         }
         // Tickle starting_pack + Position so they don't get pruned in

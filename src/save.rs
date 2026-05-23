@@ -131,6 +131,43 @@ pub struct RunSave {
     // Speed::BASELINE (100) — identical to the previous implicit value.
     #[serde(default = "default_speed")]
     pub speed: u16,
+    // Phase D: per-cell tree_species mutations (currently only "tree
+    // chopped → species cleared") and decoration mutations (harvests,
+    // sapling spawns, mushroom expiry). Sparse — chunkgen regenerates
+    // the deterministic baseline on load; these patches override.
+    #[serde(default)]
+    pub tree_species_mutations: Vec<TreeSpeciesMutationSave>,
+    #[serde(default)]
+    pub decoration_mutations: Vec<DecorationMutationSave>,
+}
+
+/// Per-cell tree_species override. `species_key` of empty string means
+/// "explicitly None" (a chopped cell). On load, unknown species keys
+/// load as None (forward-compat).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TreeSpeciesMutationSave {
+    #[serde(default)]
+    pub x: i32,
+    #[serde(default)]
+    pub y: i32,
+    /// `TreeSpecies::save_key` string, or empty for None (chopped).
+    #[serde(default)]
+    pub species_key: String,
+}
+
+/// Per-cell Decoration override. The Decoration enum is serde-derived
+/// in `src/flora.rs`; new variants added at the end are forward-compat
+/// (ciborium uses variant names, not order). Existing variants must
+/// not be renamed without a migration.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DecorationMutationSave {
+    #[serde(default)]
+    pub x: i32,
+    #[serde(default)]
+    pub y: i32,
+    /// Decoration value at this cell. Default = None.
+    #[serde(default)]
+    pub decoration: crate::flora::Decoration,
 }
 
 fn default_calendar_day() -> u32 {
@@ -232,6 +269,8 @@ impl RunSave {
             terrain_mutations: Vec::new(),
             calendar_day: calendar::START_DAY,
             speed: crate::world::Speed::BASELINE,
+            tree_species_mutations: Vec::new(),
+            decoration_mutations: Vec::new(),
         }
     }
 }
@@ -509,6 +548,8 @@ mod tests {
             terrain_mutations: Vec::new(),
             calendar_day: 100,
             speed: crate::world::Speed::BASELINE,
+            tree_species_mutations: Vec::new(),
+            decoration_mutations: Vec::new(),
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
@@ -601,6 +642,8 @@ mod tests {
             }],
             calendar_day: calendar::START_DAY,
             speed: 150,
+            tree_species_mutations: Vec::new(),
+            decoration_mutations: Vec::new(),
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
