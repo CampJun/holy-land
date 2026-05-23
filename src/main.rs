@@ -29,8 +29,8 @@ use items::{ItemInstance, Pack};
 use needs::Needs;
 use render::{draw_glyph, load_atlas, CELL_SIZE};
 use save::{
-    ActionStepSave, ActiveActionSave, CellItemsSave, MetaSave, NeedsSave, RunSave, SaveHeader,
-    SkillSave, SkillsSave, TerrainMutationSave,
+    ActionStepSave, ActiveActionSave, CellItemsSave, DecorationMutationSave, MetaSave, NeedsSave,
+    RunSave, SaveHeader, SkillSave, SkillsSave, TerrainMutationSave, TreeSpeciesMutationSave,
 };
 use skill::{Rng, Skill, SkillKind, Skills};
 use world::{
@@ -404,6 +404,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .filter_map(|tm| world::TerrainKind::from_save_key(&tm.kind).map(|k| (tm.x, tm.y, k)))
                 .collect();
             world.restore_terrain_mutations(snapshot);
+        }
+        // Phase-D: restore tree_species + decoration mutations. Empty
+        // `species_key` decodes as None (chopped cell); unknown
+        // species keys also collapse to None (forward-compat). These
+        // overlay the chunkgen defaults that ensure_chunk_loaded just
+        // re-applied via restore_terrain_mutations above.
+        if !run.tree_species_mutations.is_empty() {
+            let snap: Vec<(i32, i32, Option<flora::TreeSpecies>)> = run
+                .tree_species_mutations
+                .iter()
+                .map(|m| {
+                    let species = if m.species_key.is_empty() {
+                        None
+                    } else {
+                        flora::TreeSpecies::from_save_key(&m.species_key)
+                    };
+                    (m.x, m.y, species)
+                })
+                .collect();
+            world.restore_tree_species_mutations(snap);
+        }
+        if !run.decoration_mutations.is_empty() {
+            let snap: Vec<(i32, i32, flora::Decoration)> = run
+                .decoration_mutations
+                .iter()
+                .map(|m| (m.x, m.y, m.decoration))
+                .collect();
+            world.restore_decoration_mutations(snap);
         }
         // After restoring position, ensure the chunk ring around the
         // loaded player coord is in memory — otherwise the first FOV
@@ -895,6 +923,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut skills = world.player_skills();
             skills.reset_daily_caps();
             world.set_player_skills(skills);
+            // Phase D lifecycle ticks. Saplings mature; future cards
+            // add FallenLeaves spawn, mast drops, mushroom expiry.
+            world.promote_saplings_on_dawn();
+            // FOV may need a refresh if a sapling just became a tree
+            // (the new TreeTrunk blocks sight). Cheap on the dirty
+            // path.
+            world.recompute_fov();
             save_game(
                 &save_dir,
                 &mut meta,
@@ -1007,8 +1042,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or(GroundCover::None);
                 let bg_arr = match stored_cover {
                     GroundCover::None => bg_arr,
-                    GroundCover::FallenLeaves => lerp_rgb(bg_arr, [140, 70, 30], 0.35),
                     GroundCover::LeafLitter => lerp_rgb(bg_arr, [60, 45, 25], 0.25),
+                };
+                // Autumn FallenLeaves: render-time-only effect on
+                // outdoor grass cells adjacent to a deciduous tree.
+                // Lerps on TOP of any stored cover (LeafLitter under
+                // FallenLeaves looks like a deeper organic mat).
+                let bg_arr = if matches!(season, calendar::Season::Autumn)
+                    && terrain.is_outdoor()
+                    && has_deciduous_neighbor(&world, wx, wy)
+                {
+                    lerp_rgb(bg_arr, [140, 70, 30], 0.35)
+                } else {
+                    bg_arr
                 };
                 let bg_arr = if matches!(season, calendar::Season::Winter) && terrain.is_outdoor() {
                     lerp_rgb(bg_arr, [230, 235, 245], 0.60)
@@ -1053,8 +1099,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Items + player only render when the cell is currently
                 // visible. Memory of explored-but-unseen cells shows
-                // terrain only.
+                // terrain only. Decoration overlay sits BETWEEN
+                // terrain and items: priority is `item > decoration >
+                // terrain`. A fern with a stone dropped on it still
+                // reads as a stone.
                 if visible {
+                    let decoration = cell_state
+                        .map(|c| c.decoration)
+                        .unwrap_or(flora::Decoration::None);
+                    if !matches!(decoration, flora::Decoration::None) {
+                        glyph = decoration.glyph();
+                        let [r, gn, b] = decoration.fg(season);
+                        fg = Color::RGB(r, gn, b);
+                    }
                     if let Some(top) = cell_state.and_then(|c| c.items.last()) {
                         // Lit fires override the kind's default glyph so
                         // a lit-firewood reads as fire (orange '*') rather
@@ -1264,6 +1321,24 @@ fn save_game(
             kind: k.save_key().to_string(),
         })
         .collect();
+    run.tree_species_mutations = world
+        .snapshot_tree_species_mutations()
+        .into_iter()
+        .map(|(x, y, sp)| TreeSpeciesMutationSave {
+            x,
+            y,
+            species_key: sp.map(|s| s.save_key().to_string()).unwrap_or_default(),
+        })
+        .collect();
+    run.decoration_mutations = world
+        .snapshot_decoration_mutations()
+        .into_iter()
+        .map(|(x, y, d)| DecorationMutationSave {
+            x,
+            y,
+            decoration: d,
+        })
+        .collect();
     run.active_action = world.active_action.as_ref().map(|active| ActiveActionSave {
         steps: active
             .steps
@@ -1431,6 +1506,30 @@ fn floor_with_gradient(
         (base_bg[2] as i16 + db / 2).clamp(0, 255) as u8,
     ];
     (fg, bg)
+}
+
+/// True if any of the 8 neighboring cells at `(wx, wy)` holds a
+/// TreeTrunk with a deciduous species. Drives the autumn FallenLeaves
+/// render-time overlay. Walks `World::cell_at` so it works across
+/// chunk seams when the ring is loaded.
+fn has_deciduous_neighbor(world: &World, wx: i64, wy: i64) -> bool {
+    for dy in -1..=1_i64 {
+        for dx in -1..=1_i64 {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            if let Some(cell) = world.cell_at(wx + dx, wy + dy) {
+                if cell.terrain == TerrainKind::TreeTrunk {
+                    if let Some(sp) = cell.tree_species {
+                        if sp.is_deciduous() {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Linear RGB blend from `a` toward `b` by `t` in [0.0, 1.0]. Used by

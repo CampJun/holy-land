@@ -27,7 +27,7 @@
 // function will produce phase-12+ wilderness chunks when the player
 // crosses chunk boundaries.
 
-use crate::flora::ALL_TREE_SPECIES;
+use crate::flora::{Decoration, PlantState, ALL_TREE_SPECIES};
 use crate::items::{ItemInstance, ItemKind, ItemMetadata};
 use crate::skill::Rng;
 use crate::world::{CellState, Chunk, ChunkCoord, GroundCover, TerrainKind, CHUNK_H, CHUNK_W};
@@ -109,6 +109,16 @@ pub fn generate_chunk(coord: ChunkCoord, world_seed: u64) -> Chunk {
     // walkability. Regenerated on chunk-load so no save persistence
     // needed.
     apply_leaf_litter(&mut cells);
+
+    // Step 3.75: undergrowth decoration placement. Per-cell ~15% roll
+    // on non-skeleton Grass cells outside the central spawn disc.
+    // Weighted by adjacency: cells next to a TreeTrunk skew toward
+    // shade-loving Fern/Moss; cells in the open skew toward
+    // Gorse/Bracken/Bramble. Phase E replaces the uniform roll with
+    // noise-weighted placement. Saplings/mushrooms aren't placed by
+    // chunkgen — they arrive via ChopTree (saplings) and the
+    // autumn dawn-tick (mushrooms).
+    apply_undergrowth(&mut cells, &mut rng);
 
     // Step 4: per-grass-cell debris rolls. Mud roll needs to know
     // whether ANY adjacent cell is water; precompute that into a bool
@@ -351,6 +361,89 @@ fn apply_leaf_litter(cells: &mut [CellState]) {
     }
     for idx in targets {
         cells[idx].ground_cover = GroundCover::LeafLitter;
+    }
+}
+
+/// Per-cell decoration placement on non-skeleton Grass cells. ~15%
+/// chance per cell. Weights: cells next to TreeTrunk skew shade-
+/// loving (Fern, Moss); cells in the open skew exposed (Gorse,
+/// Bracken, Bramble). Central 5x5 spawn disc reserved so the player
+/// always lands on bare ground.
+fn apply_undergrowth(cells: &mut [CellState], rng: &mut Rng) {
+    let cw = CHUNK_W as i32;
+    let ch = CHUNK_H as i32;
+    let spawn_cx = (CHUNK_W / 2) as i32;
+    let spawn_cy = (CHUNK_H / 2) as i32;
+    for y in 0..ch {
+        for x in 0..cw {
+            // Reserve a 5x5 disc around the spawn cell so the player
+            // can't land inside a Gorse hedge. Phase E expands this to
+            // a proper radius-4 flood-fix.
+            if (x - spawn_cx).abs() <= 2 && (y - spawn_cy).abs() <= 2 {
+                continue;
+            }
+            let idx = cell_idx(x as u32, y as u32);
+            if cells[idx].terrain != TerrainKind::Grass {
+                continue;
+            }
+            // Skip cells that already have items (the chunkgen herb/
+            // debris passes ran above us) — items already establish
+            // a foreground for that cell.
+            if !cells[idx].items.is_empty() {
+                continue;
+            }
+            // 15% roll.
+            if rng.next_u32() % 100 >= 15 {
+                continue;
+            }
+            // Shade adjacency: at least one tree in the 8-neighborhood.
+            let mut shaded = false;
+            'shade: for dy in -1..=1_i32 {
+                for dx in -1..=1_i32 {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let nx = x + dx;
+                    let ny = y + dy;
+                    if nx < 0 || ny < 0 || nx >= cw || ny >= ch {
+                        continue;
+                    }
+                    if cells[cell_idx(nx as u32, ny as u32)].terrain == TerrainKind::TreeTrunk {
+                        shaded = true;
+                        break 'shade;
+                    }
+                }
+            }
+            // 5 decoration choices weighted by shade. Each list sums
+            // to 100; we roll a d100 and walk the cumulative weights.
+            // Shaded: Fern 45, Moss 30, Bramble 15, Bracken 7, Gorse 3.
+            // Open:   Gorse 35, Bracken 25, Bramble 20, Fern 10, Moss 10.
+            let r = (rng.next_u32() % 100) as i32;
+            let decoration = if shaded {
+                if r < 45 {
+                    Decoration::Fern { state: PlantState::Mature }
+                } else if r < 75 {
+                    Decoration::Moss
+                } else if r < 90 {
+                    Decoration::Bramble { state: PlantState::Mature }
+                } else if r < 97 {
+                    Decoration::Bracken { state: PlantState::Mature }
+                } else {
+                    Decoration::Gorse { state: PlantState::Mature }
+                }
+            } else if r < 35 {
+                Decoration::Gorse { state: PlantState::Mature }
+            } else if r < 60 {
+                Decoration::Bracken { state: PlantState::Mature }
+            } else if r < 80 {
+                Decoration::Bramble { state: PlantState::Mature }
+            } else if r < 90 {
+                Decoration::Fern { state: PlantState::Mature }
+            } else {
+                Decoration::Moss
+            };
+            cells[idx].decoration = decoration;
+        }
     }
 }
 
