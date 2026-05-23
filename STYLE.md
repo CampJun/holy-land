@@ -128,13 +128,13 @@ owns engine-level primitives).
 
 | What | Lives in | Accessor |
 |---|---|---|
-| Per-verb base cost (game-seconds) | `action.rs` | `ActionId::base_cost()` — single match arm per verb |
+| Per-verb base cost (CDDA-style moves) | `action.rs` | `ActionId::move_cost()` — single match arm per verb; wall-clock seconds via `World::moves_to_seconds` (folds in actor speed) |
 | Verb-specific design constants (e.g. `FIRE_BONUS_FLINT_AND_STEEL`, `FELLED_FIREWOOD_MIN`) | `action.rs` (grouped by verb) | private `const` |
 | Per-item weight / glyph / etc. | `items.rs` | `ItemKind::def()` |
 | Per-terrain glyph / walkable / blocks_sight | `world.rs` (TerrainDef table, with terrain) | `TerrainKind::def()` |
 | Per-need decay rates, max value, accumulator | `needs.rs` | private `const` |
 | Per-skill starting value, daily cap | `skill.rs` | `Skills::starting()`, `DAILY_XP_CAP` |
-| Engine primitives: movement cost, day length, FOV radii, brightness curve, multi-turn pacing | `world.rs` | `pub const` |
+| Engine primitives: tile-step move-cost (`MOVE_COST_TILE`), `MOVES_PER_SECOND`, day length, FOV radii, brightness curve, multi-turn pacing | `world.rs` | `pub const` |
 
 **Rule:** if you're balancing a verb (cost, materials, output), edit
 should be one match arm or one const in `action.rs`. You should never
@@ -144,8 +144,8 @@ change.
 The phase-9 `try_pickup_all_at_player` primitive in `world.rs` follows
 this pattern: it doesn't spend action time itself; the caller (action.rs
 execute path, or main.rs's A-button handler) calls
-`world.spend_action_time(ActionId::Pickup.base_cost())` after the
-return. The world primitive is verb-agnostic.
+`world.spend_moves(ActionId::Pickup.move_cost())` after the return.
+The world primitive is verb-agnostic.
 
 ### 2.9 Menu / panel rendering
 
@@ -200,8 +200,12 @@ phase has passed and the symbol is still dead, it's actually dead.
 4. Add arm to `execute()` (action.rs) — either `consume_and_restore`,
    custom logic, or `ExecuteOutcome::NotImplemented`.
 
-If the new verb has a base cost: add `COST_X: u32` const in `world.rs`
-and import it.
+Cost is denominated in CDDA-style moves on `ActionId::move_cost()` —
+100 moves = 1 game-second at baseline speed (`Speed::BASELINE = 100`).
+Executors call `world.spend_moves(id.move_cost())` for instant verbs
+or `world.queue_multi_turn(&[(id, world.moves_to_seconds(id.move_cost()))])`
+for multi-turn queueing. Engine-level move-cost primitives (e.g.
+`MOVE_COST_TILE`) live in `world.rs`.
 
 ### 3.3 …`NeedKind`
 1. Add variant to `NeedKind` enum (needs.rs).

@@ -125,10 +125,20 @@ pub struct RunSave {
     // existed.
     #[serde(default = "default_calendar_day")]
     pub calendar_day: u32,
+    // Combat foundation (action economy slice 1): per-actor CDDA-style
+    // speed. Persisted so any future haste/slow status effect survives
+    // save/load. Saves written before this field existed default to
+    // Speed::BASELINE (100) — identical to the previous implicit value.
+    #[serde(default = "default_speed")]
+    pub speed: u16,
 }
 
 fn default_calendar_day() -> u32 {
     calendar::START_DAY
+}
+
+fn default_speed() -> u16 {
+    crate::world::Speed::BASELINE
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -221,6 +231,7 @@ impl RunSave {
             rng_state: 0,
             terrain_mutations: Vec::new(),
             calendar_day: calendar::START_DAY,
+            speed: crate::world::Speed::BASELINE,
         }
     }
 }
@@ -497,6 +508,7 @@ mod tests {
             rng_state: 0xDEADBEEF,
             terrain_mutations: Vec::new(),
             calendar_day: 100,
+            speed: crate::world::Speed::BASELINE,
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
@@ -508,6 +520,7 @@ mod tests {
         assert_eq!(loaded.clock_seconds, 50_400);
         assert_eq!(loaded.needs.warmth, 100);
         assert_eq!(loaded.calendar_day, 100);
+        assert_eq!(loaded.speed, crate::world::Speed::BASELINE);
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -587,6 +600,7 @@ mod tests {
                 kind: "grass".to_string(),
             }],
             calendar_day: calendar::START_DAY,
+            speed: 150,
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
@@ -613,6 +627,7 @@ mod tests {
         assert_eq!(loaded.cell_items.len(), 1);
         assert_eq!(loaded.cell_items[0].x, 21);
         assert_eq!(loaded.cell_items[0].items[0].kind, "stone");
+        assert_eq!(loaded.speed, 150);
 
         fs::remove_dir_all(&dir).ok();
     }

@@ -39,11 +39,21 @@ pub const DAY_LENGTH_SECONDS: u64 = 24 * 3600;
 pub const DAWN_HOUR: u64 = 6;
 pub const DUSK_HOUR: u64 = 20;
 
-/// World-primitive action costs. Each verb's costs live in `action.rs`
-/// next to its eval/execute code per STYLE.md §2 — but movement is not
-/// a menu verb (it's a direct dpad mapping), so its cost lives where
-/// `try_move_player` consumes it.
-pub const COST_MOVE_TILE: u32 = 5;
+/// Action-cost denominator. CDDA-style: 1 game-second equals exactly
+/// `MOVES_PER_SECOND` moves at baseline speed. Verb tuning lives in
+/// moves (`ActionId::move_cost`); wall-clock time is derived via
+/// `moves_to_seconds`, which scales with the actor's `Speed`. Status
+/// effects (haste/slow) and proficiency / encumbrance modifiers all
+/// compose by changing the speed input — not by special-casing verbs.
+pub const MOVES_PER_SECOND: u32 = 100;
+
+/// World-primitive action cost for a single tile step. Each verb's costs
+/// live in `action.rs` next to its eval/execute code per STYLE.md §2 —
+/// but movement is not a menu verb (it's a direct dpad mapping), so its
+/// cost lives where `try_move_player` consumes it. 500 moves at the
+/// baseline speed of 100 = 5 game-seconds per tile (preserves slice-1
+/// pacing pre-combat-foundation).
+pub const MOVE_COST_TILE: u32 = 500;
 
 /// Phase-9 multi-turn interrupt threshold. When any need drops below this
 /// during a multi-turn tick, the active action queue cancels and control
@@ -470,6 +480,28 @@ pub struct Renderable {
 #[derive(Clone, Copy, Serialize, Deserialize)]
 pub struct Player;
 
+/// Per-actor action-economy speed (CDDA convention). 100 = baseline
+/// human. Each unit of speed buys 1 move per game-second. The wall-clock
+/// cost of any move-denominated action is `ceil(move_cost / speed)`
+/// seconds — see `World::moves_to_seconds`. Status effects compose by
+/// scaling this value; per-verb code never needs to know they exist.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Speed {
+    pub value: u16,
+}
+
+impl Speed {
+    /// A baseline-speed actor accrues exactly `MOVES_PER_SECOND` moves
+    /// per game-second — so 100 by definition.
+    pub const BASELINE: u16 = MOVES_PER_SECOND as u16;
+}
+
+impl Default for Speed {
+    fn default() -> Self {
+        Self { value: Self::BASELINE }
+    }
+}
+
 pub struct World {
     /// Chunk store keyed on grid coords. Outside this module, prefer the
     /// `tile_at` / `cell_at` / `cell_at_mut` / `snapshot_*` accessor
@@ -595,6 +627,7 @@ impl World {
             starting_pack(),
             Needs::starting(),
             Skills::starting(),
+            Speed::default(),
         ));
 
         let mut world = Self {
@@ -762,7 +795,7 @@ impl World {
         self.ensure_chunk_ring(target_cc);
         if self.cell_walkable_at(nx as i64, ny as i64) {
             self.set_player_pos(Position { x: nx, y: ny });
-            self.spend_action_time(COST_MOVE_TILE);
+            self.spend_moves(MOVE_COST_TILE);
             self.recompute_fov();
         }
     }
@@ -793,6 +826,51 @@ impl World {
             .ecs
             .get::<&mut Skills>(self.player)
             .expect("player has Skills") = skills;
+    }
+
+    /// Read the player's current `Speed` (CDDA-style action-economy
+    /// rate). Slice-1 returns the raw component value; future status
+    /// effects (haste/slow), encumbrance, and crippled-limb modifiers
+    /// will compose into the effective value through this accessor.
+    pub fn player_speed(&self) -> u16 {
+        self.ecs
+            .get::<&Speed>(self.player)
+            .map(|s| s.value)
+            .unwrap_or(Speed::BASELINE)
+    }
+
+    /// Overwrite the player's base speed. Used by save load; debug
+    /// command will use this when haste/slow lands as a status effect.
+    pub fn set_player_speed(&mut self, value: u16) {
+        if let Ok(mut s) = self.ecs.get::<&mut Speed>(self.player) {
+            s.value = value;
+        }
+    }
+
+    /// Convert a CDDA-style move-cost into wall-clock game-seconds for
+    /// the *player* actor at current effective speed. Ceiling division
+    /// — a 1-move cost at speed 100 still advances the clock by 1 sec
+    /// rather than rounding silently to zero. Used by both the instant-
+    /// verb path (`spend_moves`) and the multi-turn queue path
+    /// (`queue_multi_turn` callers in action.rs).
+    pub fn moves_to_seconds(&self, move_cost: u32) -> u32 {
+        if move_cost == 0 {
+            return 0;
+        }
+        let speed = self.player_speed().max(1) as u32;
+        (move_cost + speed - 1) / speed
+    }
+
+    /// Spend `move_cost` moves on an instant verb: translate to
+    /// game-seconds via the player's effective speed, then route
+    /// through `spend_action_time` so the need-penalty amplification
+    /// applies uniformly. This is the canonical entry point for the
+    /// CDDA action economy; `spend_action_time` remains the inner
+    /// sec-based primitive (and the path that multi-turn queueing
+    /// already amplifies up front).
+    pub fn spend_moves(&mut self, move_cost: u32) {
+        let secs = self.moves_to_seconds(move_cost);
+        self.spend_action_time(secs);
     }
 
     /// True if the in-game clock is between dusk and dawn.
@@ -1959,6 +2037,40 @@ mod tests {
             world.clock_seconds, before,
             "primitive must not burn time; that's the caller's job"
         );
+    }
+
+    #[test]
+    fn new_player_spawns_at_baseline_speed() {
+        let world = World::new(CHUNK_W, CHUNK_H);
+        assert_eq!(world.player_speed(), Speed::BASELINE);
+    }
+
+    #[test]
+    fn moves_to_seconds_at_baseline_is_one_per_hundred_moves() {
+        // Speed::BASELINE == MOVES_PER_SECOND, so the conversion is the
+        // identity on game-second-denominated tuning that pre-dated this
+        // refactor (e.g. 500 moves ↔ 5 sec tile step).
+        let world = World::new(CHUNK_W, CHUNK_H);
+        assert_eq!(world.moves_to_seconds(0), 0);
+        assert_eq!(world.moves_to_seconds(100), 1);
+        assert_eq!(world.moves_to_seconds(500), 5);
+        // Ceiling division: tiny costs still advance the clock, never
+        // round to zero.
+        assert_eq!(world.moves_to_seconds(1), 1);
+        assert_eq!(world.moves_to_seconds(99), 1);
+    }
+
+    #[test]
+    fn spend_moves_at_double_speed_halves_wall_clock() {
+        // Core CDDA-style guarantee: a haste effect that doubles speed
+        // makes a fixed move-cost action take half the wall-clock time,
+        // *without* the verb needing to know anything about the
+        // modifier. This is why we denominate combat costs in moves.
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        world.set_player_speed(200);
+        let before = world.clock_seconds;
+        world.spend_moves(1_000); // would be 10s at baseline
+        assert_eq!(world.clock_seconds - before, 5);
     }
 
     #[test]
