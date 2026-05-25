@@ -12,7 +12,7 @@
 //
 // `Pack` lives as a hecs component on the player entity; see items.rs.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use hecs::{Entity, World as Ecs};
 use serde::{Deserialize, Serialize};
@@ -144,7 +144,7 @@ pub fn dawns_elapsed(clock_seconds: u64) -> u64 {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ChunkCoord {
     pub cx: i32,
     pub cy: i32,
@@ -492,6 +492,34 @@ pub struct World {
     /// spawns from ChopTree, mushroom expiry. Apply after chunkgen
     /// + terrain_mutations.
     pub decoration_mutations: HashMap<(i32, i32), Decoration>,
+    /// Active fast-travel queue, if any. Transient — not serialized.
+    /// `tick_fast_travel` pops one cell per frame and reuses
+    /// `try_move_player` so per-cell clock/needs/FOV all stay coherent
+    /// with manual walking. Interrupted travel just clears this back
+    /// to None; the overmap remembers the destination separately.
+    pub fast_travel: Option<crate::fasttravel::FastTravelQueue>,
+    /// Debug "godmode" toggle. When true: `try_move_player` ignores
+    /// walkability (player walks through trees, water, gorse) and
+    /// `advance_time_raw` skips the needs.tick call so thirst /
+    /// hunger / sleep / warmth stay pinned at their current values.
+    /// Transient — not saved; cleared on World::new and a fresh boot.
+    pub godmode: bool,
+}
+
+/// Outcome of one `tick_fast_travel` call. The main loop matches on
+/// this to log the right message and drop the queue when it ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FastTravelStep {
+    /// Player advanced one cell; queue continues next frame.
+    Stepped,
+    /// Final cell consumed; player has arrived at the destination.
+    Completed,
+    /// Next cell is unwalkable (tree, water, decoration). Player stops
+    /// at the current cell; main loop surfaces "the path is blocked."
+    BlockedAtCell,
+    /// At least one need dropped below 5 during the step. Auto-cancel
+    /// per Cornwall-World §6.2; player stops where they are.
+    NeedCritical,
 }
 
 /// In-flight multi-turn action queue. `steps[0]` is the currently-running
@@ -551,6 +579,14 @@ pub struct MultiTurnTickResult {
 
 impl World {
     pub fn new(width: u32, height: u32) -> Self {
+        Self::with_seed(width, height, DEFAULT_SEED)
+    }
+
+    /// Build a world with an explicit `world_seed`. The seed determines
+    /// per-chunk wilderness contents (trees, debris, decorations); the
+    /// authored Cornwall layer (biomes, rivers, roads, sites) is the
+    /// same in every world.
+    pub fn with_seed(width: u32, height: u32, seed: u64) -> Self {
         // Slice-1 viewport is fixed to a single chunk. The width/height args
         // come from main's WORLD_W/WORLD_H constants; assert they match the
         // chunk dims so a future bump in main flags itself loudly here rather
@@ -562,14 +598,16 @@ impl World {
         let origin = ChunkCoord { cx: 0, cy: 0 };
         chunks.insert(
             origin,
-            Box::new(crate::chunkgen::generate_chunk(origin, DEFAULT_SEED)),
+            Box::new(crate::chunkgen::generate_chunk(
+                origin,
+                seed,
+                crate::cornwall::overmap_info_at(origin),
+            )),
         );
 
         let mut ecs = Ecs::new();
-        let spawn = Position {
-            x: CHUNK_W as i32 / 2,
-            y: CHUNK_H as i32 / 2,
-        };
+        let (sx, sy) = crate::cornwall::EXETER_SPAWN_CELL;
+        let spawn = Position { x: sx, y: sy };
         let player = ecs.spawn((
             Player,
             spawn,
@@ -585,16 +623,18 @@ impl World {
 
         let mut world = Self {
             chunks,
-            seed: DEFAULT_SEED,
+            seed,
             clock_seconds: STARTING_CLOCK_SECONDS,
             ecs,
             player,
             active_action: None,
-            rng: Rng::from_world_seed(DEFAULT_SEED),
+            rng: Rng::from_world_seed(seed),
             terrain_mutations: HashMap::new(),
             calendar_day: calendar::START_DAY,
             tree_species_mutations: HashMap::new(),
             decoration_mutations: HashMap::new(),
+            fast_travel: None,
+            godmode: false,
         };
         // First-frame FOV so the renderer doesn't draw a black screen on
         // the very first paint.
@@ -676,7 +716,11 @@ impl World {
         if self.chunks.contains_key(&coord) {
             return;
         }
-        let mut chunk = crate::chunkgen::generate_chunk(coord, self.seed);
+        let mut chunk = crate::chunkgen::generate_chunk(
+            coord,
+            self.seed,
+            crate::cornwall::overmap_info_at(coord),
+        );
         // Apply any pending mutations for this chunk on top of the
         // freshly-generated baseline. Order: terrain first (a chopped
         // tree clears the canopy), then tree_species (cleared on
@@ -745,6 +789,121 @@ impl World {
         self.ensure_chunk_ring(cc);
     }
 
+    /// Set of chunks the player is allowed to see on the overmap. Per
+    /// Cornwall-World §5.2 rule 1: any chunk whose FOV has touched
+    /// counts as "visited," and a Chebyshev-3 halo around each visited
+    /// chunk is also revealed. Rules 2 and 3 (NPC dialog / documents)
+    /// are deferred until NPCs exist.
+    ///
+    /// Derived lazily from per-cell `cell.explored`; no save field
+    /// required.
+    pub fn discovered_chunks(&self) -> HashSet<ChunkCoord> {
+        let mut visited: HashSet<ChunkCoord> = HashSet::new();
+        for (coord, chunk) in &self.chunks {
+            if chunk.cells.iter().any(|c| c.explored) {
+                visited.insert(*coord);
+            }
+        }
+        let mut discovered = HashSet::with_capacity(visited.len() * 49);
+        for v in &visited {
+            for dy in -3..=3 {
+                for dx in -3..=3 {
+                    discovered.insert(ChunkCoord {
+                        cx: v.cx + dx,
+                        cy: v.cy + dy,
+                    });
+                }
+            }
+        }
+        discovered
+    }
+
+    /// Advance the active fast-travel queue by one cell. Returns a
+    /// `FastTravelStep` describing what happened so the main loop can
+    /// log + drop the queue on completion/interrupt. The queue stays
+    /// `Some` on `Stepped`; the caller clears it on any other outcome.
+    ///
+    /// Pulls leg_cells out of the queue, refilling them via per-leg
+    /// cell A* (`fasttravel::refill_leg`) when empty so the path
+    /// genuinely steers around trees / decorations / water rather
+    /// than walking straight into them.
+    pub fn tick_fast_travel(&mut self) -> FastTravelStep {
+        // Take the queue out so we can call &mut self methods without
+        // a borrow conflict; put it back on Stepped.
+        let Some(mut queue) = self.fast_travel.take() else {
+            return FastTravelStep::Completed;
+        };
+
+        // Refill the cell-level leg if empty (lazy A* between current
+        // position and the next chunk center). The refill mutates
+        // queue.chunk_path (popping already-entered chunks).
+        if queue.leg_cells.is_empty() {
+            if !crate::fasttravel::refill_leg(self, &mut queue) {
+                // No walkable path forward — surface as BlockedAtCell
+                // and drop the queue.
+                return FastTravelStep::BlockedAtCell;
+            }
+        }
+
+        // If the refill produced no cells (player is already at the
+        // active target), check whether we're done overall.
+        let Some(next) = queue.leg_cells.pop_front() else {
+            let p = self.player_pos();
+            let at_dest =
+                (p.x as i64, p.y as i64) == queue.destination_cell || queue.chunk_path.is_empty();
+            if at_dest {
+                return FastTravelStep::Completed;
+            }
+            // Try again next frame — queue stays so refill can target
+            // the next chunk after.
+            self.fast_travel = Some(queue);
+            return FastTravelStep::Stepped;
+        };
+
+        let p = self.player_pos();
+        let raw_dx = next.0 - p.x as i64;
+        let raw_dy = next.1 - p.y as i64;
+        debug_assert!(
+            raw_dx.abs() <= 1 && raw_dy.abs() <= 1,
+            "fast-travel leg cell ({}, {}) is not 1-step-adjacent to player ({}, {})",
+            next.0,
+            next.1,
+            p.x,
+            p.y
+        );
+        let dx = raw_dx as i32;
+        let dy = raw_dy as i32;
+        let before = self.player_pos();
+        self.try_move_player(dx, dy);
+        let after = self.player_pos();
+        if before == after && (dx != 0 || dy != 0) {
+            // The pre-planned leg is now blocked (terrain mutated mid-
+            // travel — rare; e.g. a fire that spread into the path).
+            // Clear the leg so the next tick re-plans from here.
+            queue.leg_cells.clear();
+            self.fast_travel = Some(queue);
+            return FastTravelStep::Stepped;
+        }
+
+        // Need-critical interrupt.
+        let n = self.player_needs();
+        if n.thirst < 5 || n.hunger < 5 || n.sleep < 5 || n.warmth < 5 {
+            return FastTravelStep::NeedCritical;
+        }
+
+        // Done iff: chunk_path empty AND leg empty AND we're on the
+        // destination cell. (The refill_leg loop ensures chunk_path is
+        // popped as chunks are entered; we may also have ended exactly
+        // at destination_cell.)
+        let at_dest = (after.x as i64, after.y as i64) == queue.destination_cell;
+        if queue.chunk_path.is_empty() && queue.leg_cells.is_empty() && at_dest {
+            return FastTravelStep::Completed;
+        }
+
+        self.fast_travel = Some(queue);
+        FastTravelStep::Stepped
+    }
+
     pub fn player_pos(&self) -> Position {
         *self
             .ecs
@@ -769,7 +928,11 @@ impl World {
         // move would be rejected.
         let (target_cc, _, _) = Self::chunk_coord_for(nx as i64, ny as i64);
         self.ensure_chunk_ring(target_cc);
-        if self.cell_walkable_at(nx as i64, ny as i64) {
+        // Godmode walks through trees / water / gorse. The OOB-Wall
+        // fallback still applies (you can't stand outside a loaded
+        // chunk's bounds) — ensure_chunk_ring above already loaded the
+        // target ring, so any in-world cell is now reachable.
+        if self.godmode || self.cell_walkable_at(nx as i64, ny as i64) {
             self.set_player_pos(Position { x: nx, y: ny });
             self.spend_action_time(COST_MOVE_TILE);
             self.recompute_fov();
@@ -874,10 +1037,16 @@ impl World {
         if midnights > 0 {
             self.calendar_day = self.calendar_day.saturating_add(midnights as u32);
         }
-        let env = self.needs_env();
-        let mut needs = self.player_needs();
-        needs.tick(secs, env);
-        self.set_player_needs(needs);
+        // Godmode freezes the four player needs at their current value
+        // (thirst / hunger / sleep / warmth). Lit fires, cookware, and
+        // calendar/season ticks still advance — those are world events
+        // not the player's metabolism.
+        if !self.godmode {
+            let env = self.needs_env();
+            let mut needs = self.player_needs();
+            needs.tick(secs, env);
+            self.set_player_needs(needs);
+        }
         let fire_died = self.tick_fires(secs);
         self.tick_cookware(secs);
         let day_night_flipped = self.is_night() != was_night;
@@ -1575,6 +1744,192 @@ mod tests {
     fn player_spawns_at_center() {
         let world = World::new(CHUNK_W, CHUNK_H);
         assert_eq!(world.player_pos(), Position { x: 20, y: 15 });
+    }
+
+    #[test]
+    fn godmode_walks_through_tree_and_freezes_needs() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Plant a tree directly east of the player.
+        let px = world.player_pos().x;
+        let py = world.player_pos().y;
+        if let Some(c) = world.cell_at_mut((px + 1) as i64, py as i64) {
+            c.terrain = TerrainKind::TreeTrunk;
+            c.decoration = Decoration::None;
+        }
+        // Normal walk into the tree: rejected.
+        world.try_move_player(1, 0);
+        assert_eq!(
+            world.player_pos(),
+            Position { x: px, y: py },
+            "without godmode, walking into a tree must fail"
+        );
+        // Enable godmode and walk: succeeds.
+        let needs_before = world.player_needs();
+        world.godmode = true;
+        world.try_move_player(1, 0);
+        assert_eq!(
+            world.player_pos(),
+            Position { x: px + 1, y: py },
+            "with godmode, player walks through the tree"
+        );
+        let needs_after = world.player_needs();
+        // Godmode should have frozen needs (no decay during the step's
+        // clock advance).
+        assert_eq!(
+            needs_before, needs_after,
+            "godmode must freeze thirst/hunger/sleep/warmth across a move"
+        );
+    }
+
+    #[test]
+    fn fast_travel_tick_advances_player_and_clock() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Build a tiny queue: pre-populated leg_cells with a single
+        // cell east of spawn (Grass, walkable). chunk_path empty so
+        // the queue completes after the single step.
+        use std::collections::VecDeque;
+        let mut leg = VecDeque::new();
+        leg.push_back((21i64, 15i64));
+        world.fast_travel = Some(crate::fasttravel::FastTravelQueue {
+            chunk_path: VecDeque::new(),
+            leg_cells: leg,
+            destination: ChunkCoord { cx: 0, cy: 0 },
+            destination_cell: (21, 15),
+        });
+        let clock_before = world.clock_seconds;
+        let pos_before = world.player_pos();
+        let step = world.tick_fast_travel();
+        assert_eq!(step, FastTravelStep::Completed);
+        let pos_after = world.player_pos();
+        assert_eq!(
+            pos_after,
+            Position {
+                x: pos_before.x + 1,
+                y: pos_before.y
+            },
+            "fast-travel should advance player one cell east"
+        );
+        assert!(
+            world.clock_seconds > clock_before,
+            "fast-travel tick should advance the clock via try_move_player"
+        );
+    }
+
+    /// Regression: tick_fast_travel must steer the player around an
+    /// unwalkable cell (tree, decoration) — chunk-A* only sees per-
+    /// chunk biomes, so without per-cell A* the queue used to walk
+    /// straight into the obstacle.
+    #[test]
+    fn fast_travel_steers_around_trees() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Place the player on a known-walkable cell with a TreeTrunk
+        // directly east. Force the surrounding cells to be walkable
+        // grass so the only obstacle is the one tree we plant.
+        let px = 10i32;
+        let py = 10i32;
+        world.set_player_pos(Position { x: px, y: py });
+        // Clear any decoration on the obstacle cell and its neighbors,
+        // then drop a tree on (px+1, py).
+        for dy in -1..=1i32 {
+            for dx in 0..=3i32 {
+                if let Some(c) = world.cell_at_mut((px + dx) as i64, (py + dy) as i64) {
+                    c.terrain = TerrainKind::Grass;
+                    c.decoration = Decoration::None;
+                    c.tree_species = None;
+                }
+            }
+        }
+        if let Some(c) = world.cell_at_mut((px + 1) as i64, py as i64) {
+            c.terrain = TerrainKind::TreeTrunk;
+        }
+
+        // Goal: a few cells east of the tree. Use plan + tick to walk
+        // there; verify the player never steps onto the tree cell.
+        let from_cc = world.player_chunk();
+        let queue = crate::fasttravel::plan_path(
+            from_cc,
+            (px as i64, py as i64),
+            from_cc, // same chunk; planner targets destination_cell
+        )
+        .expect("plan_path returns Some for same-chunk");
+        // The same-chunk planner produces an empty queue; lay our own
+        // destination cell to force a leg.
+        use std::collections::VecDeque;
+        let target_cell = (px as i64 + 3, py as i64);
+        world.fast_travel = Some(crate::fasttravel::FastTravelQueue {
+            chunk_path: VecDeque::new(),
+            leg_cells: VecDeque::new(),
+            destination: queue.destination,
+            destination_cell: target_cell,
+        });
+
+        let mut iters = 0;
+        loop {
+            iters += 1;
+            assert!(iters < 50, "fast-travel didn't converge");
+            let outcome = world.tick_fast_travel();
+            let p = world.player_pos();
+            // Critical assertion: player must never step onto the
+            // tree cell.
+            assert!(
+                !(p.x == px + 1 && p.y == py),
+                "fast-travel stepped onto a tree at ({}, {})",
+                p.x,
+                p.y
+            );
+            match outcome {
+                FastTravelStep::Stepped => continue,
+                FastTravelStep::Completed => break,
+                other => panic!("unexpected outcome: {:?}", other),
+            }
+        }
+        let p = world.player_pos();
+        assert_eq!(p.x as i64, target_cell.0);
+        assert_eq!(p.y as i64, target_cell.1);
+    }
+
+    #[test]
+    fn discovered_chunks_expands_by_chebyshev_three() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Fresh world only has chunk (0, 0) loaded. The spawn FOV
+        // already marked some cells explored. Expansion should produce
+        // exactly the 7×7 Chebyshev-3 box around chunk (0, 0).
+        let discovered = world.discovered_chunks();
+        // 7 * 7 = 49 chunks for a single visited origin.
+        assert_eq!(
+            discovered.len(),
+            49,
+            "expected 49 chunks (7×7 Chebyshev box), got {}",
+            discovered.len()
+        );
+        for dx in -3..=3 {
+            for dy in -3..=3 {
+                assert!(
+                    discovered.contains(&ChunkCoord { cx: dx, cy: dy }),
+                    "missing chunk ({}, {}) in Chebyshev-3 halo",
+                    dx,
+                    dy
+                );
+            }
+        }
+        assert!(
+            !discovered.contains(&ChunkCoord { cx: 4, cy: 0 }),
+            "Chebyshev-4 should be outside discovered set"
+        );
+
+        // After moving into neighbor chunk (-1, 0), its 7×7 halo
+        // should also be present. Use ensure_chunk_loaded to keep the
+        // test independent of try_move_player's chunk-ring side
+        // effects.
+        world.ensure_chunk_loaded(ChunkCoord { cx: -1, cy: 0 });
+        // Force a FOV cast from a position inside chunk (-1, 0).
+        world.set_player_pos(Position { x: -20, y: 15 });
+        world.recompute_fov();
+        let d2 = world.discovered_chunks();
+        assert!(
+            d2.contains(&ChunkCoord { cx: -4, cy: 0 }),
+            "chunk (-4, 0) should be discovered after stepping into (-1, 0)"
+        );
     }
 
     #[test]

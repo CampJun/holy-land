@@ -1,9 +1,11 @@
 mod action;
 mod calendar;
 mod chunkgen;
+mod cornwall;
 mod crafting;
 #[cfg(not(target_arch = "arm"))]
 mod debug_console;
+mod fasttravel;
 mod flora;
 mod fov;
 mod input;
@@ -34,8 +36,8 @@ use save::{
 };
 use skill::{Rng, Skill, SkillKind, Skills};
 use world::{
-    brightness_at, dawns_elapsed, GroundCover, Position, TerrainKind, ViewMode, World,
-    MULTI_TURN_GAME_SEC_PER_FRAME, TREE_VARIANT_GLYPHS,
+    brightness_at, dawns_elapsed, ChunkCoord, FastTravelStep, GroundCover, Position, TerrainKind,
+    ViewMode, World, MULTI_TURN_GAME_SEC_PER_FRAME, TREE_VARIANT_GLYPHS,
 };
 
 const WORLD_W: u32 = 40;
@@ -270,12 +272,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut events = sdl.event_pump()?;
     let mut input = Input::new();
-    let mut world = World::new(WORLD_W, WORLD_H);
+
+    // Boot seed selection. If a run save exists we use its seed (so the
+    // wilderness layout reloads identically). Otherwise we pick a fresh
+    // seed from the wall clock — this is what "generate a new world"
+    // means in v1: same authored Cornwall, fresh per-chunk procgen.
+    let maybe_run = save::load_run(&save_dir.join(RUN_FILE)).ok();
+    let world_seed = maybe_run
+        .as_ref()
+        .map(|r| r.seed)
+        .unwrap_or_else(fresh_world_seed);
+    log_info!("world seed: 0x{:016X}", world_seed);
+    let mut world = World::with_seed(WORLD_W, WORLD_H, world_seed);
     world.ensure_player_ring();
     let mut prev_meta_header = meta.header.clone();
     let mut prev_run_header: Option<SaveHeader> = None;
 
-    if let Ok(run) = save::load_run(&save_dir.join(RUN_FILE)) {
+    if let Some(run) = maybe_run {
         log_info!(
             "loaded run save (player at {},{}, pack {}g, {} non-empty cells, clock {}s)",
             run.player_x,
@@ -486,6 +499,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // fields.
     let mut glyph_palette: Option<u8> = None;
 
+    // Overmap mode. `M` (desktop) toggles it. Cursor lives on the mode
+    // struct; `last_overmap_destination` survives close/reopen so the
+    // resume-from-interrupt UX (design doc §6.3) works.
+    let mut overmap_mode: Option<OvermapMode> = None;
+    let mut last_overmap_destination: Option<ChunkCoord> = None;
+    // Per-frame counter for the flashing player @ on the overmap.
+    let mut overmap_frame_count: u64 = 0;
+
     #[cfg(not(target_arch = "arm"))]
     let debug = debug_console::DebugConsole::spawn();
 
@@ -566,7 +587,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        for input_action in input.drain() {
+        let drained_actions = input.drain();
+        // Fast-travel watcher: any input action (other than the M
+        // toggle that opens the map) cancels the queue. We compute this
+        // BEFORE the input loop so the cancel fires for the SAME frame
+        // the player pressed, even if the loop consumes the action
+        // for another purpose. M is exempted so opening the overmap
+        // during travel just cancels-and-shows-map naturally below.
+        let cancels_fast_travel = world.fast_travel.is_some()
+            && drained_actions
+                .iter()
+                .any(|a| !matches!(a, Action::Y | Action::OpenOvermap));
+        for input_action in drained_actions {
             // Y press events are owned by the hold-Y radial state
             // machine above; drop them here so they don't double-fire
             // any menu open.
@@ -680,6 +712,66 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     _ => {}
                 }
+                continue;
+            }
+
+            // Overmap mode (full-screen Cornwall map). Modal: while
+            // open, the player can move a cursor + initiate fast-travel
+            // but cannot walk, interact, or open other menus. Toggle
+            // with `M` (Action::OpenOvermap).
+            if let Some(ref mut mode) = overmap_mode {
+                match input_action {
+                    Action::Up => mode.move_cursor(0, -1),
+                    Action::Down => mode.move_cursor(0, 1),
+                    Action::Left => mode.move_cursor(-1, 0),
+                    Action::Right => mode.move_cursor(1, 0),
+                    Action::A => {
+                        // Initiate fast-travel to cursor. Plan path
+                        // from the player's current cell to the cursor
+                        // chunk; if it succeeds, store the queue on
+                        // World and close the map.
+                        let from = world.player_chunk();
+                        let p = world.player_pos();
+                        let cell_from = (p.x as i64, p.y as i64);
+                        match fasttravel::plan_path(from, cell_from, mode.cursor) {
+                            Some(queue) => {
+                                log_info!(
+                                    "[fast-travel] {} chunk hops planned to ({}, {})",
+                                    queue.chunk_path.len(),
+                                    mode.cursor.cx,
+                                    mode.cursor.cy
+                                );
+                                last_overmap_destination = Some(mode.cursor);
+                                world.fast_travel = Some(queue);
+                                overmap_mode = None;
+                            }
+                            None => {
+                                log_info!(
+                                    "[fast-travel] no route to ({}, {})",
+                                    mode.cursor.cx,
+                                    mode.cursor.cy
+                                );
+                            }
+                        }
+                    }
+                    Action::B | Action::OpenOvermap => {
+                        overmap_mode = None;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            // Open the overmap from any other "neutral" state (no
+            // menus open, no active action). Toggling out lives in
+            // the overmap-input arm above.
+            if input_action == Action::OpenOvermap
+                && command_menu.is_none()
+                && info_menu.is_none()
+                && glyph_palette.is_none()
+                && world.active_action.is_none()
+            {
+                overmap_mode = Some(OvermapMode::open(&world, last_overmap_destination));
                 continue;
             }
 
@@ -853,6 +945,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // Fast-travel tick. Cancels on any input this frame (the watcher
+        // computed at the top of the loop), else advances one cell. The
+        // overmap mode being open suspends ticking — the player is
+        // staring at the map, not walking.
+        if pause_menu.is_none() && dead.is_none() && overmap_mode.is_none() {
+            if cancels_fast_travel && world.fast_travel.is_some() {
+                log_info!("[fast-travel] you stop.");
+                world.fast_travel = None;
+            } else if world.fast_travel.is_some() {
+                match world.tick_fast_travel() {
+                    FastTravelStep::Stepped => {}
+                    FastTravelStep::Completed => {
+                        log_info!("[fast-travel] arrived.");
+                        world.fast_travel = None;
+                        last_overmap_destination = None;
+                    }
+                    FastTravelStep::BlockedAtCell => {
+                        log_info!("[fast-travel] the path is blocked.");
+                        world.fast_travel = None;
+                    }
+                    FastTravelStep::NeedCritical => {
+                        log_info!("[fast-travel] you're too exhausted to keep going.");
+                        world.fast_travel = None;
+                    }
+                }
+            }
+        }
+
         // Multi-turn action tick. Runs per-frame; advance rate depends
         // on view_mode. Completed steps trigger action::complete_step
         // (which fires the verb's consume-from-pack and structure-place
@@ -883,7 +1003,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         #[cfg(not(target_arch = "arm"))]
-        debug.drain(|cmd| debug_console::apply_debug_command(&mut world, cmd));
+        {
+            let mut new_world_request: Option<Option<u64>> = None;
+            debug.drain(|cmd| {
+                if let Some(eff) = debug_console::apply_debug_command(&mut world, cmd) {
+                    match eff {
+                        debug_console::DebugSideEffect::NewWorld(s) => {
+                            new_world_request = Some(s);
+                        }
+                    }
+                }
+            });
+            if let Some(seed_opt) = new_world_request {
+                let new_seed = seed_opt.unwrap_or_else(fresh_world_seed);
+                log_info!("[newworld] rebuilding with seed 0x{:016X}", new_seed);
+                let _ = std::fs::remove_file(save_dir.join(RUN_FILE));
+                world = World::with_seed(WORLD_W, WORLD_H, new_seed);
+                world.ensure_player_ring();
+                world.recompute_fov();
+                prev_run_header = None;
+                command_menu = None;
+                info_menu = None;
+                dead = None;
+                last_dawn_idx = dawns_elapsed(world.clock_seconds);
+            }
+        }
 
         // Death detection. Runs after action+tick so an action that
         // pushed a need to 0 surfaces this frame. is_dead() is the
@@ -992,12 +1136,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if radial_open {
             draw_radial_menu(&mut ui_cells, &world, &palette);
         }
+        if let Some(ref ft) = world.fast_travel {
+            draw_fast_travel_banner(&mut ui_cells, ft, &palette);
+        }
+        if let Some(ref mode) = overmap_mode {
+            draw_overmap(&mut ui_cells, &world, mode, &palette, overmap_frame_count);
+        }
         if let Some(selected) = pause_menu {
             draw_pause_menu(&mut ui_cells, selected, &palette);
         }
         if let Some(cause) = dead {
             draw_death_screen(&mut ui_cells, cause, &palette);
         }
+        overmap_frame_count = overmap_frame_count.wrapping_add(1);
 
         let draw_start = Instant::now();
         let mut changed_cells = 0;
@@ -1253,6 +1404,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Wall-clock-derived world seed used when no run save exists. SplitMix64
+/// mixer over `SystemTime` nanos so adjacent boots produce well-spread
+/// seeds (the raw nanos field changes slowly in the high bits).
+fn fresh_world_seed() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(save::DEFAULT_WORLD_SEED);
+    let mut z = nanos.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
 fn save_game(
     save_dir: &std::path::Path,
     meta: &mut MetaSave,
@@ -1312,6 +1478,7 @@ fn save_game(
         },
     };
     run.rng_state = world.rng.state;
+    run.seed = world.seed;
     run.terrain_mutations = world
         .snapshot_terrain_mutations()
         .into_iter()
@@ -1591,6 +1758,21 @@ fn grass_dot_visible(x: i32, y: i32, seed: u64) -> bool {
 /// Width budget: starts at col 1, ends before col 39. Truncates with
 /// `...` if the join overflows.
 fn draw_here_line(cells: &mut [Option<Cell>], world: &World, palette: &Palette) {
+    let row = WORLD_H as i32 - 1;
+    // Godmode badge — render flush-right so it doesn't collide with
+    // the here-line item label that anchors at column 1.
+    if world.godmode {
+        let tag = "[GOD]";
+        let x = WORLD_W as i32 - tag.len() as i32 - 1;
+        put_text(
+            cells,
+            x,
+            row,
+            tag,
+            palette.need_critical_fg,
+            palette.hud_bg,
+        );
+    }
     let pos = world.player_pos();
     let Some(cell) = world.cell_at(pos.x as i64, pos.y as i64) else {
         return;
@@ -1605,7 +1787,6 @@ fn draw_here_line(cells: &mut [Option<Cell>], world: &World, palette: &Palette) 
         joined.truncate(max.saturating_sub(3));
         joined.push_str("...");
     }
-    let row = WORLD_H as i32 - 1;
     put_text(cells, 1, row, &joined, palette.hud_fg, palette.hud_bg);
 }
 
@@ -2278,6 +2459,259 @@ fn put_text(cells: &mut [Option<Cell>], x: i32, y: i32, text: &str, fg: Color, b
     for (i, b) in text.bytes().enumerate() {
         put_cell(cells, x + i as i32, y, Cell { glyph: b, fg, bg });
     }
+}
+
+/// Full-screen Cornwall overmap mode. Cursor + biome view. `last_destination`
+/// is wired here so the cursor can default back to the most recent
+/// fast-travel target on re-open (resume-from-interrupt per design doc §6.3).
+struct OvermapMode {
+    cursor: ChunkCoord,
+}
+
+impl OvermapMode {
+    fn open(world: &World, last_destination: Option<ChunkCoord>) -> Self {
+        let cursor = last_destination.unwrap_or_else(|| world.player_chunk());
+        Self { cursor }
+    }
+    fn move_cursor(&mut self, dx: i32, dy: i32) {
+        self.cursor = ChunkCoord {
+            cx: self.cursor.cx + dx,
+            cy: self.cursor.cy + dy,
+        };
+    }
+}
+
+/// Average game-seconds per chunk crossing for the overmap's travel-
+/// time estimate. Real cost varies by biome+road; this is the eyeballed
+/// midpoint. Cheap enough to recompute per-frame.
+const OVERMAP_AVG_CHUNK_SECS: u32 = 90;
+
+fn draw_overmap(
+    cells: &mut [Option<Cell>],
+    world: &World,
+    mode: &OvermapMode,
+    palette: &Palette,
+    frame_count: u64,
+) {
+    let player_chunk = world.player_chunk();
+    let discovered = world.discovered_chunks();
+    let view_w = WORLD_W as i32;
+    let view_h = WORLD_H as i32 - 1; // bottom row reserved for info line
+    let half_w = view_w / 2;
+    let half_h = view_h / 2;
+
+    // Player chunk renders at (half_w, half_h). Fill every cell of the
+    // viewport so terrain underneath doesn't bleed through.
+    for vy in 0..view_h {
+        for vx in 0..view_w {
+            let cc = ChunkCoord {
+                cx: player_chunk.cx + (vx - half_w),
+                cy: player_chunk.cy + (vy - half_h),
+            };
+
+            let (glyph, fg) = if !discovered.contains(&cc) {
+                (b'?', color_dim())
+            } else {
+                let info = cornwall::overmap_info_at(cc);
+                // Display priority at a chunk: named-site (anchor only)
+                // wins over river / road / biome. Otherwise rivers
+                // visually take precedence over roads (you'd notice a
+                // river crossing a road, not the road under it), and
+                // roads override the biome glyph.
+                if let Some(site) = info.named_site {
+                    if cornwall::chunk_for_anchor(site) == cc {
+                        (
+                            site.kind.overmap_glyph(),
+                            color_from_rgb(site.kind.overmap_fg()),
+                        )
+                    } else {
+                        chunk_glyph_color(cc, &info)
+                    }
+                } else {
+                    chunk_glyph_color(cc, &info)
+                }
+            };
+
+            // Player chunk: flashing `@` on top.
+            let (glyph, fg) = if cc == player_chunk {
+                let bright = (frame_count / 30) % 2 == 0;
+                (
+                    b'@',
+                    if bright {
+                        palette.player_fg
+                    } else {
+                        palette.panel_dim_fg
+                    },
+                )
+            } else {
+                (glyph, fg)
+            };
+
+            // Cursor overlay (replaces glyph entirely so the marker is
+            // unambiguous, but keeps the underlying fg color so the
+            // biome is still hinted).
+            let (glyph, fg) = if cc == mode.cursor && cc != player_chunk {
+                (b'+', palette.panel_title_fg)
+            } else {
+                (glyph, fg)
+            };
+
+            put_cell(
+                cells,
+                vx,
+                vy,
+                Cell {
+                    glyph,
+                    fg,
+                    bg: palette.panel_bg,
+                },
+            );
+        }
+    }
+
+    // Bottom info line: biome name · site name (if any) · travel time.
+    let cursor_info = cornwall::overmap_info_at(mode.cursor);
+    let biome_name = cursor_info.biome.display_name();
+    let site_name = cursor_info.named_site.map(|s| s.name).unwrap_or("");
+    let cheby = (mode.cursor.cx - player_chunk.cx)
+        .unsigned_abs()
+        .max((mode.cursor.cy - player_chunk.cy).unsigned_abs());
+    let est_secs = cheby.saturating_mul(OVERMAP_AVG_CHUNK_SECS);
+    let est_hours = est_secs / 3600;
+    let est_mins = (est_secs % 3600) / 60;
+    let line = if site_name.is_empty() {
+        if cheby == 0 {
+            format!("{} · (here)", biome_name)
+        } else {
+            format!("{} · ~{}h{:02}m", biome_name, est_hours, est_mins)
+        }
+    } else {
+        format!(
+            "{} · {} · ~{}h{:02}m",
+            biome_name, site_name, est_hours, est_mins
+        )
+    };
+    // Pad the info line to full width so terrain bleed is hidden.
+    let info_y = WORLD_H as i32 - 1;
+    for x in 0..WORLD_W as i32 {
+        put_cell(
+            cells,
+            x,
+            info_y,
+            Cell {
+                glyph: b' ',
+                fg: palette.panel_fg,
+                bg: palette.panel_bg,
+            },
+        );
+    }
+    put_text(cells, 1, info_y, &line, palette.panel_fg, palette.panel_bg);
+    // Footer hint along the right.
+    let hint = "A: travel  M/B: close";
+    let hint_x = WORLD_W as i32 - hint.len() as i32 - 1;
+    put_text(
+        cells,
+        hint_x,
+        info_y,
+        hint,
+        palette.panel_dim_fg,
+        palette.panel_bg,
+    );
+}
+
+/// Pick the glyph + color for a non-site chunk on the overmap. Rivers
+/// win over roads (the visual is "river crossing a road"); roads win
+/// over the underlying biome. Road glyph uses CP437 box-drawing
+/// connectors derived from neighboring chunks' `has_road` flags so the
+/// network draws as a continuous line.
+fn chunk_glyph_color(cc: ChunkCoord, info: &cornwall::OvermapInfo) -> (u8, Color) {
+    if info.has_river {
+        let fg = cornwall::Biome::RiverValley.overmap_fg();
+        return (cornwall::Biome::RiverValley.overmap_glyph(), color_from_rgb(fg));
+    }
+    if info.has_road {
+        return (road_connector_glyph(cc), color_from_rgb(ROAD_FG));
+    }
+    (info.biome.overmap_glyph(), color_from_rgb(info.biome.overmap_fg()))
+}
+
+/// Beaten-earth highway tint. Tan-yellow so the road network reads as
+/// distinct from forest greens, moor grays, and water blues.
+const ROAD_FG: [u8; 3] = [200, 175, 110];
+
+/// CP437 box-drawing connector for a road chunk, picked from which of
+/// the 4 cardinal neighbors are also road chunks. Now that `has_road`
+/// uses segment-vs-chunk-bbox intersection (so a diagonal polyline
+/// only flags chunks it actually crosses, not a 2-wide band), the
+/// connector pattern is a clean staircase — `└┐` pairs over diagonal
+/// segments, `─` runs over horizontal, `│` runs over vertical — with
+/// no closed-loop artifacts.
+fn road_connector_glyph(cc: ChunkCoord) -> u8 {
+    let n = cornwall::overmap_info_at(ChunkCoord { cx: cc.cx, cy: cc.cy - 1 }).has_road;
+    let s = cornwall::overmap_info_at(ChunkCoord { cx: cc.cx, cy: cc.cy + 1 }).has_road;
+    let e = cornwall::overmap_info_at(ChunkCoord { cx: cc.cx + 1, cy: cc.cy }).has_road;
+    let w = cornwall::overmap_info_at(ChunkCoord { cx: cc.cx - 1, cy: cc.cy }).has_road;
+    match (n, s, e, w) {
+        (true, true, true, true) => 0xC5,    // ┼
+        (true, true, true, false) => 0xC3,   // ├
+        (true, true, false, true) => 0xB4,   // ┤
+        (true, false, true, true) => 0xC1,   // ┴
+        (false, true, true, true) => 0xC2,   // ┬
+        (true, true, false, false) => 0xB3,  // │
+        (false, false, true, true) => 0xC4,  // ─
+        (true, false, true, false) => 0xC0,  // └
+        (true, false, false, true) => 0xD9,  // ┘
+        (false, true, true, false) => 0xDA,  // ┌
+        (false, true, false, true) => 0xBF,  // ┐
+        // Single-direction stub or isolated cell — generic horizontal.
+        _ => 0xC4,
+    }
+}
+
+fn color_from_rgb(rgb: [u8; 3]) -> Color {
+    Color::RGB(rgb[0], rgb[1], rgb[2])
+}
+
+fn color_dim() -> Color {
+    Color::RGB(80, 75, 65)
+}
+
+/// Top-of-screen banner shown while fast-travel is active. Destination
+/// label = named site if known, else chunk coord. Time remaining =
+/// queue.cells.len() × per-cell game-sec advance.
+fn draw_fast_travel_banner(
+    cells: &mut [Option<Cell>],
+    queue: &crate::fasttravel::FastTravelQueue,
+    palette: &Palette,
+) {
+    let dest_label = cornwall::overmap_info_at(queue.destination)
+        .named_site
+        .map(|s| s.name)
+        .map(String::from)
+        .unwrap_or_else(|| format!("({}, {})", queue.destination.cx, queue.destination.cy));
+    let remaining = queue.remaining_est_secs();
+    let h = remaining / 3600;
+    let m = (remaining % 3600) / 60;
+    let msg = format!(
+        "→ Travelling to {} · ~{}h{:02}m · press anything to stop",
+        dest_label, h, m
+    );
+    // Banner row 0, full-width.
+    for x in 0..WORLD_W as i32 {
+        put_cell(
+            cells,
+            x,
+            0,
+            Cell {
+                glyph: b' ',
+                fg: palette.panel_fg,
+                bg: palette.panel_bg,
+            },
+        );
+    }
+    let max_w = WORLD_W as i32 - 2;
+    let truncated: String = msg.chars().take(max_w as usize).collect();
+    put_text(cells, 1, 0, &truncated, palette.panel_fg, palette.panel_bg);
 }
 
 fn put_cell(cells: &mut [Option<Cell>], x: i32, y: i32, cell: Cell) {

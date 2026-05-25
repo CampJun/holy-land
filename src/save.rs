@@ -133,6 +133,22 @@ pub struct RunSave {
     pub tree_species_mutations: Vec<TreeSpeciesMutationSave>,
     #[serde(default)]
     pub decoration_mutations: Vec<DecorationMutationSave>,
+    /// World seed. Drives per-chunk wilderness contents; the authored
+    /// Cornwall layer (biomes/rivers/roads/sites) is identical in every
+    /// world regardless of seed. Defaults to `DEFAULT_WORLD_SEED` on
+    /// saves written before this field existed so legacy runs reload
+    /// onto the same wilderness layout.
+    #[serde(default = "default_world_seed")]
+    pub seed: u64,
+}
+
+/// Backwards-compat seed value matching `world::DEFAULT_SEED`. Used by
+/// serde's `default` attribute on `RunSave::seed` so saves written
+/// before the seed field existed reload onto the canonical world.
+pub const DEFAULT_WORLD_SEED: u64 = 0xC0FFEE_F00D_u64;
+
+fn default_world_seed() -> u64 {
+    DEFAULT_WORLD_SEED
 }
 
 /// Per-cell tree_species override. `species_key` of empty string means
@@ -260,6 +276,7 @@ impl RunSave {
             calendar_day: calendar::START_DAY,
             tree_species_mutations: Vec::new(),
             decoration_mutations: Vec::new(),
+            seed: DEFAULT_WORLD_SEED,
         }
     }
 }
@@ -538,11 +555,13 @@ mod tests {
             calendar_day: 100,
             tree_species_mutations: Vec::new(),
             decoration_mutations: Vec::new(),
+            seed: 0xABCD_1234_5678_9ABC,
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
         assert_eq!(loaded.player_x, 5);
         assert_eq!(loaded.player_y, 7);
+        assert_eq!(loaded.seed, 0xABCD_1234_5678_9ABC);
         assert_eq!(loaded.pack.capacity_g, 0);
         assert!(loaded.pack.contents.is_empty());
         assert!(loaded.cell_items.is_empty());
@@ -630,6 +649,7 @@ mod tests {
             calendar_day: calendar::START_DAY,
             tree_species_mutations: Vec::new(),
             decoration_mutations: Vec::new(),
+            seed: DEFAULT_WORLD_SEED,
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
@@ -695,6 +715,9 @@ mod tests {
         assert_eq!(loaded.needs.warmth, 0);
         // Schema-v2 calendar_day defaults to START_DAY (21 Mar 1300).
         assert_eq!(loaded.calendar_day, calendar::START_DAY);
+        // Seed defaults to DEFAULT_WORLD_SEED on saves written before
+        // the field existed, so legacy runs reload onto canonical Cornwall.
+        assert_eq!(loaded.seed, DEFAULT_WORLD_SEED);
 
         fs::remove_dir_all(&dir).ok();
     }

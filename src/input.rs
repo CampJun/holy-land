@@ -25,6 +25,9 @@ pub enum Action {
     R2,
     Start,
     Select,
+    /// Toggle the full-screen Cornwall overmap. Bound to `M` on desktop;
+    /// the Miyoo binding lands later as a Select+R chord.
+    OpenOvermap,
 }
 
 const INITIAL_DELAY: Duration = Duration::from_millis(250);
@@ -168,6 +171,7 @@ fn keycode_to_action(kc: Keycode) -> Option<Action> {
         Keycode::V => Action::R2,
         Keycode::Escape => Action::Start,
         Keycode::LShift | Keycode::RShift => Action::Select,
+        Keycode::M => Action::OpenOvermap,
         _ => return None,
     })
 }
