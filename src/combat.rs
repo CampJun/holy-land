@@ -267,49 +267,11 @@ pub fn roll_damage(
     }
 }
 
-/// Stat-block lookup for phase-1 weapons. Phase 3 lifts these onto
-/// `ItemDef`; for now the table sits next to the math that consumes it
-/// so the whole phase-1 combat surface is in one file. `None` means the
-/// item isn't a weapon (you can't bump-attack with a waterskin).
+/// Weapon-profile lookup. As of phase 3 this just defers to the
+/// `ItemDef.weapon` field — kept as a free function so call sites
+/// stay terse.
 pub fn weapon_profile_for(kind: ItemKind) -> Option<WeaponProfile> {
-    Some(match kind {
-        // Player's starting wield. Per the damage-math card's example
-        // dagger: fast, stab-heavy, modest cut.
-        ItemKind::Knife => WeaponProfile {
-            to_hit: 1,
-            damage_die: DamageTriplet { bash: 0, cut: 2, stab: 8 },
-            move_cost: 70,
-        },
-        // Cornish bandit's signature roll. Reach-2 is a phase-5 concern;
-        // phase 1 treats the spear as adjacent-only.
-        ItemKind::Spear => WeaponProfile {
-            to_hit: 1,
-            damage_die: DamageTriplet { bash: 1, cut: 0, stab: 9 },
-            move_cost: 110,
-        },
-        // Felling axe doubles as a passable cleaver. Listed so the
-        // player can wield their starting axe if they prefer.
-        ItemKind::Axe => WeaponProfile {
-            to_hit: 0,
-            damage_die: DamageTriplet { bash: 3, cut: 9, stab: 0 },
-            move_cost: 130,
-        },
-        _ => return None,
-    })
-}
-
-/// Phase-1 stand-in for a real armor-piece resolver. Hardcodes the
-/// bandit's Yeoman padded-doublet profile; the player has no armor in
-/// phase 1 (Rabble tier). Phase 2/3 lift this to per-piece coverage +
-/// DR table on equip slots.
-pub fn unarmored() -> ArmorDr {
-    ArmorDr::default()
-}
-
-pub fn padded_doublet_dr() -> ArmorDr {
-    // Padded blocks bash well, cut middling, stab poorly (the cards'
-    // rock-paper-scissors).
-    ArmorDr { bash: 4, cut: 2, stab: 1 }
+    kind.def().weapon
 }
 
 fn roll_die(max: u16, rng: &mut Rng) -> u16 {

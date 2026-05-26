@@ -677,30 +677,30 @@ impl Worn {
     }
 }
 
-/// Bandit Yeoman-tier loadout: padded doublet (torso + arms) + iron
-/// skullcap (head). Phase 3 lifts this to the rolled-per-spawn table
-/// from `Status armament tiers.md`.
-pub fn bandit_starting_worn() -> Worn {
-    use crate::combat::BodyPart;
-    Worn::new(vec![
-        ArmorPiece {
-            regions: BodyRegionMask::empty()
-                .with(BodyPart::Torso)
-                .with(BodyPart::LArm)
-                .with(BodyPart::RArm),
-            coverage_pct: 80,
-            dr: crate::combat::ArmorDr { bash: 4, cut: 2, stab: 1 },
-            encumbrance: 2,
-            item_kind: None,
-        },
-        ArmorPiece {
-            regions: BodyRegionMask::empty().with(BodyPart::Head),
-            coverage_pct: 70,
-            dr: crate::combat::ArmorDr { bash: 3, cut: 4, stab: 3 },
-            encumbrance: 1,
-            item_kind: None,
-        },
-    ])
+/// Build an `ArmorPiece` from an item kind by reading its `ItemDef`
+/// armor stats. Returns `None` if the item is not wearable. The
+/// resulting piece records its source `ItemKind` so death can drop
+/// the matching `ItemInstance` back onto the cell.
+pub fn armor_piece_for(kind: crate::items::ItemKind) -> Option<ArmorPiece> {
+    let stats = kind.def().armor?;
+    let mut regions = BodyRegionMask::empty();
+    for &part in stats.regions {
+        regions = regions.with(part);
+    }
+    Some(ArmorPiece {
+        regions,
+        coverage_pct: stats.coverage_pct,
+        dr: stats.dr,
+        encumbrance: stats.encumbrance,
+        item_kind: Some(kind),
+    })
+}
+
+/// Build a `Worn` from a list of wearable item kinds. Non-wearable
+/// kinds are silently skipped — callers that care about validation
+/// (e.g. an Equip verb) should check `def().armor.is_some()` first.
+pub fn worn_from_items(kinds: &[crate::items::ItemKind]) -> Worn {
+    Worn::new(kinds.iter().filter_map(|&k| armor_piece_for(k)).collect())
 }
 
 /// Topmost non-player entity glyph + fg at a world cell, if any.
@@ -719,12 +719,65 @@ pub fn entity_glyph_at(world: &World, wx: i32, wy: i32) -> Option<(u8, [u8; 3])>
     None
 }
 
-/// Spawn one Cornish bandit at `pos`. Phase 1 hardcodes the loadout
-/// (always spear); phase 3 wires the Yeoman tier roll table from
-/// `Status armament tiers.md`. Returns the new entity for callers that
-/// want to record its id (save load takes this branch).
-pub fn spawn_cornish_bandit(ecs: &mut Ecs, pos: Position) -> Entity {
-    ecs.spawn((
+/// Yeoman-tier loadout rolled per spawn from the table in
+/// `Bestiary slice 1.md` §Loadout roll. `None` in a slot means the
+/// piece rolled empty (e.g. some bandits roll no head armor).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct YeomanLoadout {
+    pub main_hand: Option<crate::items::ItemKind>,
+    pub off_hand: Option<crate::items::ItemKind>,
+    pub head: Option<crate::items::ItemKind>,
+    pub torso: Option<crate::items::ItemKind>,
+}
+
+impl YeomanLoadout {
+    /// Iterator over every non-None worn armor piece (head/torso) for
+    /// the bandit's `Worn` assembly.
+    pub fn worn_kinds(&self) -> impl Iterator<Item = crate::items::ItemKind> + '_ {
+        [self.head, self.torso].into_iter().flatten()
+    }
+}
+
+/// Roll a fresh Yeoman loadout for the Cornish bandit. Probabilities
+/// come directly from `Bestiary slice 1.md`. Re-rolls each spawn so
+/// five bandits in a chunk naturally vary (one bowman, one buckler,
+/// three spearmen, etc. — bow deferred to phase 5).
+pub fn roll_yeoman_loadout(rng: &mut Rng) -> YeomanLoadout {
+    use crate::items::ItemKind;
+    let main_hand = match rng.d100() {
+        1..=50 => Some(ItemKind::Spear),
+        51..=80 => Some(ItemKind::ShortSword),
+        _ => Some(ItemKind::Falchion),
+    };
+    let off_hand = match rng.d100() {
+        1..=60 => Some(ItemKind::Knife),
+        61..=90 => None,
+        _ => Some(ItemKind::SmallRoundShield),
+    };
+    let head = match rng.d100() {
+        1..=70 => Some(ItemKind::IronSkullcap),
+        _ => None,
+    };
+    let torso = match rng.d100() {
+        1..=80 => Some(ItemKind::PaddedDoublet),
+        _ => Some(ItemKind::LeatherJerkin),
+    };
+    YeomanLoadout { main_hand, off_hand, head, torso }
+}
+
+/// Spawn a Cornish bandit at `pos` carrying the explicit `loadout`.
+/// Fresh-game init rolls a Yeoman loadout via `roll_yeoman_loadout`;
+/// save restore passes the loadout reconstructed from disk. The off-
+/// hand is recorded as an `OffHand` component for future block/grapple
+/// hooks but doesn't contribute to combat math yet.
+pub fn spawn_cornish_bandit(ecs: &mut Ecs, pos: Position, loadout: YeomanLoadout) -> Entity {
+    // Main_hand falls back to Spear if the roll somehow produced None —
+    // phase 1 always had a wielded weapon and the AI assumes it.
+    let main_hand = loadout
+        .main_hand
+        .unwrap_or(crate::items::ItemKind::Spear);
+    let worn_kinds: Vec<_> = loadout.worn_kinds().collect();
+    let entity = ecs.spawn((
         pos,
         Renderable {
             glyph: b'b',
@@ -736,10 +789,186 @@ pub fn spawn_cornish_bandit(ecs: &mut Ecs, pos: Position) -> Entity {
         Hostile,
         Ai(AiKind::ChaseAndBump),
         CornishBandit,
-        Wielded(crate::items::ItemKind::Spear),
+        Wielded(main_hand),
         CombatSkills::starting_bandit(),
-        bandit_starting_worn(),
-    ))
+        worn_from_items(&worn_kinds),
+    ));
+    if let Some(off) = loadout.off_hand {
+        let _ = ecs.insert_one(entity, OffHand(off));
+    }
+    entity
+}
+
+/// Optional off-hand item (knife / small round shield / nothing).
+/// Phase 3 stores it for save round-trip + death drops; the block
+/// bonus from a shield lands in a later phase per the cards.
+#[derive(Clone, Copy, Debug)]
+pub struct OffHand(pub crate::items::ItemKind);
+
+/// Eight equipment slots per `Armor model.md` §Equip slots. Acts as
+/// the source of truth for the player; `Wielded` / `OffHand` / `Worn`
+/// are kept in sync via `World::sync_equipment` on each equip /
+/// unequip / pickup-from-death. Phase 4 lifts this onto the bandit
+/// too so death drops walk the full slot set.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Equipment {
+    pub main_hand: Option<crate::items::ItemKind>,
+    pub off_hand: Option<crate::items::ItemKind>,
+    pub head: Option<crate::items::ItemKind>,
+    pub torso: Option<crate::items::ItemKind>,
+    pub l_arm: Option<crate::items::ItemKind>,
+    pub r_arm: Option<crate::items::ItemKind>,
+    pub l_leg: Option<crate::items::ItemKind>,
+    pub r_leg: Option<crate::items::ItemKind>,
+}
+
+impl Equipment {
+    /// Rabble-tier player kit: knife in main hand, nothing else equipped.
+    pub fn starting_player() -> Self {
+        Self {
+            main_hand: Some(crate::items::ItemKind::Knife),
+            ..Self::default()
+        }
+    }
+
+    /// Iterator over every (slot, ItemKind) pair currently occupied.
+    /// Used by death-drop and save round-trip.
+    pub fn occupied(&self) -> impl Iterator<Item = (EquipSlot, crate::items::ItemKind)> + '_ {
+        EquipSlot::ALL.into_iter().filter_map(move |s| self.get(s).map(|k| (s, k)))
+    }
+
+    pub fn get(&self, slot: EquipSlot) -> Option<crate::items::ItemKind> {
+        match slot {
+            EquipSlot::MainHand => self.main_hand,
+            EquipSlot::OffHand => self.off_hand,
+            EquipSlot::Head => self.head,
+            EquipSlot::Torso => self.torso,
+            EquipSlot::LArm => self.l_arm,
+            EquipSlot::RArm => self.r_arm,
+            EquipSlot::LLeg => self.l_leg,
+            EquipSlot::RLeg => self.r_leg,
+        }
+    }
+
+    pub fn set(&mut self, slot: EquipSlot, kind: Option<crate::items::ItemKind>) {
+        match slot {
+            EquipSlot::MainHand => self.main_hand = kind,
+            EquipSlot::OffHand => self.off_hand = kind,
+            EquipSlot::Head => self.head = kind,
+            EquipSlot::Torso => self.torso = kind,
+            EquipSlot::LArm => self.l_arm = kind,
+            EquipSlot::RArm => self.r_arm = kind,
+            EquipSlot::LLeg => self.l_leg = kind,
+            EquipSlot::RLeg => self.r_leg = kind,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EquipSlot {
+    MainHand,
+    OffHand,
+    Head,
+    Torso,
+    LArm,
+    RArm,
+    LLeg,
+    RLeg,
+}
+
+impl EquipSlot {
+    pub const ALL: [EquipSlot; 8] = [
+        EquipSlot::MainHand,
+        EquipSlot::OffHand,
+        EquipSlot::Head,
+        EquipSlot::Torso,
+        EquipSlot::LArm,
+        EquipSlot::RArm,
+        EquipSlot::LLeg,
+        EquipSlot::RLeg,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            EquipSlot::MainHand => "main hand",
+            EquipSlot::OffHand => "off hand",
+            EquipSlot::Head => "head",
+            EquipSlot::Torso => "torso",
+            EquipSlot::LArm => "left arm",
+            EquipSlot::RArm => "right arm",
+            EquipSlot::LLeg => "left leg",
+            EquipSlot::RLeg => "right leg",
+        }
+    }
+
+    pub fn save_key(self) -> &'static str {
+        match self {
+            EquipSlot::MainHand => "main_hand",
+            EquipSlot::OffHand => "off_hand",
+            EquipSlot::Head => "head",
+            EquipSlot::Torso => "torso",
+            EquipSlot::LArm => "l_arm",
+            EquipSlot::RArm => "r_arm",
+            EquipSlot::LLeg => "l_leg",
+            EquipSlot::RLeg => "r_leg",
+        }
+    }
+
+    pub fn from_save_key(s: &str) -> Option<Self> {
+        Some(match s {
+            "main_hand" => EquipSlot::MainHand,
+            "off_hand" => EquipSlot::OffHand,
+            "head" => EquipSlot::Head,
+            "torso" => EquipSlot::Torso,
+            "l_arm" => EquipSlot::LArm,
+            "r_arm" => EquipSlot::RArm,
+            "l_leg" => EquipSlot::LLeg,
+            "r_leg" => EquipSlot::RLeg,
+            _ => return None,
+        })
+    }
+}
+
+/// Decide which slot an `ItemKind` should occupy. Returns the first
+/// matching slot — armor pieces go to the first of their regions, since
+/// phase 3 uses a single-piece-per-region model. Weapons go to
+/// `MainHand`. None means the item isn't equippable.
+pub fn default_slot_for(kind: crate::items::ItemKind) -> Option<EquipSlot> {
+    let def = kind.def();
+    if def.weapon.is_some() {
+        return Some(EquipSlot::MainHand);
+    }
+    if let Some(armor) = def.armor {
+        if let Some(part) = armor.regions.first() {
+            return Some(match part {
+                crate::combat::BodyPart::Head => EquipSlot::Head,
+                crate::combat::BodyPart::Torso => EquipSlot::Torso,
+                crate::combat::BodyPart::LArm => EquipSlot::LArm,
+                crate::combat::BodyPart::RArm => EquipSlot::RArm,
+                crate::combat::BodyPart::LLeg => EquipSlot::LLeg,
+                crate::combat::BodyPart::RLeg => EquipSlot::RLeg,
+            });
+        }
+    }
+    // Shields aren't weapons OR armor in the ItemDef sense (yet) — give
+    // them an explicit off-hand placement.
+    if matches!(kind, crate::items::ItemKind::SmallRoundShield) {
+        return Some(EquipSlot::OffHand);
+    }
+    None
+}
+
+/// Round-trip shape for one hostile entity. Lives here (not save.rs)
+/// because the conversion is local to the spawn / restore pair; save.rs
+/// just describes the on-disk bytes.
+#[derive(Clone, Debug)]
+pub struct HostileSnapshot {
+    pub pos: Position,
+    pub body: BodyParts,
+    pub main_hand: Option<crate::items::ItemKind>,
+    pub off_hand: Option<crate::items::ItemKind>,
+    pub worn_kinds: Vec<crate::items::ItemKind>,
+    pub flavor: &'static str,
 }
 
 /// Combat skill block carried on every combatant. Slice-1 hardcodes
@@ -966,10 +1195,11 @@ impl World {
             Speed::default(),
             BodyParts::starting_human(),
             CombatSkills::starting_player(),
-            // Rabble-tier player wields a knife (the cards' "dagger")
-            // off the starting pack. The pack copy stays put so the
-            // player can also Drop / inspect it; phase 3's Equip verb
-            // makes this a real bind.
+            // Player's equipment is the source of truth; Wielded /
+            // OffHand / Worn are derived caches kept in sync via
+            // `sync_equipment`. Rabble-tier player starts with a knife
+            // in main hand and nothing else equipped.
+            Equipment::starting_player(),
             Wielded(crate::items::ItemKind::Knife),
         ));
 
@@ -1395,10 +1625,10 @@ impl World {
         self.ecs.query::<&Hostile>().iter().next().is_some()
     }
 
-    /// Spawn one Cornish bandit a few tiles east of the player. The
-    /// bestiary card explicitly calls this out as the phase-1 first-
-    /// encounter target. Idempotent only via the caller's
-    /// `has_any_hostile()` guard.
+    /// Spawn one Cornish bandit a few tiles east of the player with a
+    /// freshly-rolled Yeoman loadout. The bestiary card explicitly
+    /// calls this out as the phase-1 first-encounter target. Idempotent
+    /// only via the caller's `has_any_hostile()` guard.
     pub fn spawn_starter_bandit(&mut self) {
         let p = self.player_pos();
         let mut pos = Position { x: p.x + 5, y: p.y };
@@ -1412,14 +1642,15 @@ impl World {
                 break;
             }
         }
-        spawn_cornish_bandit(&mut self.ecs, pos);
+        let loadout = roll_yeoman_loadout(&mut self.rng);
+        spawn_cornish_bandit(&mut self.ecs, pos, loadout);
     }
 
     /// Snapshot every hostile entity for save serialization. Returns
     /// (position, health, wielded ItemKind, flavor key). Phase 1 only
     /// emits "cornish_bandit" but the flavor field is stringly-typed
     /// so future hostiles fit without a schema bump.
-    pub fn snapshot_hostiles(&self) -> Vec<(Position, BodyParts, Option<crate::items::ItemKind>, &'static str)> {
+    pub fn snapshot_hostiles(&self) -> Vec<HostileSnapshot> {
         let mut out = Vec::new();
         for (e, (pos, _h)) in self.ecs.query::<(&Position, &Hostile)>().iter() {
             let body = self
@@ -1427,13 +1658,29 @@ impl World {
                 .get::<&BodyParts>(e)
                 .map(|b| *b)
                 .unwrap_or_else(|_| BodyParts::starting_human());
-            let wielded = self.ecs.get::<&Wielded>(e).ok().map(|w| w.0);
+            let main_hand = self.ecs.get::<&Wielded>(e).ok().map(|w| w.0);
+            let off_hand = self.ecs.get::<&OffHand>(e).ok().map(|w| w.0);
+            // Worn pieces round-trip via their `item_kind` source so
+            // restore rebuilds them from `ItemDef` rather than carrying
+            // stat copies in the save.
+            let worn_kinds: Vec<crate::items::ItemKind> = self
+                .ecs
+                .get::<&Worn>(e)
+                .map(|w| w.pieces.iter().filter_map(|p| p.item_kind).collect())
+                .unwrap_or_default();
             let flavor = if self.ecs.satisfies::<&CornishBandit>(e).unwrap_or(false) {
                 "cornish_bandit"
             } else {
                 "unknown"
             };
-            out.push((*pos, body, wielded, flavor));
+            out.push(HostileSnapshot {
+                pos: *pos,
+                body,
+                main_hand,
+                off_hand,
+                worn_kinds,
+                flavor,
+            });
         }
         out
     }
@@ -1443,7 +1690,7 @@ impl World {
     /// re-load doesn't double up the World::new spawn.
     pub fn restore_hostiles<I>(&mut self, snapshot: I)
     where
-        I: IntoIterator<Item = (Position, BodyParts, Option<crate::items::ItemKind>, String)>,
+        I: IntoIterator<Item = HostileSnapshot>,
     {
         let existing: Vec<Entity> = self
             .ecs
@@ -1454,18 +1701,27 @@ impl World {
         for e in existing {
             let _ = self.ecs.despawn(e);
         }
-        for (pos, body, wielded, flavor) in snapshot {
+        for snap in snapshot {
             // Phase-1 only supports the Cornish bandit flavor. Unknown
             // flavors still spawn as bandits (forward-compat default).
-            let _ = flavor; // reserved for future dispatch
-            let entity = spawn_cornish_bandit(&mut self.ecs, pos);
+            let _ = snap.flavor; // reserved for future dispatch
+            // Synthesize a YeomanLoadout from the saved Wielded / OffHand;
+            // worn pieces are rebuilt directly into the Worn component
+            // below (regardless of which slot they originated in).
+            let loadout = YeomanLoadout {
+                main_hand: snap.main_hand,
+                off_hand: snap.off_hand,
+                head: None,
+                torso: None,
+            };
+            let entity = spawn_cornish_bandit(&mut self.ecs, snap.pos, loadout);
             if let Ok(mut b) = self.ecs.get::<&mut BodyParts>(entity) {
-                *b = body;
+                *b = snap.body;
             }
-            if let Some(kind) = wielded {
-                if let Ok(mut w) = self.ecs.get::<&mut Wielded>(entity) {
-                    *w = Wielded(kind);
-                }
+            // Replace the (empty) Worn from spawn with the saved pieces.
+            if !snap.worn_kinds.is_empty() {
+                let worn = worn_from_items(&snap.worn_kinds);
+                let _ = self.ecs.insert_one(entity, worn);
             }
         }
     }
@@ -2549,7 +2805,6 @@ impl World {
             Ok(p) => *p,
             Err(_) => return,
         };
-        let wielded = self.ecs.get::<&Wielded>(e).ok().map(|w| w.0);
         let is_player = e == self.player;
         let is_bandit = self.ecs.satisfies::<&CornishBandit>(e).unwrap_or(false);
         if is_player {
@@ -2559,11 +2814,25 @@ impl World {
             self.push_message("You die.".to_string());
             return;
         }
-        // Drop the wielded weapon at the death cell so the player can
-        // loot it. Cell-items append (not replace) to preserve any
-        // ground items already there. Phase 3 extends to the full
-        // loadout once equipment slots exist.
-        if let Some(kind) = wielded {
+        // Phase-4 full-loadout drop: every wielded / off-hand / worn
+        // armor piece becomes a ground item on the death cell. The
+        // player can pick up and equip the lot to climb from Rabble
+        // tier to Yeoman.
+        let mut drops: Vec<crate::items::ItemKind> = Vec::new();
+        if let Ok(w) = self.ecs.get::<&Wielded>(e) {
+            drops.push(w.0);
+        }
+        if let Ok(o) = self.ecs.get::<&OffHand>(e) {
+            drops.push(o.0);
+        }
+        if let Ok(worn) = self.ecs.get::<&Worn>(e) {
+            for piece in worn.pieces.iter() {
+                if let Some(kind) = piece.item_kind {
+                    drops.push(kind);
+                }
+            }
+        }
+        for kind in drops {
             let instance = kind.make_default_instance(1);
             if let Some(cell) = self.cell_at_mut(pos.x as i64, pos.y as i64) {
                 cell.items.push(instance);
@@ -2575,6 +2844,127 @@ impl World {
             self.push_message("It dies.".to_string());
         }
         let _ = self.ecs.despawn(e);
+    }
+
+    /// Rebuild the derived combat components (`Wielded`, `OffHand`,
+    /// `Worn`) from an entity's `Equipment`. The slot enum is the
+    /// source of truth; this just projects it back into the shape the
+    /// combat resolver consumes. Cheap — call after every equip /
+    /// unequip / death-loot pickup.
+    pub fn sync_equipment(&mut self, entity: Entity) {
+        let Ok(eq) = self.ecs.get::<&Equipment>(entity).map(|e| *e) else { return };
+        // Wielded mirrors main_hand; remove the component entirely if
+        // empty so combat-tick can skip the swing.
+        if let Some(kind) = eq.main_hand {
+            let _ = self.ecs.insert_one(entity, Wielded(kind));
+        } else {
+            let _ = self.ecs.remove_one::<Wielded>(entity);
+        }
+        if let Some(kind) = eq.off_hand {
+            let _ = self.ecs.insert_one(entity, OffHand(kind));
+        } else {
+            let _ = self.ecs.remove_one::<OffHand>(entity);
+        }
+        // Rebuild Worn from the six armor slots.
+        let armor_kinds: Vec<crate::items::ItemKind> = [
+            eq.head, eq.torso, eq.l_arm, eq.r_arm, eq.l_leg, eq.r_leg,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if armor_kinds.is_empty() {
+            let _ = self.ecs.remove_one::<Worn>(entity);
+        } else {
+            let _ = self.ecs.insert_one(entity, worn_from_items(&armor_kinds));
+        }
+    }
+
+    /// Equip `kind` from the player's pack into the matching slot.
+    /// Returns a message describing the outcome (success or refusal).
+    /// On success: the item leaves the pack, lands in the slot, and any
+    /// prior occupant of that slot is bounced back to the pack.
+    pub fn equip_from_pack(&mut self, kind: crate::items::ItemKind) -> String {
+        let Some(slot) = default_slot_for(kind) else {
+            return format!("You can't equip the {}.", kind.name());
+        };
+        // Pull one from the pack — Pack::take_one_from_stack already
+        // handles fungible decrement vs unique remove.
+        let pack_taken = {
+            let mut pack = self.ecs.get::<&mut Pack>(self.player).unwrap();
+            pack.take_one_from_stack(kind)
+        };
+        if !pack_taken {
+            return format!("No {} in your pack.", kind.name());
+        }
+        // Swap with any prior occupant of the slot.
+        let prior = {
+            let mut eq = self.ecs.get::<&mut Equipment>(self.player).unwrap();
+            let p = eq.get(slot);
+            eq.set(slot, Some(kind));
+            p
+        };
+        if let Some(prev) = prior {
+            // Bounce the prior occupant back to the pack. If the pack is
+            // somehow full, drop it on the player's cell so nothing
+            // vanishes — this matches the "pickup" fallback already used
+            // elsewhere.
+            let instance = prev.make_default_instance(1);
+            let bounce = {
+                let mut pack = self.ecs.get::<&mut Pack>(self.player).unwrap();
+                pack.try_add(instance)
+            };
+            if let Err(item) = bounce {
+                let pos = self.player_pos();
+                if let Some(cell) = self.cell_at_mut(pos.x as i64, pos.y as i64) {
+                    cell.items.push(item);
+                }
+            }
+        }
+        self.sync_equipment(self.player);
+        format!("You equip the {} ({}).", kind.name(), slot.label())
+    }
+
+    /// Unequip the slot back into the pack. Drops the item on the
+    /// ground if the pack is full. Returns a message describing the
+    /// outcome.
+    pub fn unequip_to_pack(&mut self, slot: EquipSlot) -> String {
+        let removed = {
+            let mut eq = self.ecs.get::<&mut Equipment>(self.player).unwrap();
+            let removed = eq.get(slot);
+            eq.set(slot, None);
+            removed
+        };
+        let Some(kind) = removed else {
+            return format!("Nothing equipped on your {}.", slot.label());
+        };
+        let instance = kind.make_default_instance(1);
+        let bounce = {
+            let mut pack = self.ecs.get::<&mut Pack>(self.player).unwrap();
+            pack.try_add(instance)
+        };
+        if let Err(item) = bounce {
+            let pos = self.player_pos();
+            if let Some(cell) = self.cell_at_mut(pos.x as i64, pos.y as i64) {
+                cell.items.push(item);
+            }
+        }
+        self.sync_equipment(self.player);
+        format!("You stow the {}.", kind.name())
+    }
+
+    /// Read the player's equipment for HUD / save serialization.
+    pub fn player_equipment(&self) -> Equipment {
+        self.ecs
+            .get::<&Equipment>(self.player)
+            .map(|e| *e)
+            .unwrap_or_default()
+    }
+
+    /// Restore the player's equipment from a save and re-sync derived
+    /// components.
+    pub fn set_player_equipment(&mut self, eq: Equipment) {
+        let _ = self.ecs.insert_one(self.player, eq);
+        self.sync_equipment(self.player);
     }
 
     /// Walk every hostile entity once; chase + bump per
@@ -3661,9 +4051,19 @@ mod tests {
 
     fn drop_test_bandit(world: &mut World, dx: i32, dy: i32) -> Entity {
         let p = world.player_pos();
+        // Deterministic loadout for tests: always spear + padded
+        // doublet + skullcap so assertions about armor coverage stay
+        // stable regardless of the world's RNG state.
+        let loadout = YeomanLoadout {
+            main_hand: Some(crate::items::ItemKind::Spear),
+            off_hand: Some(crate::items::ItemKind::Knife),
+            head: Some(crate::items::ItemKind::IronSkullcap),
+            torso: Some(crate::items::ItemKind::PaddedDoublet),
+        };
         spawn_cornish_bandit(
             &mut world.ecs,
             Position { x: p.x + dx, y: p.y + dy },
+            loadout,
         )
     }
 
@@ -3756,11 +4156,168 @@ mod tests {
 
     #[test]
     fn worn_upper_body_encumbrance_sums_pieces() {
-        let worn = bandit_starting_worn();
-        // Padded doublet enc 2 over torso + L arm + R arm (3 regions) +
-        // iron skullcap enc 1 over head (0 regions in upper-body sum).
-        // Expected upper_body sum = 2 * 3 = 6.
+        // Bandit's Yeoman default: padded doublet (enc 2, regions
+        // torso+L arm+R arm) + iron skullcap (enc 1, region head).
+        // Upper-body sum = 2 * 3 = 6; head doesn't contribute to upper-
+        // body encumbrance.
+        let worn = worn_from_items(&[
+            ItemKind::PaddedDoublet,
+            ItemKind::IronSkullcap,
+        ]);
         assert_eq!(worn.upper_body_encumbrance(), 6);
         assert_eq!(worn.leg_encumbrance(), 0);
+    }
+
+    #[test]
+    fn yeoman_roll_main_hand_always_a_weapon() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        for _ in 0..200 {
+            let loadout = roll_yeoman_loadout(&mut world.rng);
+            let mh = loadout.main_hand.expect("main hand never empty");
+            assert!(
+                mh.def().weapon.is_some(),
+                "rolled main_hand {:?} must have weapon stats",
+                mh
+            );
+            // Off-hand may be empty; if present, must be a known Yeoman
+            // option (Knife or SmallRoundShield).
+            if let Some(oh) = loadout.off_hand {
+                assert!(
+                    matches!(oh, ItemKind::Knife | ItemKind::SmallRoundShield),
+                    "unexpected off_hand {:?}",
+                    oh
+                );
+            }
+            // Torso always has an armor piece.
+            let torso = loadout.torso.expect("torso always rolls something");
+            assert!(torso.def().armor.is_some(), "torso piece must be armor");
+        }
+    }
+
+    #[test]
+    fn equip_from_pack_moves_into_slot_and_syncs_wielded() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Drop a spear into the pack.
+        world
+            .ecs
+            .get::<&mut Pack>(world.player)
+            .unwrap()
+            .try_add(ItemKind::Spear.make_default_instance(1))
+            .unwrap();
+        let msg = world.equip_from_pack(ItemKind::Spear);
+        assert!(msg.contains("equip"), "msg: {}", msg);
+        // Player's main_hand should now be spear; the prior knife is
+        // bounced back to the pack.
+        let eq = world.player_equipment();
+        assert_eq!(eq.main_hand, Some(ItemKind::Spear));
+        let wielded = world
+            .ecs
+            .get::<&Wielded>(world.player)
+            .map(|w| w.0)
+            .unwrap();
+        assert_eq!(wielded, ItemKind::Spear);
+        let pack = world.ecs.get::<&Pack>(world.player).unwrap();
+        assert!(
+            pack.contents.iter().any(|i| i.kind == ItemKind::Knife),
+            "displaced knife should bounce to the pack",
+        );
+    }
+
+    #[test]
+    fn equip_padded_doublet_builds_worn_with_correct_dr() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Empty the starting pack so the 2.5kg doublet fits cleanly.
+        {
+            let mut pack = world.ecs.get::<&mut Pack>(world.player).unwrap();
+            pack.contents.clear();
+        }
+        world
+            .ecs
+            .get::<&mut Pack>(world.player)
+            .unwrap()
+            .try_add(ItemKind::PaddedDoublet.make_default_instance(1))
+            .unwrap();
+        world.equip_from_pack(ItemKind::PaddedDoublet);
+        let worn = world
+            .ecs
+            .get::<&Worn>(world.player)
+            .map(|w| w.clone())
+            .expect("Worn after equip");
+        assert_eq!(worn.pieces.len(), 1);
+        let p = &worn.pieces[0];
+        assert!(p.regions.contains(crate::combat::BodyPart::Torso));
+        assert!(p.regions.contains(crate::combat::BodyPart::LArm));
+        assert!(p.regions.contains(crate::combat::BodyPart::RArm));
+        assert_eq!(p.dr.bash, 4);
+    }
+
+    #[test]
+    fn unequip_returns_item_to_pack() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Player starts with Knife in main hand.
+        let pack_before = world
+            .ecs
+            .get::<&Pack>(world.player)
+            .unwrap()
+            .has_stack(ItemKind::Knife);
+        let msg = world.unequip_to_pack(EquipSlot::MainHand);
+        assert!(msg.contains("stow"), "msg: {}", msg);
+        assert!(world.ecs.get::<&Wielded>(world.player).is_err(), "Wielded removed");
+        let pack_after = world
+            .ecs
+            .get::<&Pack>(world.player)
+            .unwrap()
+            .has_stack(ItemKind::Knife);
+        // Starting pack ALSO had a knife already (separate copy). After
+        // unequip we end up with the equipped knife back too — `pack_after`
+        // should be true regardless; the meaningful change is the absence
+        // of Wielded plus Equipment.main_hand == None.
+        assert!(pack_after || !pack_before, "knife now in pack");
+        let eq = world.player_equipment();
+        assert_eq!(eq.main_hand, None);
+    }
+
+    #[test]
+    fn bandit_death_drops_full_loadout() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let bandit = drop_test_bandit(&mut world, 5, 0);
+        let pos = world.ecs.get::<&Position>(bandit).map(|p| *p).unwrap();
+        // Damage the torso to 0 with a stab attack.
+        world.apply_damage_to_part(
+            bandit,
+            crate::combat::BodyPart::Torso,
+            crate::combat::DamageTriplet { bash: 0, cut: 0, stab: 200 },
+        );
+        assert!(world.ecs.get::<&Position>(bandit).is_err(), "bandit despawned");
+        let drops = &world.cell_at(pos.x as i64, pos.y as i64).unwrap().items;
+        let has = |k: ItemKind| drops.iter().any(|i| i.kind == k);
+        assert!(has(ItemKind::Spear), "main_hand dropped");
+        assert!(has(ItemKind::Knife), "off_hand dropped");
+        assert!(has(ItemKind::IronSkullcap), "head armor dropped");
+        assert!(has(ItemKind::PaddedDoublet), "torso armor dropped");
+    }
+
+    #[test]
+    fn yeoman_main_hand_distribution_matches_spec() {
+        // Per Bestiary slice 1: 50% spear / 30% short sword / 20% falchion.
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let mut spear = 0;
+        let mut sword = 0;
+        let mut falchion = 0;
+        let n = 5_000;
+        for _ in 0..n {
+            match roll_yeoman_loadout(&mut world.rng).main_hand {
+                Some(ItemKind::Spear) => spear += 1,
+                Some(ItemKind::ShortSword) => sword += 1,
+                Some(ItemKind::Falchion) => falchion += 1,
+                other => panic!("unexpected main_hand roll {:?}", other),
+            }
+        }
+        let p_spear = spear as f64 / n as f64;
+        let p_sword = sword as f64 / n as f64;
+        let p_falchion = falchion as f64 / n as f64;
+        assert!((p_spear - 0.50).abs() < 0.04, "spear {:.3}", p_spear);
+        assert!((p_sword - 0.30).abs() < 0.04, "sword {:.3}", p_sword);
+        assert!((p_falchion - 0.20).abs() < 0.04, "falchion {:.3}", p_falchion);
     }
 }

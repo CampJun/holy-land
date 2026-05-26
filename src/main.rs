@@ -422,28 +422,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(bp) = run.player_body_parts.as_ref() {
             world.set_player_body(save_bp_to_world(bp));
         }
+        if let Some(eq) = run.player_equipment.as_ref() {
+            world.set_player_equipment(save_equipment_to_world(eq));
+        }
         if !run.hostiles.is_empty() {
-            let restored: Vec<(world::Position, world::BodyParts, Option<items::ItemKind>, String)> =
-                run.hostiles
-                    .iter()
-                    .map(|h| {
-                        let wielded = if h.wielded_kind.is_empty() {
-                            None
-                        } else {
-                            items::ItemKind::from_save_key(&h.wielded_kind)
-                        };
-                        let body = match h.body_parts.as_ref() {
-                            Some(bp) => save_bp_to_world(bp),
-                            None => world::BodyParts::starting_human(),
-                        };
-                        (
-                            world::Position { x: h.x, y: h.y },
-                            body,
-                            wielded,
-                            h.flavor.clone(),
-                        )
-                    })
-                    .collect();
+            // Cornish-bandit literal is the only flavor we restore as
+            // of phase 3. Unknown flavors fall through the default in
+            // `restore_hostiles`.
+            let static_flavor = |s: &str| -> &'static str {
+                match s {
+                    "cornish_bandit" => "cornish_bandit",
+                    _ => "unknown",
+                }
+            };
+            let restored: Vec<world::HostileSnapshot> = run
+                .hostiles
+                .iter()
+                .map(|h| {
+                    let main_hand = if h.wielded_kind.is_empty() {
+                        None
+                    } else {
+                        items::ItemKind::from_save_key(&h.wielded_kind)
+                    };
+                    let off_hand = if h.off_hand_kind.is_empty() {
+                        None
+                    } else {
+                        items::ItemKind::from_save_key(&h.off_hand_kind)
+                    };
+                    let worn_kinds: Vec<items::ItemKind> = h
+                        .worn_kinds
+                        .iter()
+                        .filter_map(|s| items::ItemKind::from_save_key(s))
+                        .collect();
+                    let body = match h.body_parts.as_ref() {
+                        Some(bp) => save_bp_to_world(bp),
+                        None => world::BodyParts::starting_human(),
+                    };
+                    world::HostileSnapshot {
+                        pos: world::Position { x: h.x, y: h.y },
+                        body,
+                        main_hand,
+                        off_hand,
+                        worn_kinds,
+                        flavor: static_flavor(&h.flavor),
+                    }
+                })
+                .collect();
             world.restore_hostiles(restored);
         }
         // Phase-11b: restore terrain mutations (chopped trees, etc.)
@@ -863,26 +887,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     Action::A => {
-                        // Only the Crafting tab consumes A (queues a
-                        // recipe); Inventory and Skills are read-only.
-                        if state.tab == InfoTab::Crafting {
-                            if let Some(recipe) = crafting::RECIPES.get(state.selected) {
-                                match action::evaluate(&world, recipe.action) {
-                                    action::Availability::Available { .. } => {
-                                        let action::ExecuteOutcome::Done(msg) =
-                                            action::execute(&mut world, recipe.action);
-                                        log_info!("[craft] {}", msg);
-                                        info_menu = None;
-                                    }
-                                    action::Availability::Unavailable { reason } => {
-                                        log_info!(
-                                            "[craft] can't '{}': {}",
-                                            recipe.name,
-                                            reason
-                                        );
+                        match state.tab {
+                            InfoTab::Crafting => {
+                                if let Some(recipe) = crafting::RECIPES.get(state.selected) {
+                                    match action::evaluate(&world, recipe.action) {
+                                        action::Availability::Available { .. } => {
+                                            let action::ExecuteOutcome::Done(msg) =
+                                                action::execute(&mut world, recipe.action);
+                                            log_info!("[craft] {}", msg);
+                                            info_menu = None;
+                                        }
+                                        action::Availability::Unavailable { reason } => {
+                                            log_info!(
+                                                "[craft] can't '{}': {}",
+                                                recipe.name,
+                                                reason
+                                            );
+                                        }
                                     }
                                 }
                             }
+                            InfoTab::Inventory => {
+                                // Equip / unequip toggles per the row
+                                // category. The world helpers handle
+                                // pack ↔ slot bouncing and the derived
+                                // Wielded / Worn / OffHand sync.
+                                match inventory_row_at(&world, state.selected) {
+                                    Some(InventoryRow::EquipSlot(slot)) => {
+                                        let msg = world.unequip_to_pack(slot);
+                                        world.push_message(msg);
+                                    }
+                                    Some(InventoryRow::PackItem(kind)) => {
+                                        let msg = world.equip_from_pack(kind);
+                                        world.push_message(msg);
+                                    }
+                                    None => {}
+                                }
+                            }
+                            InfoTab::Skills => {}
                         }
                     }
                     Action::B | Action::Select => {
@@ -1501,6 +1543,36 @@ fn world_bp_to_save(bp: &world::BodyParts) -> save::BodyPartsSave {
     }
 }
 
+/// Convert in-memory `Equipment` into save bytes. Empty slots become
+/// the empty string (forward-compat default).
+fn world_equipment_to_save(eq: &world::Equipment) -> save::EquipmentSave {
+    let s = |k: Option<items::ItemKind>| k.map(|x| x.save_key().to_string()).unwrap_or_default();
+    save::EquipmentSave {
+        main_hand: s(eq.main_hand),
+        off_hand: s(eq.off_hand),
+        head: s(eq.head),
+        torso: s(eq.torso),
+        l_arm: s(eq.l_arm),
+        r_arm: s(eq.r_arm),
+        l_leg: s(eq.l_leg),
+        r_leg: s(eq.r_leg),
+    }
+}
+
+fn save_equipment_to_world(eq: &save::EquipmentSave) -> world::Equipment {
+    let p = |s: &str| items::ItemKind::from_save_key(s);
+    world::Equipment {
+        main_hand: p(&eq.main_hand),
+        off_hand: p(&eq.off_hand),
+        head: p(&eq.head),
+        torso: p(&eq.torso),
+        l_arm: p(&eq.l_arm),
+        r_arm: p(&eq.r_arm),
+        l_leg: p(&eq.l_leg),
+        r_leg: p(&eq.r_leg),
+    }
+}
+
 /// Reverse of `world_bp_to_save`. Defaults a zero-max cell to the
 /// canonical starting maxes so a partial save (e.g. only torso written)
 /// still loads into a sane body.
@@ -1613,6 +1685,8 @@ fn save_game(
         .collect();
     let player_body = world.player_body();
     run.player_body_parts = Some(world_bp_to_save(&player_body));
+    let player_eq = world.player_equipment();
+    run.player_equipment = Some(world_equipment_to_save(&player_eq));
     // Leave the legacy single-pool field empty; phase 2 + later writes
     // route through body_parts. A v3 player_health field still loads
     // cleanly via serde but is never written.
@@ -1620,17 +1694,19 @@ fn save_game(
     run.hostiles = world
         .snapshot_hostiles()
         .into_iter()
-        .map(|(pos, bp, wielded, flavor)| save::HostileSave {
-            x: pos.x,
-            y: pos.y,
+        .map(|snap| save::HostileSave {
+            x: snap.pos.x,
+            y: snap.pos.y,
             // hp + max_hp stay populated for any older binary that
             // wants to read the file — surface the torso pool as the
             // closest single-pool analog.
-            hp: bp.torso.hp,
-            max_hp: bp.torso.max,
-            wielded_kind: wielded.map(|k| k.save_key().to_string()).unwrap_or_default(),
-            flavor: flavor.to_string(),
-            body_parts: Some(world_bp_to_save(&bp)),
+            hp: snap.body.torso.hp,
+            max_hp: snap.body.torso.max,
+            wielded_kind: snap.main_hand.map(|k| k.save_key().to_string()).unwrap_or_default(),
+            flavor: snap.flavor.to_string(),
+            body_parts: Some(world_bp_to_save(&snap.body)),
+            off_hand_kind: snap.off_hand.map(|k| k.save_key().to_string()).unwrap_or_default(),
+            worn_kinds: snap.worn_kinds.iter().map(|k| k.save_key().to_string()).collect(),
         })
         .collect();
     run.active_action = world.active_action.as_ref().map(|active| ActiveActionSave {
@@ -2135,10 +2211,32 @@ fn draw_glyph_palette(cells: &mut [Option<Cell>], cursor: u8, palette: &Palette)
 
 fn info_tab_row_count(world: &World, tab: InfoTab) -> usize {
     match tab {
-        InfoTab::Inventory => world.player_pack().contents.len(),
+        // Inventory shows every equip slot (8) on top, then every pack
+        // item. A on a slot row unequips; A on a pack row equips.
+        InfoTab::Inventory => world::EquipSlot::ALL.len() + world.player_pack().contents.len(),
         InfoTab::Crafting => crafting::RECIPES.len(),
         InfoTab::Skills => 1, // Fire Making; slice-2 adds more skills
     }
+}
+
+/// Map an inventory-tab row index to the action it should trigger when
+/// A is pressed. `None` means the row is informational only.
+enum InventoryRow {
+    EquipSlot(world::EquipSlot),
+    PackItem(items::ItemKind),
+}
+
+fn inventory_row_at(world: &World, selected: usize) -> Option<InventoryRow> {
+    let slot_count = world::EquipSlot::ALL.len();
+    if selected < slot_count {
+        return Some(InventoryRow::EquipSlot(world::EquipSlot::ALL[selected]));
+    }
+    let pack_idx = selected - slot_count;
+    world
+        .player_pack()
+        .contents
+        .get(pack_idx)
+        .map(|i| InventoryRow::PackItem(i.kind))
 }
 
 fn draw_info_menu(
@@ -2243,35 +2341,69 @@ fn draw_info_inventory(
     palette: &Palette,
 ) {
     let pack = world.player_pack();
-    if pack.contents.is_empty() {
-        put_text(
-            cells,
-            layout.inner_x(),
-            layout.first_row_y(),
-            "(pack empty)",
-            palette.panel_dim_fg,
-            palette.panel_bg,
-        );
-        return;
-    }
+    let equipment = world.player_equipment();
 
     let max_rows = (layout.footer_y() - layout.first_row_y() - 1).max(1) as usize;
-    let visible = pack.contents.iter().take(max_rows);
-    for (i, item) in visible.enumerate() {
-        let row_y = layout.first_row_y() + i as i32;
-        let is_selected = i == selected;
-        let label = item.display_label();
-        let weight = fmt_weight(item.total_weight_g());
+    let mut row_idx = 0usize;
+
+    // Equipment slots first: one row per slot, labelled "[slot] item" or
+    // "[slot] —". Selecting one and pressing A unequips the slot.
+    for &slot in &world::EquipSlot::ALL {
+        if row_idx >= max_rows {
+            break;
+        }
+        let row_y = layout.first_row_y() + row_idx as i32;
+        let is_selected = row_idx == selected;
+        let label = match equipment.get(slot) {
+            Some(kind) => format!("[{}] {}", slot.label(), kind.name()),
+            None => format!("[{}] —", slot.label()),
+        };
         draw_menu_row(
             cells,
             layout,
             row_y,
             is_selected,
             &label,
-            palette.panel_fg,
-            Some((&weight, palette.panel_dim_fg)),
+            palette.panel_dim_fg,
+            None,
             palette,
         );
+        row_idx += 1;
+    }
+
+    // Pack rows below. Skip the empty hint if we have equipment lines
+    // above — the player still sees the slot list when the pack is empty.
+    if pack.contents.is_empty() && row_idx < max_rows {
+        let row_y = layout.first_row_y() + row_idx as i32;
+        put_text(
+            cells,
+            layout.inner_x(),
+            row_y,
+            "(pack empty)",
+            palette.panel_dim_fg,
+            palette.panel_bg,
+        );
+    } else {
+        for item in pack.contents.iter() {
+            if row_idx >= max_rows {
+                break;
+            }
+            let row_y = layout.first_row_y() + row_idx as i32;
+            let is_selected = row_idx == selected;
+            let label = item.display_label();
+            let weight = fmt_weight(item.total_weight_g());
+            draw_menu_row(
+                cells,
+                layout,
+                row_y,
+                is_selected,
+                &label,
+                palette.panel_fg,
+                Some((&weight, palette.panel_dim_fg)),
+                palette,
+            );
+            row_idx += 1;
+        }
     }
 
     // Pack-total summary on the row just above the footer.

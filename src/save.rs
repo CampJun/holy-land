@@ -166,6 +166,34 @@ pub struct RunSave {
     // player_health for new saves.
     #[serde(default)]
     pub player_body_parts: Option<BodyPartsSave>,
+    // Phase 3 (equip slots): per-slot `ItemKind::save_key` strings.
+    // Additive — v3 saves without this field load with the Rabble-
+    // tier starting equipment (knife in main hand).
+    #[serde(default)]
+    pub player_equipment: Option<EquipmentSave>,
+}
+
+/// Per-slot equipment round-trip. Each field is a save_key string; an
+/// empty string means the slot is unoccupied. Unknown kinds load as
+/// empty (forward-compat).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct EquipmentSave {
+    #[serde(default)]
+    pub main_hand: String,
+    #[serde(default)]
+    pub off_hand: String,
+    #[serde(default)]
+    pub head: String,
+    #[serde(default)]
+    pub torso: String,
+    #[serde(default)]
+    pub l_arm: String,
+    #[serde(default)]
+    pub r_arm: String,
+    #[serde(default)]
+    pub l_leg: String,
+    #[serde(default)]
+    pub r_leg: String,
 }
 
 /// Single-pool combat health (phase 1). Phase 2's body-part split
@@ -235,6 +263,16 @@ pub struct HostileSave {
     /// field load with a defaulted full-HP body.
     #[serde(default)]
     pub body_parts: Option<BodyPartsSave>,
+    /// Phase-3 off-hand `ItemKind::save_key`. Empty means no off-hand.
+    /// Additive — older saves load with no off-hand.
+    #[serde(default)]
+    pub off_hand_kind: String,
+    /// Phase-3 worn armor pieces — list of `ItemKind::save_key` strings.
+    /// Restore rebuilds the `Worn` component by looking up each kind's
+    /// `ItemDef.armor` stats. Unknown / non-wearable keys are skipped
+    /// (forward-compat).
+    #[serde(default)]
+    pub worn_kinds: Vec<String>,
 }
 
 /// Backwards-compat seed value matching `world::DEFAULT_SEED`. Used by
@@ -380,6 +418,7 @@ impl RunSave {
             player_health: None,
             hostiles: Vec::new(),
             player_body_parts: None,
+            player_equipment: None,
         }
     }
 }
@@ -646,6 +685,8 @@ mod tests {
             wielded_kind: "spear".to_string(),
             flavor: "cornish_bandit".to_string(),
             body_parts: None,
+            off_hand_kind: String::new(),
+            worn_kinds: Vec::new(),
         }];
         save_atomic(&path, &run).unwrap();
 
@@ -697,6 +738,7 @@ mod tests {
             player_health: None,
             hostiles: Vec::new(),
             player_body_parts: None,
+            player_equipment: None,
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
@@ -796,6 +838,7 @@ mod tests {
             player_health: None,
             hostiles: Vec::new(),
             player_body_parts: None,
+            player_equipment: None,
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
