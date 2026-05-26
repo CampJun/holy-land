@@ -1,6 +1,7 @@
 mod action;
 mod calendar;
 mod chunkgen;
+mod city;
 mod cornwall;
 mod crafting;
 #[cfg(not(target_arch = "arm"))]

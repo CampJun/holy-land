@@ -1,0 +1,29 @@
+// Exeter c.1300 — STUB geometry. Replaced by Hooker-1587-derived
+// real geometry in a follow-up commit. Coordinates are anchor-relative
+// world cells (anchor lives in cornwall.rs::NAMED_SITES, currently
+// (0, 0) for Exeter). 1 cell = 5 ft = 1.524 m.
+//
+// Stub layout: 300×220-cell axis-aligned rectangle (~457×335 m), four
+// gates at the midpoints of each side, no streets or landmarks yet.
+// Real Exeter was ~600×500 m irregular polygon — this rectangle just
+// proves the wall-stamping pipeline end-to-end.
+
+City(
+    name: "Exeter",
+    wall: Wall(
+        polygon: [
+            (-150, -110),  // NW corner
+            ( 150, -110),  // NE corner
+            ( 150,  110),  // SE corner
+            (-150,  110),  // SW corner
+        ],
+        gates: [
+            Gate(name: "North Gate", cell: (   0, -110), width: 2),
+            Gate(name: "East Gate",  cell: ( 150,    0), width: 2),
+            Gate(name: "South Gate", cell: (   0,  110), width: 2),
+            Gate(name: "West Gate",  cell: (-150,    0), width: 2),
+        ],
+    ),
+    streets: [],
+    landmarks: [],
+)
