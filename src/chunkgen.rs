@@ -190,15 +190,18 @@ pub fn generate_chunk(coord: ChunkCoord, world_seed: u64, info: OvermapInfo) -> 
         }
     }
 
-    // Step 8: authored-city stamping. Wall polygon + gates run on top
-    // of forest procgen so the wall reads cleanly through whatever
-    // trees the noise placed. Spawn-disc enforcement then guarantees a
-    // walkable pocket at the spawn cell — if a city wall ever passed
-    // through the spawn cell it would be reopened, which is exactly
-    // the playability guarantee we want.
-    if let Some(site) = info.named_site {
-        if let Some(city) = crate::city::cities().get(site.name) {
-            city.stamp_into_chunk(coord, &mut cells, site.anchor_cell);
+    // Step 8: authored-city stamping. Bbox-driven (NOT named_site-
+    // driven), because real cities extend far beyond their tight
+    // biome-override radius — Exeter's wall + Rougemont + Exe Bridge
+    // bbox is ~14×31 chunks while `named_site` reaches only 9×9.
+    // Stamping runs on top of forest procgen so walls read cleanly
+    // through whatever trees the noise placed; spawn-disc enforcement
+    // then guarantees a walkable pocket at the spawn cell — if a city
+    // wall ever passed through the spawn cell it would be reopened,
+    // which is exactly the playability guarantee we want.
+    for loaded in crate::city::cities().values() {
+        if loaded.intersects_chunk(coord) {
+            loaded.city.stamp_into_chunk(coord, &mut cells, loaded.anchor);
         }
     }
 

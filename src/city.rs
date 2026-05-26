@@ -66,24 +66,97 @@ pub enum Footprint {
 
 const EXETER_RON: &str = include_str!("../assets/cities/exeter.ron");
 
-static CITIES: OnceLock<HashMap<&'static str, City>> = OnceLock::new();
+/// A city's parsed RON plus world-cell anchor and bbox cached at load.
+/// City stamping intersects this bbox against each chunk (cities can
+/// extend well beyond the `NamedSite` biome-override radius, so we
+/// can't reuse that for stamping range).
+pub struct LoadedCity {
+    pub city: City,
+    pub anchor: (i64, i64),
+    /// Inclusive world-cell bbox: `(min_x, min_y, max_x, max_y)`.
+    pub bbox: (i64, i64, i64, i64),
+}
 
-/// Lazily parse all bundled city RON files. Panics on parse error: the
-/// files are embedded with `include_str!` so a malformed RON is a
-/// build-time defect that should fail fast at boot, same as the atlas.
-pub fn cities() -> &'static HashMap<&'static str, City> {
+impl LoadedCity {
+    /// True if this city has any geometry inside the given chunk's
+    /// world-cell bounds. Cheap rectangle-vs-rectangle intersect.
+    pub fn intersects_chunk(&self, coord: ChunkCoord) -> bool {
+        let chunk_min_x = coord.cx as i64 * CHUNK_W as i64;
+        let chunk_min_y = coord.cy as i64 * CHUNK_H as i64;
+        let chunk_max_x = chunk_min_x + CHUNK_W as i64 - 1;
+        let chunk_max_y = chunk_min_y + CHUNK_H as i64 - 1;
+        let (cmin_x, cmin_y, cmax_x, cmax_y) = self.bbox;
+        !(cmax_x < chunk_min_x
+            || cmin_x > chunk_max_x
+            || cmax_y < chunk_min_y
+            || cmin_y > chunk_max_y)
+    }
+}
+
+static CITIES: OnceLock<HashMap<&'static str, LoadedCity>> = OnceLock::new();
+
+/// Lazily parse all bundled city RON files and resolve each one's
+/// anchor from `NAMED_SITES`. Panics on parse failure or missing
+/// `NamedSite` — both are build-time defects, fail fast at boot.
+pub fn cities() -> &'static HashMap<&'static str, LoadedCity> {
     CITIES.get_or_init(|| {
-        let mut map: HashMap<&'static str, City> = HashMap::new();
-        // Each entry: (NamedSite.name, embedded RON). Add cities here as
-        // they're authored.
+        let mut map: HashMap<&'static str, LoadedCity> = HashMap::new();
         let entries: &[(&'static str, &'static str)] = &[("Exeter", EXETER_RON)];
         for (name, src) in entries {
             let city: City = ron::from_str(src)
                 .unwrap_or_else(|e| panic!("city RON parse failed for {name}: {e}"));
-            map.insert(name, city);
+            let anchor = crate::cornwall::NAMED_SITES
+                .iter()
+                .find(|s| s.name == *name)
+                .map(|s| s.anchor_cell)
+                .unwrap_or_else(|| {
+                    panic!("city {name} has no matching NamedSite in cornwall.rs")
+                });
+            let bbox = compute_city_bbox(&city, anchor);
+            map.insert(name, LoadedCity { city, anchor, bbox });
         }
         map
     })
+}
+
+/// Compute the inclusive world-cell bbox of every authored polygon /
+/// polyline in `city`, offset by `anchor`. Used to drive chunk
+/// stamping (`LoadedCity::intersects_chunk`).
+fn compute_city_bbox(city: &City, anchor: (i64, i64)) -> (i64, i64, i64, i64) {
+    let mut min_x = i64::MAX;
+    let mut min_y = i64::MAX;
+    let mut max_x = i64::MIN;
+    let mut max_y = i64::MIN;
+    let mut acc = |p: (i64, i64)| {
+        let x = p.0 + anchor.0;
+        let y = p.1 + anchor.1;
+        if x < min_x { min_x = x; }
+        if y < min_y { min_y = y; }
+        if x > max_x { max_x = x; }
+        if y > max_y { max_y = y; }
+    };
+    for &p in &city.wall.polygon {
+        acc(p);
+    }
+    for street in &city.streets {
+        for &p in &street.polyline {
+            acc(p);
+        }
+    }
+    for lm in &city.landmarks {
+        match &lm.footprint {
+            Footprint::Rect(a, b) => {
+                acc(*a);
+                acc(*b);
+            }
+            Footprint::Polygon(verts) => {
+                for &p in verts {
+                    acc(p);
+                }
+            }
+        }
+    }
+    (min_x, min_y, max_x, max_y)
 }
 
 impl City {
@@ -189,25 +262,40 @@ mod tests {
     #[test]
     fn exeter_ron_parses() {
         let map = cities();
-        let exeter = map.get("Exeter").expect("Exeter loaded");
-        assert!(exeter.wall.polygon.len() >= 3);
-        assert!(!exeter.wall.gates.is_empty());
+        let loaded = map.get("Exeter").expect("Exeter loaded");
+        assert!(loaded.city.wall.polygon.len() >= 3);
+        assert!(!loaded.city.wall.gates.is_empty());
+        // Real Exeter has streets and landmarks now too.
+        assert!(!loaded.city.streets.is_empty());
+        assert!(!loaded.city.landmarks.is_empty());
     }
 
     #[test]
-    fn wall_stamps_into_anchor_chunk() {
-        let exeter = cities().get("Exeter").unwrap();
+    fn exeter_bbox_covers_known_features() {
+        let loaded = cities().get("Exeter").unwrap();
+        let (min_x, min_y, max_x, max_y) = loaded.bbox;
+        // Wall E edge ~+118, Exe Bridge SW corner ~-398, Rougemont N
+        // ~-548, Quay/leat S edge ~+290. Anchor is (0, 0).
+        assert!(min_x <= -398, "min_x = {min_x}, expected ≤ -398 (Exe Bridge)");
+        assert!(min_y <= -548, "min_y = {min_y}, expected ≤ -548 (Rougemont)");
+        assert!(max_x >= 118, "max_x = {max_x}, expected ≥ 118 (wall E)");
+        assert!(max_y >= 290, "max_y = {max_y}, expected ≥ 290 (quay)");
+    }
+
+    #[test]
+    fn wall_stamps_into_chunks_along_the_circuit() {
+        let loaded = cities().get("Exeter").unwrap();
         let cell_count = (CHUNK_W as usize) * (CHUNK_H as usize);
+        // Chunk (2, -3) covers world cells [80..120)×[-90..-60). The
+        // East-gate vertex (112, -126) is just NE of this chunk, and
+        // the segment from (118, -20) to (98, 85) crosses it.
         let mut cells: Vec<CellState> = (0..cell_count)
             .map(|_| CellState::with_terrain(TerrainKind::Grass))
             .collect();
-        // Chunk (3, -4) covers world cells [120..160)×[-120..-90). The
-        // NE corner of the stub Exeter rectangle (150, -110) lands
-        // inside it, along with stretches of the N and E walls.
-        exeter.stamp_into_chunk(
-            ChunkCoord { cx: 3, cy: -4 },
+        loaded.city.stamp_into_chunk(
+            ChunkCoord { cx: 2, cy: -3 },
             &mut cells,
-            (0, 0),
+            loaded.anchor,
         );
         let wall_count = cells
             .iter()
@@ -215,31 +303,45 @@ mod tests {
             .count();
         assert!(
             wall_count > 0,
-            "stub Exeter rectangle should have stamped some StoneWall cells into chunk (3, -4)"
+            "Exeter wall should stamp some StoneWall cells into chunk (2, -3)"
         );
     }
 
     #[test]
-    fn gate_has_no_wall_at_center() {
-        let exeter = cities().get("Exeter").unwrap();
+    fn each_gate_center_has_no_wall() {
+        let loaded = cities().get("Exeter").unwrap();
         let cell_count = (CHUNK_W as usize) * (CHUNK_H as usize);
-        // East gate of the stub is at world cell (150, 0). Its chunk is
-        // cx = 150 div 40 = 3, cy = 0 div 30 = 0. Chunk (3, 0) covers
-        // world cells [120..160)×[0..30), so the East gate at (150, 0)
-        // lands at local cell (30, 0).
-        let mut cells: Vec<CellState> = (0..cell_count)
-            .map(|_| CellState::with_terrain(TerrainKind::Grass))
-            .collect();
-        exeter.stamp_into_chunk(
-            ChunkCoord { cx: 3, cy: 0 },
-            &mut cells,
-            (0, 0),
-        );
-        let idx = 0 * (CHUNK_W as usize) + 30;
-        assert_eq!(
-            cells[idx].terrain,
-            TerrainKind::Grass,
-            "East gate center should be a gap, not a stamped wall"
-        );
+        for gate in &loaded.city.wall.gates {
+            let world_x = gate.cell.0 + loaded.anchor.0;
+            let world_y = gate.cell.1 + loaded.anchor.1;
+            let cx = (world_x).div_euclid(CHUNK_W as i64) as i32;
+            let cy = (world_y).div_euclid(CHUNK_H as i64) as i32;
+            let mut cells: Vec<CellState> = (0..cell_count)
+                .map(|_| CellState::with_terrain(TerrainKind::Grass))
+                .collect();
+            loaded.city.stamp_into_chunk(
+                ChunkCoord { cx, cy },
+                &mut cells,
+                loaded.anchor,
+            );
+            let lx = world_x - (cx as i64 * CHUNK_W as i64);
+            let ly = world_y - (cy as i64 * CHUNK_H as i64);
+            let idx = (ly as usize) * (CHUNK_W as usize) + (lx as usize);
+            assert_ne!(
+                cells[idx].terrain,
+                TerrainKind::StoneWall,
+                "gate {} center ({world_x}, {world_y}) should be a gap, not a wall",
+                gate.name
+            );
+        }
+    }
+
+    #[test]
+    fn bbox_intersection_skips_far_chunks() {
+        let loaded = cities().get("Exeter").unwrap();
+        // (1000, 1000) is hundreds of chunks away from Exeter.
+        assert!(!loaded.intersects_chunk(ChunkCoord { cx: 1000, cy: 1000 }));
+        // (0, 0) is the anchor; must intersect.
+        assert!(loaded.intersects_chunk(ChunkCoord { cx: 0, cy: 0 }));
     }
 }
