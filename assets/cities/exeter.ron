@@ -112,8 +112,12 @@ City(
     ],
 
     landmarks: [
+        // PavedArea: walkable CobbleRoad fill. Cathedral Close sits
+        // BENEATH the Cathedral footprint, which then overwrites it
+        // with StoneWall in the stone-mass pass.
         Landmark(
             name: "Cathedral Close",
+            kind: PavedArea,
             footprint: Polygon([
                 ( -72,  -48),
                 ( -20,  -56),
@@ -128,12 +132,16 @@ City(
                 ( -66,   18),
             ]),
         ),
+        // StoneMass: solid StoneWall fill (v1 silhouette — interiors
+        // come with the doors+rooms card).
         Landmark(
             name: "Cathedral",
+            kind: StoneMass,
             footprint: Rect((-42, -12), (42, 12)),
         ),
         Landmark(
             name: "Rougemont Motte",
+            kind: StoneMass,
             footprint: Polygon([
                 (-145, -470),
                 (-130, -525),
@@ -147,18 +155,22 @@ City(
         ),
         Landmark(
             name: "Rougemont Keep",
+            kind: StoneMass,
             footprint: Rect((-95, -506), (-62, -480)),
         ),
         Landmark(
             name: "Guildhall",
+            kind: StoneMass,
             footprint: Rect((-96, 65), (-94, 67)),
         ),
-        // Extramural features. Encoded as landmarks so the bbox covers
-        // them; specific stamping (bridge spans, quay piers, leat as
-        // water channel) is a follow-up. For now they parse and the
-        // bbox sees them — no terrain effect yet.
+        // Bridge / WaterChannel: parsed for bbox but NOT stamped in v1
+        // — they need river context (cells the bridge sits over should
+        // be deleted water, and the leat should become an actual water
+        // polyline). Landed when the cornwall river pipeline gets
+        // touched.
         Landmark(
             name: "Exe Bridge",
+            kind: Bridge,
             footprint: Polygon([
                 (-245,  205),
                 (-282,  232),
@@ -169,6 +181,7 @@ City(
         ),
         Landmark(
             name: "Riverside Quay",
+            kind: PavedArea,
             footprint: Polygon([
                 (-182,  244),
                 ( -88,  248),
@@ -180,6 +193,7 @@ City(
         ),
         Landmark(
             name: "Mill Leat",
+            kind: WaterChannel,
             footprint: Polygon([
                 (-214,  238),
                 (-150,  228),

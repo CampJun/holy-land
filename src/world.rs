@@ -2135,12 +2135,16 @@ mod tests {
     #[test]
     fn chunk_zero_zero_has_walkable_grass_at_spawn() {
         let world = World::new(CHUNK_W, CHUNK_H);
-        // Spawn cell must be walkable Grass (chunkgen carves around the
-        // skeleton features so the player never starts inside water or
-        // a tree).
+        // Spawn cell must be walkable. Pre-Exeter this was guaranteed
+        // to be `Grass` (chunkgen carved around the authored skeleton
+        // features). With Exeter stamping, the spawn cell now lands on
+        // Cathedral Close (CobbleRoad). The invariant we actually care
+        // about is walkability.
         let spawn = world.tile_at(20, 15);
-        assert_eq!(spawn, TerrainKind::Grass);
-        assert!(spawn.def().walkable);
+        assert!(
+            spawn.def().walkable,
+            "spawn terrain {spawn:?} must be walkable"
+        );
     }
 
     #[test]
