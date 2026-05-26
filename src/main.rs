@@ -1853,29 +1853,30 @@ fn build_ui_cells(
     let hp_line = format!("HP H{} T{}", body.head.hp.max(0), body.torso.hp.max(0));
     put_text(&mut cells, 1, 2, &hp_line, hp_fg, palette.hud_bg);
 
-    // Crippled-limb badge directly after HP (only shown when something
-    // is crippled). Phase-2 cripples drop a wielded weapon (arm) or
-    // halve speed (leg); a one-glance badge surfaces that state.
-    let mut crippled: Vec<&'static str> = Vec::new();
-    if body.l_arm.is_crippled() { crippled.push("L-arm"); }
-    if body.r_arm.is_crippled() { crippled.push("R-arm"); }
-    if body.l_leg.is_crippled() { crippled.push("L-leg"); }
-    if body.r_leg.is_crippled() { crippled.push("R-leg"); }
-    let after_hp_x = 1 + hp_line.len() as i32 + 2;
-    if !crippled.is_empty() {
-        let tag = format!("[{} crippled]", crippled.join(", "));
-        put_text(&mut cells, after_hp_x, 2, &tag, palette.need_critical_fg, palette.hud_bg);
+    // Crippled-status badge directly after HP. Reads functionally
+    // rather than anatomically — what the player can't do matters more
+    // than which limb. Phase 2 rules: any arm crippled → can't wield
+    // (any wielded weapon drops); any leg crippled → effective speed
+    // halved. Specific limb identity surfaces in the original cripple-
+    // event log line.
+    let arm_out = body.l_arm.is_crippled() || body.r_arm.is_crippled();
+    let leg_out = body.l_leg.is_crippled() || body.r_leg.is_crippled();
+    if arm_out || leg_out {
+        let after_hp_x = 1 + hp_line.len() as i32 + 2;
+        let tag = match (arm_out, leg_out) {
+            (true, true) => "[no weapon / lame]",
+            (true, false) => "[no weapon]",
+            (false, true) => "[lame]",
+            (false, false) => "",
+        };
+        put_text(&mut cells, after_hp_x, 2, tag, palette.need_critical_fg, palette.hud_bg);
     }
 
-    // Row 2 also (right of HP): Fire Making readout abbreviated to FM
-    // so the HP indicator owns the leftmost slot. Hidden if the
-    // crippled badge would collide; the skill is always available in
-    // the Select info menu's Skills tab.
-    if crippled.is_empty() {
-        let fm = skills.get(SkillKind::FireMaking);
-        let line = format!("FM {}%", fm.value);
-        put_text(&mut cells, after_hp_x, 2, &line, palette.hud_fg, palette.hud_bg);
-    }
+    // Per-skill readouts live in the Select info menu's Skills tab —
+    // base HUD reserves row 2 for vitals (HP + crippled status) so
+    // combat-relevant info reads cleanly at a glance. `skills` stays
+    // in the signature for future right-of-HP indicators.
+    let _ = skills;
 
     cells
 }

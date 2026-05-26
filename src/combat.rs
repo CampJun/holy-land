@@ -75,15 +75,17 @@ impl BodyPart {
         matches!(self, BodyPart::Head | BodyPart::Torso)
     }
 
-    /// Short label for the in-game log line.
+    /// Short label for the in-game log line. Compact arm/leg labels
+    /// ("L-arm" / "R-leg") so combat lines fit in the 38-cell HUD
+    /// width without truncating the damage number.
     pub fn label(self) -> &'static str {
         match self {
             BodyPart::Head => "head",
             BodyPart::Torso => "chest",
-            BodyPart::LArm => "left arm",
-            BodyPart::RArm => "right arm",
-            BodyPart::LLeg => "left leg",
-            BodyPart::RLeg => "right leg",
+            BodyPart::LArm => "L-arm",
+            BodyPart::RArm => "R-arm",
+            BodyPart::LLeg => "L-leg",
+            BodyPart::RLeg => "R-leg",
         }
     }
 

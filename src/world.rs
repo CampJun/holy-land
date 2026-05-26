@@ -2690,11 +2690,14 @@ impl World {
         }
     }
 
-    fn miss_line(&self, attacker_is_player: bool, target_is_player: bool, weapon: &str) -> String {
+    fn miss_line(&self, attacker_is_player: bool, target_is_player: bool, _weapon: &str) -> String {
+        // Compact lines fit the 38-cell HUD without truncating. Weapon
+        // omitted from the miss line — you know what you swung; what
+        // matters is that it missed.
         match (attacker_is_player, target_is_player) {
-            (true, _) => format!("You swing your {} but miss.", weapon),
-            (_, true) => format!("The bandit's {} swings wide.", weapon),
-            _ => format!("A {} swing misses.", weapon),
+            (true, _) => "You miss.".to_string(),
+            (_, true) => "Bandit misses.".to_string(),
+            _ => "A swing misses.".to_string(),
         }
     }
 
@@ -2702,23 +2705,20 @@ impl World {
         &self,
         attacker_is_player: bool,
         target_is_player: bool,
-        weapon: &str,
+        _weapon: &str,
         part: crate::combat::BodyPart,
         dmg: u16,
         crit: bool,
     ) -> String {
-        let bang = if crit { "CRIT — " } else { "" };
+        // Compact format: "You hit chest -18" or "CRIT! You hit head -27".
+        // Weapon name omitted (you know what you swung); body part +
+        // damage are the load-bearing info.
+        let prefix = if crit { "CRIT! " } else { "" };
         let where_ = part.label();
         match (attacker_is_player, target_is_player) {
-            (true, _) => format!(
-                "{}You strike the bandit's {} with your {} ({} dmg).",
-                bang, where_, weapon, dmg
-            ),
-            (_, true) => format!(
-                "{}The bandit's {} hits your {} ({} dmg).",
-                bang, weapon, where_, dmg
-            ),
-            _ => format!("{}A {} strike lands on the {} ({} dmg).", bang, weapon, where_, dmg),
+            (true, _) => format!("{}You hit {} -{}", prefix, where_, dmg),
+            (_, true) => format!("{}Bandit hits {} -{}", prefix, where_, dmg),
+            _ => format!("{}Hit {} -{}", prefix, where_, dmg),
         }
     }
 
@@ -2788,18 +2788,18 @@ impl World {
         }
         let _ = self.ecs.remove_one::<Wielded>(target);
         let line = if target == self.player {
-            format!("Your {} arm fails; you drop your {}.", part.label().replace("arm", "").trim(), kind.name())
+            format!("Your {} fails — drop {}.", part.label(), kind.name())
         } else {
-            format!("The bandit's {} fails; the {} clatters down.", part.label(), kind.name())
+            format!("Bandit's {} fails — drops {}.", part.label(), kind.name())
         };
         self.push_message(line);
     }
 
     fn cripple_leg_line(&self, target: Entity, part: crate::combat::BodyPart) -> String {
         if target == self.player {
-            format!("Your {} buckles — you can barely move.", part.label())
+            format!("Your {} buckles!", part.label())
         } else {
-            format!("The bandit's {} gives out.", part.label())
+            format!("Bandit's {} gives out.", part.label())
         }
     }
 
