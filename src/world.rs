@@ -740,19 +740,32 @@ impl YeomanLoadout {
 
 /// Roll a fresh Yeoman loadout for the Cornish bandit. Probabilities
 /// come directly from `Bestiary slice 1.md`. Re-rolls each spawn so
-/// five bandits in a chunk naturally vary (one bowman, one buckler,
-/// three spearmen, etc. — bow deferred to phase 5).
+/// five bandits in a chunk naturally vary — one bowman, one buckler,
+/// three spearmen, etc. Per the card, 20% of bandits roll a Bow as
+/// their main hand (with 12 arrows in pack); the remaining 80% draw
+/// from the melee distribution.
 pub fn roll_yeoman_loadout(rng: &mut Rng) -> YeomanLoadout {
     use crate::items::ItemKind;
-    let main_hand = match rng.d100() {
-        1..=50 => Some(ItemKind::Spear),
-        51..=80 => Some(ItemKind::ShortSword),
-        _ => Some(ItemKind::Falchion),
+    let is_bowman = rng.d100() <= 20;
+    let main_hand = if is_bowman {
+        Some(ItemKind::Bow)
+    } else {
+        match rng.d100() {
+            1..=50 => Some(ItemKind::Spear),
+            51..=80 => Some(ItemKind::ShortSword),
+            _ => Some(ItemKind::Falchion),
+        }
     };
-    let off_hand = match rng.d100() {
-        1..=60 => Some(ItemKind::Knife),
-        61..=90 => None,
-        _ => Some(ItemKind::SmallRoundShield),
+    // Bow bandits favor a knife backup (no shield) for the awkward
+    // moment a player closes to melee.
+    let off_hand = if is_bowman {
+        Some(ItemKind::Knife)
+    } else {
+        match rng.d100() {
+            1..=60 => Some(ItemKind::Knife),
+            61..=90 => None,
+            _ => Some(ItemKind::SmallRoundShield),
+        }
     };
     let head = match rng.d100() {
         1..=70 => Some(ItemKind::IronSkullcap),
@@ -795,6 +808,16 @@ pub fn spawn_cornish_bandit(ecs: &mut Ecs, pos: Position, loadout: YeomanLoadout
     ));
     if let Some(off) = loadout.off_hand {
         let _ = ecs.insert_one(entity, OffHand(off));
+    }
+    // Bow bandits get a small Pack with 12 arrows so the AI can shoot.
+    // Pack-on-hostile is transient (not saved) for phase 6 — restored
+    // bandits get fresh ammo. Phase 8+ can lift hostile inventory into
+    // the save format.
+    if loadout.main_hand == Some(crate::items::ItemKind::Bow) {
+        let mut pack = crate::items::Pack::empty(5_000);
+        let arrows = crate::items::ItemKind::Arrow.make_default_instance(12);
+        let _ = pack.try_add(arrows);
+        let _ = ecs.insert_one(entity, pack);
     }
     entity
 }
@@ -935,7 +958,7 @@ impl EquipSlot {
 /// `MainHand`. None means the item isn't equippable.
 pub fn default_slot_for(kind: crate::items::ItemKind) -> Option<EquipSlot> {
     let def = kind.def();
-    if def.weapon.is_some() {
+    if def.weapon.is_some() || def.ranged.is_some() {
         return Some(EquipSlot::MainHand);
     }
     if let Some(armor) = def.armor {
@@ -1596,6 +1619,24 @@ impl World {
     fn player_wielded_profile(&self) -> Option<crate::combat::WeaponProfile> {
         let kind = self.ecs.get::<&Wielded>(self.player).ok().map(|w| w.0)?;
         crate::combat::weapon_profile_for(kind)
+    }
+
+    /// Player's current main-hand ItemKind, if any. Public for the
+    /// action-availability checks (e.g. `Aim` needs a ranged weapon).
+    pub fn player_main_hand_kind(&self) -> Option<crate::items::ItemKind> {
+        self.ecs.get::<&Wielded>(self.player).ok().map(|w| w.0)
+    }
+
+    /// Lookup an entity's `Position`. Used by the targeting cursor
+    /// to snap onto a hostile and to commit shots.
+    pub fn position_of(&self, e: Entity) -> Option<Position> {
+        self.ecs.get::<&Position>(e).ok().map(|p| *p)
+    }
+
+    /// Find the hostile (if any) at world coords `(x, y)`. Public for
+    /// the targeting cursor's commit path.
+    pub fn hostile_at(&self, x: i32, y: i32) -> Option<Entity> {
+        self.find_hostile_at(x, y)
     }
 
     /// First hostile entity standing on `(x, y)`, if any. Used by the
@@ -2662,6 +2703,267 @@ impl World {
         }
     }
 
+    /// Fire one shot from `attacker` at the entity at `target_pos`
+    /// using the attacker's wielded ranged weapon. Consumes one piece
+    /// of ammo from the attacker's pack; on hit, the arrow drops on the
+    /// target's cell (70% recovery, 30% break — placeholder per the
+    /// reach-and-ranged card). LoS via `cell_blocks_sight_at` along a
+    /// Bresenham line; out-of-range / out-of-LoS shots short-circuit
+    /// with a log message instead of resolving.
+    pub fn perform_ranged_attack(&mut self, attacker: Entity, target: Entity) {
+        let attacker_is_player = attacker == self.player;
+        let Some((atk_stats, weapon_kind, ranged)) = self.ranged_loadout(attacker) else {
+            return;
+        };
+        // Range + LoS preflight.
+        let (Ok(atk_pos), Ok(tgt_pos)) = (
+            self.ecs.get::<&Position>(attacker).map(|p| *p),
+            self.ecs.get::<&Position>(target).map(|p| *p),
+        ) else {
+            return;
+        };
+        let dx = tgt_pos.x - atk_pos.x;
+        let dy = tgt_pos.y - atk_pos.y;
+        let cheb = dx.abs().max(dy.abs()) as u8;
+        if cheb > ranged.max_range {
+            if attacker_is_player {
+                self.push_message("Out of range.".to_string());
+            }
+            return;
+        }
+        if !self.ranged_los_clear(atk_pos, tgt_pos) {
+            if attacker_is_player {
+                self.push_message("No line of sight.".to_string());
+            }
+            return;
+        }
+        // Ammo: consume one from the attacker's pack. No pack → no shot.
+        let ammo_kind = crate::items::ItemKind::from_save_key(ranged.ammo_kind);
+        if let Some(kind) = ammo_kind {
+            let took = self
+                .ecs
+                .get::<&mut crate::items::Pack>(attacker)
+                .ok()
+                .map(|mut p| p.take_one_from_stack(kind))
+                .unwrap_or(false);
+            if !took {
+                if attacker_is_player {
+                    self.push_message(format!("No {} in your pack.", kind.name()));
+                }
+                return;
+            }
+        }
+        // Range penalty: -1 to_hit per tile past half max_range.
+        let range_penalty = {
+            let half = (ranged.max_range / 2) as i32;
+            (cheb as i32 - half).max(0) as i16
+        };
+        let weapon = crate::combat::WeaponProfile {
+            to_hit: ranged.to_hit - range_penalty,
+            damage_die: ranged.damage_die,
+            move_cost: ranged.move_cost,
+            reach: 1,
+        };
+        let def_stats = self.defender_stats(target);
+        let outcome = crate::combat::resolve_hit(atk_stats, def_stats, weapon, &mut self.rng);
+        let target_is_player = target == self.player;
+        let weapon_label = weapon_kind.name();
+        match outcome {
+            crate::combat::HitOutcome::Miss => {
+                self.push_message(self.ranged_miss_line(attacker_is_player, target_is_player));
+                // Missed arrow lands somewhere near the target — drop on
+                // the cell for the player to recover.
+                if let Some(kind) = ammo_kind {
+                    self.drop_arrow_near(tgt_pos, kind, true);
+                }
+            }
+            crate::combat::HitOutcome::Hit { .. } | crate::combat::HitOutcome::Crit { .. } => {
+                let crit = outcome.is_crit();
+                let part = crate::combat::roll_body_part(&mut self.rng);
+                let armor = self.layered_dr_for(target, part);
+                let dmg = crate::combat::roll_damage(weapon, atk_stats, armor, crit, &mut self.rng);
+                let total = dmg.total();
+                self.push_message(self.ranged_hit_line(
+                    attacker_is_player,
+                    target_is_player,
+                    weapon_label,
+                    part,
+                    total,
+                    crit,
+                ));
+                self.apply_damage_to_part(target, part, dmg);
+                if let Some(kind) = ammo_kind {
+                    // 70% of arrows survive embedded in the target —
+                    // pickup gives them back. Crits break the arrow
+                    // more often (placeholder).
+                    let break_roll = self.rng.d100();
+                    let break_threshold = if crit { 50 } else { 30 };
+                    let survives = break_roll > break_threshold;
+                    if survives {
+                        self.drop_arrow_near(tgt_pos, kind, false);
+                    }
+                }
+            }
+        }
+        if attacker_is_player {
+            self.spend_moves(ranged.move_cost);
+        }
+    }
+
+    fn ranged_loadout(
+        &self,
+        e: Entity,
+    ) -> Option<(crate::combat::AttackerStats, crate::items::ItemKind, crate::combat::RangedProfile)> {
+        let kind = self.ecs.get::<&Wielded>(e).ok().map(|w| w.0)?;
+        let ranged = kind.def().ranged?;
+        let skills = self.ecs.get::<&CombatSkills>(e).ok()?;
+        let atk = crate::combat::AttackerStats {
+            // Ranged uses melee skill as a stand-in until phase 9 splits
+            // Melee + Ranged into separate top-level skills.
+            melee_skill: skills.melee,
+            weapon_prof: skills.weapon_prof,
+            agi_mod: skills.agi_mod,
+            str_bonus: skills.str_bonus,
+        };
+        Some((atk, kind, ranged))
+    }
+
+    /// True if every cell on the Bresenham line between `from` and `to`
+    /// (exclusive of endpoints) is transparent. Tree / wall / gorse all
+    /// block per `cell_blocks_sight_at`.
+    fn ranged_los_clear(&self, from: Position, to: Position) -> bool {
+        let mut x0 = from.x;
+        let mut y0 = from.y;
+        let x1 = to.x;
+        let y1 = to.y;
+        let dx = (x1 - x0).abs();
+        let dy = -(y1 - y0).abs();
+        let sx = if x0 < x1 { 1 } else { -1 };
+        let sy = if y0 < y1 { 1 } else { -1 };
+        let mut err = dx + dy;
+        loop {
+            // Step.
+            let e2 = 2 * err;
+            if e2 >= dy {
+                err += dy;
+                x0 += sx;
+            }
+            if e2 <= dx {
+                err += dx;
+                y0 += sy;
+            }
+            if x0 == x1 && y0 == y1 {
+                return true;
+            }
+            if self.cell_blocks_sight_at(x0 as i64, y0 as i64) {
+                return false;
+            }
+        }
+    }
+
+    fn drop_arrow_near(&mut self, pos: Position, kind: crate::items::ItemKind, miss: bool) {
+        // Miss scatters the arrow within one cell of the target. Hit
+        // drops on the target's exact cell (sticks in the body).
+        let (dx, dy) = if miss {
+            let r = self.rng.next_u32();
+            let dx = ((r % 3) as i32) - 1;
+            let dy = (((r / 3) % 3) as i32) - 1;
+            (dx, dy)
+        } else {
+            (0, 0)
+        };
+        let lx = pos.x + dx;
+        let ly = pos.y + dy;
+        let instance = kind.make_default_instance(1);
+        if let Some(cell) = self.cell_at_mut(lx as i64, ly as i64) {
+            cell.items.push(instance);
+        }
+    }
+
+    fn ranged_miss_line(&self, attacker_is_player: bool, target_is_player: bool) -> String {
+        match (attacker_is_player, target_is_player) {
+            (true, _) => "Your shot misses.".to_string(),
+            (_, true) => "Arrow whistles past you.".to_string(),
+            _ => "An arrow misses.".to_string(),
+        }
+    }
+
+    fn ranged_hit_line(
+        &self,
+        attacker_is_player: bool,
+        target_is_player: bool,
+        weapon: &str,
+        part: crate::combat::BodyPart,
+        dmg: u16,
+        crit: bool,
+    ) -> String {
+        let prefix = if crit { "CRIT! " } else { "" };
+        let where_ = part.label();
+        match (attacker_is_player, target_is_player) {
+            (true, _) => format!("{}You shoot bandit's {} -{}", prefix, where_, dmg),
+            (_, true) => format!("{}Arrow hits your {} -{}", prefix, where_, dmg),
+            _ => format!("{}{} shot lands on {} -{}", prefix, weapon, where_, dmg),
+        }
+    }
+
+    /// Rough hit-percent estimate for a ranged shot against `target`.
+    /// Used by the targeting cursor HUD only — actual resolution still
+    /// rolls the contested margin. Quick linear stand-in: 50% at
+    /// margin 0, ±5pp per point, clamped [5, 95].
+    pub fn estimate_ranged_hit_pct(&self, target: Entity) -> u8 {
+        let Some((atk_stats, _, ranged)) = self.ranged_loadout(self.player) else {
+            return 0;
+        };
+        let (Ok(atk_pos), Ok(tgt_pos)) = (
+            self.ecs.get::<&Position>(self.player).map(|p| *p),
+            self.ecs.get::<&Position>(target).map(|p| *p),
+        ) else {
+            return 0;
+        };
+        let cheb = (tgt_pos.x - atk_pos.x).abs().max((tgt_pos.y - atk_pos.y).abs()) as i16;
+        let range_penalty = {
+            let half = (ranged.max_range / 2) as i16;
+            (cheb - half).max(0)
+        };
+        let atk_score = atk_stats.melee_skill
+            + atk_stats.weapon_prof
+            + (ranged.to_hit - range_penalty)
+            + atk_stats.agi_mod;
+        let def = self.defender_stats(target);
+        let def_score = def.dodge_skill + def.agi_mod - def.encumbrance;
+        let margin = atk_score as i32 - def_score as i32;
+        // 50% at margin 0; +5pp per +1 margin; clamp [5, 95].
+        let pct = (50 + margin * 5).clamp(5, 95);
+        pct as u8
+    }
+
+    /// Returns true if the player has line of sight to the entity at
+    /// `pos`. Used by the targeting cursor to flag out-of-LoS picks.
+    pub fn player_has_los_to(&self, pos: Position) -> bool {
+        let Ok(p) = self.ecs.get::<&Position>(self.player).map(|p| *p) else { return false };
+        self.ranged_los_clear(p, pos)
+    }
+
+    /// Find a hostile in front of the attacker at any distance up to
+    /// `max_range` with LoS clear — used by AI to decide whether to
+    /// shoot or close.
+    pub fn nearest_visible_hostile(&self, from: Position, max_range: u8) -> Option<Entity> {
+        let mut best: Option<(Entity, u8)> = None;
+        for (e, (pos, _h)) in self.ecs.query::<(&Position, &Hostile)>().iter() {
+            let cheb = (pos.x - from.x).abs().max((pos.y - from.y).abs()) as u8;
+            if cheb == 0 || cheb > max_range {
+                continue;
+            }
+            if !self.ranged_los_clear(from, *pos) {
+                continue;
+            }
+            if best.map(|(_, d)| cheb < d).unwrap_or(true) {
+                best = Some((e, cheb));
+            }
+        }
+        best.map(|(e, _)| e)
+    }
+
     /// Sum the DR contribution of every Worn piece that covers `part`
     /// and rolls under its coverage %. The roll happens per-piece, not
     /// per-type — a single piece either catches the swing or it doesn't.
@@ -2859,22 +3161,29 @@ impl World {
         // armor piece becomes a ground item on the death cell. The
         // player can pick up and equip the lot to climb from Rabble
         // tier to Yeoman.
-        let mut drops: Vec<crate::items::ItemKind> = Vec::new();
+        let mut drops: Vec<crate::items::ItemInstance> = Vec::new();
         if let Ok(w) = self.ecs.get::<&Wielded>(e) {
-            drops.push(w.0);
+            drops.push(w.0.make_default_instance(1));
         }
         if let Ok(o) = self.ecs.get::<&OffHand>(e) {
-            drops.push(o.0);
+            drops.push(o.0.make_default_instance(1));
         }
         if let Ok(worn) = self.ecs.get::<&Worn>(e) {
             for piece in worn.pieces.iter() {
                 if let Some(kind) = piece.item_kind {
-                    drops.push(kind);
+                    drops.push(kind.make_default_instance(1));
                 }
             }
         }
-        for kind in drops {
-            let instance = kind.make_default_instance(1);
+        // Spill the hostile's pack contents (arrows for a bow bandit,
+        // anything else that's been added in later phases). Cloning
+        // ItemInstance preserves stack counts + metadata.
+        if let Ok(pack) = self.ecs.get::<&crate::items::Pack>(e) {
+            for item in pack.contents.iter() {
+                drops.push(item.clone());
+            }
+        }
+        for instance in drops {
             if let Some(cell) = self.cell_at_mut(pos.x as i64, pos.y as i64) {
                 cell.items.push(instance);
             }
@@ -3034,24 +3343,53 @@ impl World {
             let dy = (player_pos.y - pos.y).signum();
             let chebyshev =
                 (player_pos.x - pos.x).abs().max((player_pos.y - pos.y).abs()) as u8;
-            // Look up the hostile's weapon reach (defaults to 1 if no
-            // wielded weapon or non-weapon item — same fallback the
-            // player's bump-attack path uses).
-            let reach = self
-                .ecs
-                .get::<&Wielded>(e)
-                .ok()
-                .and_then(|w| crate::combat::weapon_profile_for(w.0))
+            // Inspect the hostile's wielded item: ranged weapon vs melee
+            // changes both the attack distance and the resolver to call.
+            let wielded_kind = self.ecs.get::<&Wielded>(e).ok().map(|w| w.0);
+            let ranged = wielded_kind.and_then(|k| k.def().ranged);
+            let reach = wielded_kind
+                .and_then(crate::combat::weapon_profile_for)
                 .map(|w| w.reach)
                 .unwrap_or(1);
-            // Reach-2 swing also needs the intermediate cell clear of
-            // sight blockers. For adjacent (range 1) the LoS check is
-            // trivial.
+            // Ranged path: bow bandit shoots if in max_range, LoS clear,
+            // and has at least one arrow in pack. If adjacent, the
+            // bow is awkward — they fall through to the melee path
+            // (which, for a bow main_hand, does nothing — placeholder
+            // until phase 7 wires a knife backup swap).
+            if let Some(r) = ranged {
+                let los = self.ranged_los_clear(pos, player_pos);
+                let has_ammo = crate::items::ItemKind::from_save_key(r.ammo_kind)
+                    .and_then(|k| self.ecs.get::<&crate::items::Pack>(e).ok().map(|p| p.has_stack(k)))
+                    .unwrap_or(false);
+                if chebyshev >= 2 && chebyshev <= r.max_range && los && has_ammo {
+                    self.perform_ranged_attack(e, self.player);
+                    if self.player_killed_by_combat {
+                        return;
+                    }
+                    continue;
+                }
+                // Bow + adjacent: archer kites — step away from the
+                // player if possible.
+                if chebyshev <= 1 {
+                    let bx = pos.x - dx;
+                    let by = pos.y - dy;
+                    if self.cell_walkable_at(bx as i64, by as i64)
+                        && self.find_hostile_at(bx, by).is_none()
+                    {
+                        if let Ok(mut p) = self.ecs.get::<&mut Position>(e) {
+                            p.x = bx;
+                            p.y = by;
+                        }
+                        continue;
+                    }
+                }
+            }
+            // Melee path. Reach-2 swing also needs the intermediate cell
+            // clear of sight blockers.
             let in_range = chebyshev >= 1 && chebyshev <= reach;
             let los_clear = if chebyshev <= 1 {
                 true
             } else {
-                // Intermediate cell sits one step toward the player.
                 let ix = pos.x + dx;
                 let iy = pos.y + dy;
                 !self.cell_blocks_sight_at(ix as i64, iy as i64)
@@ -4237,13 +4575,12 @@ mod tests {
         for _ in 0..200 {
             let loadout = roll_yeoman_loadout(&mut world.rng);
             let mh = loadout.main_hand.expect("main hand never empty");
+            let def = mh.def();
             assert!(
-                mh.def().weapon.is_some(),
-                "rolled main_hand {:?} must have weapon stats",
+                def.weapon.is_some() || def.ranged.is_some(),
+                "rolled main_hand {:?} must have weapon or ranged stats",
                 mh
             );
-            // Off-hand may be empty; if present, must be a known Yeoman
-            // option (Knife or SmallRoundShield).
             if let Some(oh) = loadout.off_hand {
                 assert!(
                     matches!(oh, ItemKind::Knife | ItemKind::SmallRoundShield),
@@ -4518,26 +4855,199 @@ mod tests {
     }
 
     #[test]
+    fn bow_def_has_ranged_profile() {
+        let def = ItemKind::Bow.def();
+        assert!(def.ranged.is_some(), "bow must expose ranged stats");
+        assert_eq!(def.ranged.unwrap().ammo_kind, "arrow");
+        assert!(def.weapon.is_none(), "bow doesn't do melee");
+    }
+
+    #[test]
+    fn player_shoot_consumes_one_arrow_and_drops_on_target() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Equip a bow, stuff a few arrows.
+        {
+            let mut pack = world.ecs.get::<&mut Pack>(world.player).unwrap();
+            pack.contents.clear();
+            pack.try_add(ItemKind::Bow.make_default_instance(1)).unwrap();
+            pack.try_add(ItemKind::Arrow.make_default_instance(5)).unwrap();
+        }
+        world.equip_from_pack(ItemKind::Bow);
+        // Clear a 4-cell-east corridor of any chunkgen decorations so
+        // the Bresenham LoS check succeeds deterministically.
+        let p = world.player_pos();
+        for dx in 1..=4 {
+            if let Some(c) = world.cell_at_mut((p.x + dx) as i64, p.y as i64) {
+                c.terrain = TerrainKind::Grass;
+                c.decoration = Decoration::None;
+            }
+        }
+        let bandit = spawn_cornish_bandit(
+            &mut world.ecs,
+            Position { x: p.x + 4, y: p.y },
+            YeomanLoadout::default(),
+        );
+        let arrows_before: u16 = world
+            .ecs
+            .get::<&Pack>(world.player)
+            .unwrap()
+            .contents
+            .iter()
+            .filter(|i| i.kind == ItemKind::Arrow)
+            .map(|i| i.count)
+            .sum();
+        world.perform_ranged_attack(world.player, bandit);
+        let arrows_after: u16 = world
+            .ecs
+            .get::<&Pack>(world.player)
+            .unwrap()
+            .contents
+            .iter()
+            .filter(|i| i.kind == ItemKind::Arrow)
+            .map(|i| i.count)
+            .sum();
+        assert_eq!(
+            arrows_before - arrows_after,
+            1,
+            "exactly one arrow consumed per shot"
+        );
+    }
+
+    #[test]
+    fn ranged_out_of_range_short_circuits() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        {
+            let mut pack = world.ecs.get::<&mut Pack>(world.player).unwrap();
+            pack.contents.clear();
+            pack.try_add(ItemKind::Bow.make_default_instance(1)).unwrap();
+            pack.try_add(ItemKind::Arrow.make_default_instance(3)).unwrap();
+        }
+        world.equip_from_pack(ItemKind::Bow);
+        let p = world.player_pos();
+        // 15 cells away — beyond bow's max_range = 10.
+        let bandit = spawn_cornish_bandit(
+            &mut world.ecs,
+            Position { x: p.x + 15, y: p.y },
+            YeomanLoadout::default(),
+        );
+        let arrows_before: u16 = world
+            .ecs
+            .get::<&Pack>(world.player)
+            .unwrap()
+            .contents
+            .iter()
+            .filter(|i| i.kind == ItemKind::Arrow)
+            .map(|i| i.count)
+            .sum();
+        world.perform_ranged_attack(world.player, bandit);
+        let arrows_after: u16 = world
+            .ecs
+            .get::<&Pack>(world.player)
+            .unwrap()
+            .contents
+            .iter()
+            .filter(|i| i.kind == ItemKind::Arrow)
+            .map(|i| i.count)
+            .sum();
+        assert_eq!(arrows_before, arrows_after, "out-of-range shot must not consume ammo");
+    }
+
+    #[test]
+    fn ranged_los_blocked_by_tree() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        {
+            let mut pack = world.ecs.get::<&mut Pack>(world.player).unwrap();
+            pack.contents.clear();
+            pack.try_add(ItemKind::Bow.make_default_instance(1)).unwrap();
+            pack.try_add(ItemKind::Arrow.make_default_instance(3)).unwrap();
+        }
+        world.equip_from_pack(ItemKind::Bow);
+        let p = world.player_pos();
+        // Tree at p.x+2 blocks LoS to a bandit at p.x+4.
+        if let Some(c) = world.cell_at_mut((p.x + 2) as i64, p.y as i64) {
+            c.terrain = TerrainKind::TreeTrunk;
+            c.decoration = Decoration::None;
+        }
+        let bandit = spawn_cornish_bandit(
+            &mut world.ecs,
+            Position { x: p.x + 4, y: p.y },
+            YeomanLoadout::default(),
+        );
+        let arrows_before: u16 = world
+            .ecs
+            .get::<&Pack>(world.player)
+            .unwrap()
+            .contents
+            .iter()
+            .filter(|i| i.kind == ItemKind::Arrow)
+            .map(|i| i.count)
+            .sum();
+        world.perform_ranged_attack(world.player, bandit);
+        let arrows_after: u16 = world
+            .ecs
+            .get::<&Pack>(world.player)
+            .unwrap()
+            .contents
+            .iter()
+            .filter(|i| i.kind == ItemKind::Arrow)
+            .map(|i| i.count)
+            .sum();
+        assert_eq!(arrows_before, arrows_after, "tree-blocked shot must not consume ammo");
+    }
+
+    #[test]
+    fn bow_bandit_death_drops_arrows() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let p = world.player_pos();
+        let bandit = spawn_cornish_bandit(
+            &mut world.ecs,
+            Position { x: p.x + 5, y: p.y },
+            YeomanLoadout {
+                main_hand: Some(ItemKind::Bow),
+                off_hand: Some(ItemKind::Knife),
+                head: None,
+                torso: Some(ItemKind::PaddedDoublet),
+            },
+        );
+        let bandit_pos = world.ecs.get::<&Position>(bandit).map(|p| *p).unwrap();
+        world.apply_damage_to_part(
+            bandit,
+            crate::combat::BodyPart::Torso,
+            crate::combat::DamageTriplet { bash: 0, cut: 0, stab: 200 },
+        );
+        let drops = &world.cell_at(bandit_pos.x as i64, bandit_pos.y as i64).unwrap().items;
+        let has = |k: ItemKind| drops.iter().any(|i| i.kind == k);
+        assert!(has(ItemKind::Bow), "bow dropped");
+        assert!(has(ItemKind::Arrow), "arrows dropped from pack");
+    }
+
+    #[test]
     fn yeoman_main_hand_distribution_matches_spec() {
-        // Per Bestiary slice 1: 50% spear / 30% short sword / 20% falchion.
+        // Per Bestiary slice 1: 20% bow main_hand; the remaining 80%
+        // draw from 50% spear / 30% short sword / 20% falchion. Marginal
+        // expected: spear 40%, sword 24%, falchion 16%, bow 20%.
         let mut world = World::new(CHUNK_W, CHUNK_H);
         let mut spear = 0;
         let mut sword = 0;
         let mut falchion = 0;
+        let mut bow = 0;
         let n = 5_000;
         for _ in 0..n {
             match roll_yeoman_loadout(&mut world.rng).main_hand {
                 Some(ItemKind::Spear) => spear += 1,
                 Some(ItemKind::ShortSword) => sword += 1,
                 Some(ItemKind::Falchion) => falchion += 1,
+                Some(ItemKind::Bow) => bow += 1,
                 other => panic!("unexpected main_hand roll {:?}", other),
             }
         }
         let p_spear = spear as f64 / n as f64;
         let p_sword = sword as f64 / n as f64;
         let p_falchion = falchion as f64 / n as f64;
-        assert!((p_spear - 0.50).abs() < 0.04, "spear {:.3}", p_spear);
-        assert!((p_sword - 0.30).abs() < 0.04, "sword {:.3}", p_sword);
-        assert!((p_falchion - 0.20).abs() < 0.04, "falchion {:.3}", p_falchion);
+        let p_bow = bow as f64 / n as f64;
+        assert!((p_spear - 0.40).abs() < 0.04, "spear {:.3}", p_spear);
+        assert!((p_sword - 0.24).abs() < 0.04, "sword {:.3}", p_sword);
+        assert!((p_falchion - 0.16).abs() < 0.04, "falchion {:.3}", p_falchion);
+        assert!((p_bow - 0.20).abs() < 0.04, "bow {:.3}", p_bow);
     }
 }

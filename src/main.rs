@@ -199,6 +199,38 @@ struct InfoMenuState {
     selected: usize,
 }
 
+/// Ranged targeting cursor — modal input state opened by the `Aim`
+/// verb. Dpad moves the cursor; A commits the shot; B cancels. The
+/// cursor lives in world coords so it lines up with the bandit's
+/// rendered glyph regardless of camera scroll.
+struct TargetCursor {
+    pos: world::Position,
+    max_range: u8,
+}
+
+impl TargetCursor {
+    /// Open the cursor; snap onto the nearest visible hostile within
+    /// the wielded bow's max range. Falls back to the player's tile.
+    fn open(world: &World) -> Self {
+        let player = world.player_pos();
+        // Look up the wielded bow's range.
+        let max_range = world
+            .player_main_hand_kind()
+            .and_then(|k| k.def().ranged.map(|r| r.max_range))
+            .unwrap_or(10);
+        let pos = world
+            .nearest_visible_hostile(player, max_range)
+            .and_then(|e| world.position_of(e))
+            .unwrap_or(player);
+        Self { pos, max_range }
+    }
+
+    fn move_by(&mut self, dx: i32, dy: i32) {
+        self.pos.x = self.pos.x.saturating_add(dx);
+        self.pos.y = self.pos.y.saturating_add(dy);
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let save_dir = platform::save_dir();
     logging::init(&save_dir);
@@ -568,6 +600,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // fields.
     let mut glyph_palette: Option<u8> = None;
 
+    // Ranged-targeting cursor. Opened by the `Aim` verb (via
+    // `ExecuteOutcome::OpenAim`); A commits the shot, B cancels.
+    // Sits between command_menu and pause priority — see input loop
+    // below.
+    let mut target_cursor: Option<TargetCursor> = None;
+
     // Overmap mode. `M` (desktop) toggles it. Cursor lives on the mode
     // struct; `last_overmap_destination` survives close/reopen so the
     // resume-from-interrupt UX (design doc §6.3) works.
@@ -693,9 +731,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     {
                         match action::evaluate(&world, *id) {
                             action::Availability::Available { .. } => {
-                                let action::ExecuteOutcome::Done(msg) =
-                                    action::execute(&mut world, *id);
-                                log_info!("[radial] {}", msg);
+                                match action::execute(&mut world, *id) {
+                                    action::ExecuteOutcome::Done(msg) => {
+                                        log_info!("[radial] {}", msg);
+                                    }
+                                    action::ExecuteOutcome::OpenAim => {
+                                        target_cursor = Some(TargetCursor::open(&world));
+                                    }
+                                }
                             }
                             action::Availability::Unavailable { reason } => {
                                 log_info!("[radial] can't '{}': {}", name, reason);
@@ -780,6 +823,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Action::B | Action::Start => {
                         pause_menu = None;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            // Ranged-targeting cursor. Modal: dpad moves the cursor,
+            // A commits the shot via World::perform_ranged_attack,
+            // B cancels. Closes on commit OR cancel.
+            if let Some(ref mut tc) = target_cursor {
+                match input_action {
+                    Action::Up => tc.move_by(0, -1),
+                    Action::Down => tc.move_by(0, 1),
+                    Action::Left => tc.move_by(-1, 0),
+                    Action::Right => tc.move_by(1, 0),
+                    Action::A => {
+                        if let Some(target) = world.hostile_at(tc.pos.x, tc.pos.y) {
+                            world.perform_ranged_attack(world.player, target);
+                            // Hostile turn after the shot, matching the
+                            // melee bump flow.
+                            world.tick_hostiles();
+                        } else {
+                            world.push_message("No target there.".to_string());
+                        }
+                        target_cursor = None;
+                    }
+                    Action::B => {
+                        target_cursor = None;
                     }
                     _ => {}
                 }
@@ -892,10 +963,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if let Some(recipe) = crafting::RECIPES.get(state.selected) {
                                     match action::evaluate(&world, recipe.action) {
                                         action::Availability::Available { .. } => {
-                                            let action::ExecuteOutcome::Done(msg) =
-                                                action::execute(&mut world, recipe.action);
-                                            log_info!("[craft] {}", msg);
-                                            info_menu = None;
+                                            match action::execute(&mut world, recipe.action) {
+                                                action::ExecuteOutcome::Done(msg) => {
+                                                    log_info!("[craft] {}", msg);
+                                                    info_menu = None;
+                                                }
+                                                action::ExecuteOutcome::OpenAim => {
+                                                    // Crafting recipes never open the aim
+                                                    // cursor, but match exhaustively to keep
+                                                    // the variant disciplined.
+                                                    info_menu = None;
+                                                }
+                                            }
                                         }
                                         action::Availability::Unavailable { reason } => {
                                             log_info!(
@@ -982,10 +1061,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let id = action::ALL_ACTIONS[selected].id;
                         match action::evaluate(&world, id) {
                             action::Availability::Available { .. } => {
-                                let action::ExecuteOutcome::Done(msg) =
-                                    action::execute(&mut world, id);
-                                log_info!("[menu] {}", msg);
-                                command_menu = None;
+                                match action::execute(&mut world, id) {
+                                    action::ExecuteOutcome::Done(msg) => {
+                                        log_info!("[menu] {}", msg);
+                                        command_menu = None;
+                                    }
+                                    action::ExecuteOutcome::OpenAim => {
+                                        target_cursor = Some(TargetCursor::open(&world));
+                                        command_menu = None;
+                                    }
+                                }
                             }
                             action::Availability::Unavailable { reason } => {
                                 // Stay open so the player can pick another.
@@ -1016,10 +1101,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Action::A => {
                     // Route through the same dispatcher the command
                     // menu uses so Pickup's cost + side-effects stay
-                    // in one place (action.rs).
-                    let action::ExecuteOutcome::Done(msg) =
-                        action::execute(&mut world, action::ActionId::Pickup);
-                    log_debug!("{}", msg);
+                    // in one place (action.rs). Pickup never returns
+                    // OpenAim, but match exhaustively for discipline.
+                    match action::execute(&mut world, action::ActionId::Pickup) {
+                        action::ExecuteOutcome::Done(msg) => log_debug!("{}", msg),
+                        action::ExecuteOutcome::OpenAim => {}
+                    }
                 }
                 Action::Start => {
                     pause_menu = Some(0);
@@ -1223,8 +1310,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             calendar_day,
             player_body,
         );
-        draw_message_line(&mut ui_cells, &world, &palette);
+        if target_cursor.is_none() {
+            draw_message_line(&mut ui_cells, &world, &palette);
+        }
         draw_here_line(&mut ui_cells, &world, &palette);
+        if let Some(ref tc) = target_cursor {
+            draw_target_cursor(&mut ui_cells, &world, tc, cam_x, cam_y, &palette);
+        }
         if let Some(active) = world.active_action.as_ref() {
             draw_multi_turn_banner(&mut ui_cells, active, &palette);
         }
@@ -2033,6 +2125,60 @@ fn draw_message_line(cells: &mut [Option<Cell>], world: &World, palette: &Palett
         let prev_row = WORLD_H as i32 - 3;
         put_text(cells, 1, prev_row, &truncate(prev), palette.panel_dim_fg, palette.hud_bg);
     }
+}
+
+/// Paint the ranged-targeting cursor overlay: yellow '+' on the cursor
+/// cell and a HUD line above the here-line showing range / to-hit% /
+/// target info. The cursor sits on top of whatever's in the cell;
+/// we don't blank the underlying glyph so the player still sees the
+/// bandit through the crosshair.
+fn draw_target_cursor(
+    cells: &mut [Option<Cell>],
+    world: &World,
+    cursor: &TargetCursor,
+    cam_x: i64,
+    cam_y: i64,
+    palette: &Palette,
+) {
+    let vx = (cursor.pos.x as i64 - cam_x) as i32;
+    let vy = (cursor.pos.y as i64 - cam_y) as i32;
+    if vx >= 0 && vy >= 0 && (vx as u32) < WORLD_W && (vy as u32) < WORLD_H {
+        let cursor_fg = Color::RGB(240, 220, 60);
+        // Underlying cell's bg is preserved by reading prev_cells via
+        // put_cell-on-top — for simplicity, paint a '+' over whatever
+        // bg is at that index.
+        let idx = (vy as u32 * WORLD_W + vx as u32) as usize;
+        let bg = cells[idx].map(|c| c.bg).unwrap_or(palette.hud_bg);
+        cells[idx] = Some(Cell { glyph: b'+', fg: cursor_fg, bg });
+    }
+    // HUD line above the here-line: "Aim: chest  hit 65%  rng 4/10".
+    let player_pos = world.player_pos();
+    let dx = cursor.pos.x - player_pos.x;
+    let dy = cursor.pos.y - player_pos.y;
+    let range = dx.abs().max(dy.abs()) as u8;
+    let target = world.hostile_at(cursor.pos.x, cursor.pos.y);
+    let los = world.player_has_los_to(cursor.pos);
+    let row = WORLD_H as i32 - 2;
+    let line = match target {
+        Some(t) => {
+            let pct = world.estimate_ranged_hit_pct(t);
+            if range > cursor.max_range {
+                format!("Aim: out of range  rng {}/{}", range, cursor.max_range)
+            } else if !los {
+                format!("Aim: no LoS  rng {}/{}", range, cursor.max_range)
+            } else {
+                format!("Aim: target  hit {}%  rng {}/{}", pct, range, cursor.max_range)
+            }
+        }
+        None => format!("Aim: empty  rng {}/{}", range, cursor.max_range),
+    };
+    let max = (WORLD_W as usize).saturating_sub(2);
+    let mut s = line;
+    if s.len() > max {
+        s.truncate(max.saturating_sub(3));
+        s.push_str("...");
+    }
+    put_text(cells, 1, row, &s, palette.hud_fg, palette.hud_bg);
 }
 
 fn draw_here_line(cells: &mut [Option<Cell>], world: &World, palette: &Palette) {

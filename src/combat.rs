@@ -178,6 +178,25 @@ pub struct WeaponProfile {
 /// adjacent target — the cards' "no-reach penalty" placeholder ~30%.
 pub const NO_REACH_DAMAGE_PCT: u16 = 70;
 
+/// Ranged weapon profile. Lives on `ItemDef.ranged` for bows; a
+/// crossbow variant lands in a later phase with explicit reload state.
+/// `ammo_kind` save_key for the consumed ammo item — the resolver
+/// pulls one from the attacker's pack per shot.
+#[derive(Clone, Copy, Debug)]
+pub struct RangedProfile {
+    pub to_hit: i16,
+    pub damage_die: DamageTriplet,
+    /// Cost in moves per shot (draw + loose).
+    pub move_cost: u32,
+    /// Maximum effective range in tiles. Targets beyond this can't be
+    /// shot; targets near max take a graduated to-hit penalty.
+    pub max_range: u8,
+    /// `ItemKind::save_key` of the ammo this weapon expects. Empty
+    /// means no ammo required (sling, throwing). Phase 6 supports bow
+    /// + arrow only.
+    pub ammo_kind: &'static str,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AttackerStats {
     pub melee_skill: i16,

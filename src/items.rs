@@ -13,7 +13,7 @@
 // - Save format uses stable string `save_key()`s for forward-compat. Unknown
 //   keys on load are dropped silently (see `Pack::from_save`).
 
-use crate::combat::{ArmorDr, BodyPart, DamageTriplet, WeaponProfile};
+use crate::combat::{ArmorDr, BodyPart, DamageTriplet, RangedProfile, WeaponProfile};
 use crate::crafting::{CookableKind, CookedState, PanContents, Seasonings};
 use crate::save::{ItemInstanceSave, ItemMetadataSave, PackSave};
 
@@ -71,6 +71,13 @@ pub enum ItemKind {
     PaddedDoublet,
     /// Cheaper torso-only armor. Yeoman tier (20% torso roll).
     LeatherJerkin,
+    /// Drawn-string bow. Period-correct ranged weapon; 20% chance per
+    /// Yeoman bandit spawn (per `Bestiary slice 1.md`). Consumes one
+    /// `Arrow` from the attacker's pack per shot.
+    Bow,
+    /// Stackable bow ammo. Consumed per shot; drops on hit target's
+    /// cell for ~70% recovery (phase 6 placeholder break rule).
+    Arrow,
 }
 
 /// All per-kind metadata in one place. Adding a new `ItemKind` variant is
@@ -103,6 +110,9 @@ pub struct ItemDef {
     /// to build the bandit's `Worn` from its rolled loadout instead of
     /// hand-assembling pieces in world.rs.
     pub armor: Option<ArmorStats>,
+    /// Ranged profile — `Some` for bows / crossbows. The Aim verb
+    /// surfaces only when the main-hand item has this set.
+    pub ranged: Option<RangedProfile>,
 }
 
 /// Static armor description for an `ItemKind`. The wearable mask
@@ -156,6 +166,8 @@ const ALL_KINDS: &[ItemKind] = &[
     ItemKind::IronSkullcap,
     ItemKind::PaddedDoublet,
     ItemKind::LeatherJerkin,
+    ItemKind::Bow,
+    ItemKind::Arrow,
 ];
 
 impl ItemKind {
@@ -179,6 +191,7 @@ impl ItemKind {
                     reach: 1,
                 }),
                 armor: None,
+                ranged: None,
             },
             ItemKind::Knife => ItemDef {
                 save_key: "knife",
@@ -195,6 +208,7 @@ impl ItemKind {
                     reach: 1,
                 }),
                 armor: None,
+                ranged: None,
             },
             ItemKind::Pack => ItemDef {
                 save_key: "pack",
@@ -206,6 +220,7 @@ impl ItemKind {
                 blends_with_terrain: false,
                 weapon: None,
                 armor: None,
+                ranged: None,
             },
             ItemKind::Tent => ItemDef {
                 save_key: "tent",
@@ -217,6 +232,7 @@ impl ItemKind {
                 blends_with_terrain: false,
                 weapon: None,
                 armor: None,
+                ranged: None,
             },
             ItemKind::Bedroll => ItemDef {
                 save_key: "bedroll",
@@ -228,6 +244,7 @@ impl ItemKind {
                 blends_with_terrain: false,
                 weapon: None,
                 armor: None,
+                ranged: None,
             },
             ItemKind::CookingPan => ItemDef {
                 save_key: "cooking_pan",
@@ -239,6 +256,7 @@ impl ItemKind {
                 blends_with_terrain: false,
                 weapon: None,
                 armor: None,
+                ranged: None,
             },
             ItemKind::Waterskin => ItemDef {
                 save_key: "waterskin",
@@ -250,6 +268,7 @@ impl ItemKind {
                 blends_with_terrain: false,
                 weapon: None,
                 armor: None,
+                ranged: None,
             },
             ItemKind::FlintAndSteel => ItemDef {
                 save_key: "flint_and_steel",
@@ -261,6 +280,7 @@ impl ItemKind {
                 blends_with_terrain: false,
                 weapon: None,
                 armor: None,
+                ranged: None,
             },
             ItemKind::Herb => ItemDef {
                 save_key: "herb",
@@ -274,6 +294,7 @@ impl ItemKind {
                 blends_with_terrain: false,
                 weapon: None,
                 armor: None,
+                ranged: None,
             },
             // Organic detritus: blends into the floor texture so the
             // eye glides past it. ChopTree drops firewood (which
@@ -288,6 +309,7 @@ impl ItemKind {
                 blends_with_terrain: true,
                 weapon: None,
                 armor: None,
+                ranged: None,
             },
             ItemKind::Stick => ItemDef {
                 save_key: "stick",
@@ -299,6 +321,7 @@ impl ItemKind {
                 blends_with_terrain: true,
                 weapon: None,
                 armor: None,
+                ranged: None,
             },
             ItemKind::Firewood => ItemDef {
                 save_key: "firewood",
@@ -311,6 +334,7 @@ impl ItemKind {
                 blends_with_terrain: false,
                 weapon: None,
                 armor: None,
+                ranged: None,
             },
             ItemKind::GrassBlade => ItemDef {
                 save_key: "grass_blade",
@@ -322,6 +346,7 @@ impl ItemKind {
                 blends_with_terrain: true,
                 weapon: None,
                 armor: None,
+                ranged: None,
             },
             ItemKind::Stone => ItemDef {
                 save_key: "stone",
@@ -336,6 +361,7 @@ impl ItemKind {
                 blends_with_terrain: false,
                 weapon: None,
                 armor: None,
+                ranged: None,
             },
             ItemKind::MossPatch => ItemDef {
                 save_key: "moss_patch",
@@ -347,6 +373,7 @@ impl ItemKind {
                 blends_with_terrain: true,
                 weapon: None,
                 armor: None,
+                ranged: None,
             },
             ItemKind::Mud => ItemDef {
                 save_key: "mud",
@@ -358,6 +385,7 @@ impl ItemKind {
                 blends_with_terrain: true,
                 weapon: None,
                 armor: None,
+                ranged: None,
             },
             ItemKind::Ration => ItemDef {
                 save_key: "ration",
@@ -370,6 +398,7 @@ impl ItemKind {
                 blends_with_terrain: false,
                 weapon: None,
                 armor: None,
+                ranged: None,
             },
             ItemKind::Fish => ItemDef {
                 save_key: "fish",
@@ -383,6 +412,7 @@ impl ItemKind {
                 blends_with_terrain: false,
                 weapon: None,
                 armor: None,
+                ranged: None,
             },
             ItemKind::Cooked => ItemDef {
                 save_key: "cooked",
@@ -397,6 +427,7 @@ impl ItemKind {
                 blends_with_terrain: false,
                 weapon: None,
                 armor: None,
+                ranged: None,
             },
             // Phase C: undergrowth harvest yields.
             ItemKind::Moss => ItemDef {
@@ -409,6 +440,7 @@ impl ItemKind {
                 blends_with_terrain: true,
                 weapon: None,
                 armor: None,
+                ranged: None,
             },
             ItemKind::FernFrond => ItemDef {
                 save_key: "fern_frond",
@@ -420,6 +452,7 @@ impl ItemKind {
                 blends_with_terrain: true,
                 weapon: None,
                 armor: None,
+                ranged: None,
             },
             ItemKind::FernRoot => ItemDef {
                 save_key: "fern_root",
@@ -431,6 +464,7 @@ impl ItemKind {
                 blends_with_terrain: false,
                 weapon: None,
                 armor: None,
+                ranged: None,
             },
             ItemKind::GorseFaggot => ItemDef {
                 save_key: "gorse_faggot",
@@ -442,6 +476,7 @@ impl ItemKind {
                 blends_with_terrain: false,
                 weapon: None,
                 armor: None,
+                ranged: None,
             },
             ItemKind::BrackenStraw => ItemDef {
                 save_key: "bracken_straw",
@@ -453,6 +488,7 @@ impl ItemKind {
                 blends_with_terrain: true,
                 weapon: None,
                 armor: None,
+                ranged: None,
             },
             ItemKind::BrambleFruit => ItemDef {
                 save_key: "bramble_fruit",
@@ -464,6 +500,7 @@ impl ItemKind {
                 blends_with_terrain: false,
                 weapon: None,
                 armor: None,
+                ranged: None,
             },
             ItemKind::Hazelnut => ItemDef {
                 save_key: "hazelnut",
@@ -475,6 +512,7 @@ impl ItemKind {
                 blends_with_terrain: false,
                 weapon: None,
                 armor: None,
+                ranged: None,
             },
             ItemKind::Acorn => ItemDef {
                 save_key: "acorn",
@@ -486,6 +524,7 @@ impl ItemKind {
                 blends_with_terrain: false,
                 weapon: None,
                 armor: None,
+                ranged: None,
             },
             ItemKind::RowanBerry => ItemDef {
                 save_key: "rowan_berry",
@@ -497,6 +536,7 @@ impl ItemKind {
                 blends_with_terrain: false,
                 weapon: None,
                 armor: None,
+                ranged: None,
             },
             ItemKind::Spear => ItemDef {
                 save_key: "spear",
@@ -517,6 +557,7 @@ impl ItemKind {
                     reach: 2,
                 }),
                 armor: None,
+                ranged: None,
             },
             ItemKind::ShortSword => ItemDef {
                 save_key: "short_sword",
@@ -533,6 +574,7 @@ impl ItemKind {
                     reach: 1,
                 }),
                 armor: None,
+                ranged: None,
             },
             ItemKind::Falchion => ItemDef {
                 save_key: "falchion",
@@ -549,6 +591,7 @@ impl ItemKind {
                     reach: 1,
                 }),
                 armor: None,
+                ranged: None,
             },
             ItemKind::SmallRoundShield => ItemDef {
                 save_key: "small_round_shield",
@@ -563,6 +606,7 @@ impl ItemKind {
                 // death.
                 weapon: None,
                 armor: None,
+                ranged: None,
             },
             ItemKind::IronSkullcap => ItemDef {
                 save_key: "iron_skullcap",
@@ -579,6 +623,7 @@ impl ItemKind {
                     dr: ArmorDr { bash: 3, cut: 4, stab: 3 },
                     encumbrance: 1,
                 }),
+                ranged: None,
             },
             ItemKind::PaddedDoublet => ItemDef {
                 save_key: "padded_doublet",
@@ -598,6 +643,7 @@ impl ItemKind {
                     // and plate to 3 when those land in a later phase.
                     encumbrance: 1,
                 }),
+                ranged: None,
             },
             ItemKind::LeatherJerkin => ItemDef {
                 save_key: "leather_jerkin",
@@ -614,6 +660,38 @@ impl ItemKind {
                     dr: ArmorDr { bash: 3, cut: 2, stab: 2 },
                     encumbrance: 1,
                 }),
+                ranged: None,
+            },
+            ItemKind::Bow => ItemDef {
+                save_key: "bow",
+                name: "bow",
+                is_fungible: false,
+                glyph: b')',
+                color: [150, 110, 70],
+                default_weight_g: 800,
+                blends_with_terrain: false,
+                weapon: None,
+                armor: None,
+                ranged: Some(RangedProfile {
+                    to_hit: 2,
+                    // Stab-heavy; the arrow itself does the work.
+                    damage_die: DamageTriplet { bash: 0, cut: 1, stab: 10 },
+                    move_cost: 130,
+                    max_range: 10,
+                    ammo_kind: "arrow",
+                }),
+            },
+            ItemKind::Arrow => ItemDef {
+                save_key: "arrow",
+                name: "arrow",
+                is_fungible: true,
+                glyph: b'-',
+                color: [180, 150, 100],
+                default_weight_g: 40,
+                blends_with_terrain: false,
+                weapon: None,
+                armor: None,
+                ranged: None,
             },
         }
     }

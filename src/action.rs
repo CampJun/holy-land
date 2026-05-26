@@ -82,6 +82,11 @@ pub enum ActionId {
     DigFern,
     CutGorse,
     CutBracken,
+    /// Open the ranged-targeting cursor. Available when the player's
+    /// wielded item has a ranged profile (bow / crossbow). The cursor
+    /// commits to a shot via A; cancel via B. Execution lives in main.rs
+    /// — the verb itself just signals "open targeting mode."
+    Aim,
 }
 
 impl ActionId {
@@ -131,6 +136,11 @@ impl ActionId {
             ActionId::DigFern => 6_000,
             ActionId::CutGorse => 12_000,
             ActionId::CutBracken => 2_000,
+            // Aim itself is free — opening the targeting cursor doesn't
+            // advance the clock. The shot fires from the cursor's
+            // commit path (`World::perform_ranged_attack`), which
+            // charges the bow's `RangedProfile.move_cost`.
+            ActionId::Aim => 0,
         }
     }
 
@@ -164,6 +174,7 @@ impl ActionId {
             ActionId::DigFern => "dig_fern",
             ActionId::CutGorse => "cut_gorse",
             ActionId::CutBracken => "cut_bracken",
+            ActionId::Aim => "aim",
         }
     }
 
@@ -194,6 +205,7 @@ impl ActionId {
             "dig_fern" => ActionId::DigFern,
             "cut_gorse" => ActionId::CutGorse,
             "cut_bracken" => ActionId::CutBracken,
+            "aim" => ActionId::Aim,
             _ => return None,
         })
     }
@@ -309,6 +321,11 @@ pub const ALL_ACTIONS: &[ContextAction] = &[
         name: "Cut bracken",
         description: "Cut bracken straw for bedding (knife).",
     },
+    ContextAction {
+        id: ActionId::Aim,
+        name: "Aim",
+        description: "Raise your bow and pick a target.",
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -411,7 +428,31 @@ pub fn evaluate(world: &World, id: ActionId) -> Availability {
             HARVEST_REQUIRES_KNIFE,
             "no bracken adjacent",
         ),
+        ActionId::Aim => eval_aim(world),
     }
+}
+
+fn eval_aim(world: &World) -> Availability {
+    // Available iff the player is wielding a ranged weapon AND has at
+    // least one round of the matching ammo in pack.
+    use crate::items::ItemKind as IK;
+    let pack = world.player_pack();
+    let wielded = world
+        .player_main_hand_kind()
+        .and_then(|k| k.def().ranged.map(|r| (k, r)));
+    let Some((kind, ranged)) = wielded else {
+        return Availability::Unavailable { reason: "no ranged weapon equipped" };
+    };
+    let _ = kind;
+    if !ranged.ammo_kind.is_empty() {
+        let Some(ammo) = IK::from_save_key(ranged.ammo_kind) else {
+            return Availability::Unavailable { reason: "ammo kind unknown" };
+        };
+        if !pack.has_stack(ammo) {
+            return Availability::Unavailable { reason: "no ammo in pack" };
+        }
+    }
+    Availability::Available { cost_game_seconds: 0 }
 }
 
 /// Counts the materials reachable by a Fire Making attempt: the
@@ -550,10 +591,23 @@ fn eval_pickup(world: &World) -> Availability {
 #[derive(Debug)]
 pub enum ExecuteOutcome {
     /// The action ran; the inner message is suitable for log_info.
-    /// Slice 1 wires every verb so this is the only variant; future
-    /// failure modes (e.g. async/queued failure) can extend the enum
-    /// without touching the call sites' Done arm.
     Done(String),
+    /// The action wants to open the ranged-targeting cursor instead of
+    /// resolving immediately. Main.rs catches this and switches input
+    /// mode; the actual shot resolution lives on the cursor's commit
+    /// path (`World::perform_ranged_attack`).
+    OpenAim,
+}
+
+impl ExecuteOutcome {
+    /// Convenience for callers that want the log message (or empty
+    /// string for non-Done outcomes).
+    pub fn message(&self) -> &str {
+        match self {
+            ExecuteOutcome::Done(s) => s.as_str(),
+            ExecuteOutcome::OpenAim => "",
+        }
+    }
 }
 
 pub fn execute(world: &mut World, id: ActionId) -> ExecuteOutcome {
@@ -629,6 +683,7 @@ pub fn execute(world: &mut World, id: ActionId) -> ExecuteOutcome {
         ActionId::DigFern => execute_dig_fern(world),
         ActionId::CutGorse => execute_cut_gorse(world),
         ActionId::CutBracken => execute_cut_bracken(world),
+        ActionId::Aim => ExecuteOutcome::OpenAim,
     }
 }
 
@@ -1810,6 +1865,7 @@ mod tests {
         let outcome = execute(&mut world, ActionId::CutFern);
         match outcome {
             ExecuteOutcome::Done(ref msg) => assert!(msg.contains("fern"), "got {:?}", msg),
+            other => panic!("expected Done, got {:?}", other),
         }
         // Decoration cleared.
         assert!(matches!(
@@ -1865,6 +1921,7 @@ mod tests {
         let outcome = execute(&mut world, ActionId::ChopTree);
         match outcome {
             ExecuteOutcome::Done(_) => {}
+            other => panic!("expected Done, got {:?}", other),
         }
         assert_eq!(world.tile_at(east_x as i64, east_y as i64), TerrainKind::BareDirt);
         let cell = world.cell_at(east_x as i64, east_y as i64).expect("cell");
