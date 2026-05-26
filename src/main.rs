@@ -1211,6 +1211,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let tint = brightness_at(world.clock_seconds);
         let player_skills = world.player_skills();
         let calendar_day = world.calendar_day;
+        let player_body = world.player_body();
         let mut ui_cells = build_ui_cells(
             &palette,
             needs,
@@ -1220,6 +1221,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             is_night,
             player_skills,
             calendar_day,
+            player_body,
         );
         draw_message_line(&mut ui_cells, &world, &palette);
         draw_here_line(&mut ui_cells, &world, &palette);
@@ -1759,6 +1761,7 @@ fn build_ui_cells(
     is_night: bool,
     skills: Skills,
     calendar_day: u32,
+    body: world::BodyParts,
 ) -> Vec<Option<Cell>> {
     let mut cells = vec![None; (WORLD_W * WORLD_H) as usize];
 
@@ -1832,10 +1835,47 @@ fn build_ui_cells(
         }
     }
 
-    // Row 2 left: Fire Making skill readout. Single-skill HUD for slice 1.
-    let fm = skills.get(SkillKind::FireMaking);
-    let line = format!("{} {}%", SkillKind::FireMaking.display_name(), fm.value);
-    put_text(&mut cells, 1, 2, &line, palette.hud_fg, palette.hud_bg);
+    // Row 2 left: vital-HP readout. With per-body-part HP, the single
+    // number that answers "am I about to die?" is the worst of the two
+    // vitals — head and torso. Limbs can cripple but won't kill. Show
+    // head + torso explicitly so the player sees both, color the line
+    // by the worst-percent of the two.
+    let head_pct = body.head.hp.max(0) as i32 * 100 / body.head.max.max(1) as i32;
+    let torso_pct = body.torso.hp.max(0) as i32 * 100 / body.torso.max.max(1) as i32;
+    let worst = head_pct.min(torso_pct);
+    let hp_fg = if worst <= 25 {
+        palette.need_critical_fg
+    } else if worst <= 50 {
+        Color::RGB(230, 200, 90)
+    } else {
+        palette.hud_fg
+    };
+    let hp_line = format!("HP H{} T{}", body.head.hp.max(0), body.torso.hp.max(0));
+    put_text(&mut cells, 1, 2, &hp_line, hp_fg, palette.hud_bg);
+
+    // Crippled-limb badge directly after HP (only shown when something
+    // is crippled). Phase-2 cripples drop a wielded weapon (arm) or
+    // halve speed (leg); a one-glance badge surfaces that state.
+    let mut crippled: Vec<&'static str> = Vec::new();
+    if body.l_arm.is_crippled() { crippled.push("L-arm"); }
+    if body.r_arm.is_crippled() { crippled.push("R-arm"); }
+    if body.l_leg.is_crippled() { crippled.push("L-leg"); }
+    if body.r_leg.is_crippled() { crippled.push("R-leg"); }
+    let after_hp_x = 1 + hp_line.len() as i32 + 2;
+    if !crippled.is_empty() {
+        let tag = format!("[{} crippled]", crippled.join(", "));
+        put_text(&mut cells, after_hp_x, 2, &tag, palette.need_critical_fg, palette.hud_bg);
+    }
+
+    // Row 2 also (right of HP): Fire Making readout abbreviated to FM
+    // so the HP indicator owns the leftmost slot. Hidden if the
+    // crippled badge would collide; the skill is always available in
+    // the Select info menu's Skills tab.
+    if crippled.is_empty() {
+        let fm = skills.get(SkillKind::FireMaking);
+        let line = format!("FM {}%", fm.value);
+        put_text(&mut cells, after_hp_x, 2, &line, palette.hud_fg, palette.hud_bg);
+    }
 
     cells
 }
@@ -1960,19 +2000,38 @@ fn grass_dot_visible(x: i32, y: i32, seed: u64) -> bool {
 ///
 /// Width budget: starts at col 1, ends before col 39. Truncates with
 /// `...` if the join overflows.
-/// Surface the most recent combat / interaction log entry one row
-/// above the here-line. Single line keeps the HUD light; phase-2+
-/// might split it into a scroll-back overlay.
+/// Surface the two most recent log entries on consecutive rows above
+/// the here-line. Two rows are enough that a single combat exchange
+/// (player swing + bandit reply) is fully visible without the second
+/// message swallowing the first. Older entries scroll off; a full
+/// scroll-back panel is a follow-up.
 fn draw_message_line(cells: &mut [Option<Cell>], world: &World, palette: &Palette) {
-    let Some(msg) = world.message_log.back() else { return };
-    let row = WORLD_H as i32 - 2;
-    let max = (WORLD_W as usize).saturating_sub(2);
-    let mut s = msg.clone();
-    if s.len() > max {
-        s.truncate(max.saturating_sub(3));
-        s.push_str("...");
+    let count = world.message_log.len();
+    if count == 0 {
+        return;
     }
-    put_text(cells, 1, row, &s, palette.hud_fg, palette.hud_bg);
+    let max = (WORLD_W as usize).saturating_sub(2);
+    let truncate = |s: &str| {
+        if s.len() <= max {
+            s.to_string()
+        } else {
+            let mut t = s.to_string();
+            t.truncate(max.saturating_sub(3));
+            t.push_str("...");
+            t
+        }
+    };
+    // Bottom row (just above the here-line) is the *newest* entry; the
+    // row above it is the previous entry (dimmed so the eye glides to
+    // the newest first). Reads top→bottom as "earlier, then now."
+    let newest = world.message_log.back().expect("count > 0");
+    let newest_row = WORLD_H as i32 - 2;
+    put_text(cells, 1, newest_row, &truncate(newest), palette.hud_fg, palette.hud_bg);
+    if count >= 2 {
+        let prev = &world.message_log[count - 2];
+        let prev_row = WORLD_H as i32 - 3;
+        put_text(cells, 1, prev_row, &truncate(prev), palette.panel_dim_fg, palette.hud_bg);
+    }
 }
 
 fn draw_here_line(cells: &mut [Option<Cell>], world: &World, palette: &Palette) {
