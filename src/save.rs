@@ -24,6 +24,12 @@
 // ground_cover (additive, ride this same bump). v1 saves are
 // friendly-rejected — no data migration. Players returning to the Holy
 // Land design check out the `holy-land-archive` git tag.
+//
+// Schema v3 (combat foundation): adds `player_health: Option<HealthSave>`
+// and `hostiles: Vec<HostileSave>` to RunSave. Both are additive with
+// `#[serde(default)]`; v2→v3 needs no migration code, just the header
+// version accepts both in `check_schema`. Older saves load with a
+// freshly-spawned bandit and the player at full HP.
 
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -33,7 +39,7 @@ use uuid::Uuid;
 
 use crate::calendar;
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SaveHeader {
@@ -146,6 +152,47 @@ pub struct RunSave {
     /// onto the same wilderness layout.
     #[serde(default = "default_world_seed")]
     pub seed: u64,
+    // Schema v3 (combat foundation): player HP + hostile entities.
+    // Both additive with serde defaults — v2 saves load with the
+    // player at full HP and the world's fresh-spawn bandit intact.
+    #[serde(default)]
+    pub player_health: Option<HealthSave>,
+    #[serde(default)]
+    pub hostiles: Vec<HostileSave>,
+}
+
+/// Single-pool combat health (phase 1). Phase 2's body-part split adds
+/// fields here additively; older saves load with hp == max.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct HealthSave {
+    #[serde(default)]
+    pub hp: i16,
+    #[serde(default)]
+    pub max: i16,
+}
+
+/// One hostile entity round-trip. `wielded_kind` is an `ItemKind`
+/// save_key string for forward-compat; unknown values drop the
+/// wielded weapon on load. `flavor` distinguishes future hostile types
+/// from the phase-1 Cornish bandit; unknown flavors load as bandit.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct HostileSave {
+    #[serde(default)]
+    pub x: i32,
+    #[serde(default)]
+    pub y: i32,
+    #[serde(default)]
+    pub hp: i16,
+    #[serde(default)]
+    pub max_hp: i16,
+    /// `ItemKind::save_key` string for the entity's wielded weapon.
+    /// Empty means unarmed.
+    #[serde(default)]
+    pub wielded_kind: String,
+    /// Flavor key, e.g. "cornish_bandit". Defaults to bandit on
+    /// unknown values (forward-compat).
+    #[serde(default)]
+    pub flavor: String,
 }
 
 /// Backwards-compat seed value matching `world::DEFAULT_SEED`. Used by
@@ -288,6 +335,8 @@ impl RunSave {
             tree_species_mutations: Vec::new(),
             decoration_mutations: Vec::new(),
             seed: DEFAULT_WORLD_SEED,
+            player_health: None,
+            hostiles: Vec::new(),
         }
     }
 }
@@ -411,7 +460,10 @@ const V1_FRIENDLY_REJECT_MSG: &str =
 
 fn check_schema(header: &SaveHeader) -> io::Result<()> {
     match header.schema_version {
-        SCHEMA_VERSION => Ok(()),
+        // v2 → v3 is purely additive (player_health + hostiles default
+        // via serde). Accept both; the next save re-headers the file to
+        // SCHEMA_VERSION so the v2 footprint vanishes over time.
+        2 | 3 => Ok(()),
         1 => Err(io::Error::new(io::ErrorKind::Other, V1_FRIENDLY_REJECT_MSG)),
         v if v < SCHEMA_VERSION => Err(io::Error::new(
             io::ErrorKind::Other,
@@ -535,6 +587,36 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_run_with_combat_state() {
+        let dir = std::env::temp_dir().join(format!("survival-combat-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("run.cbor");
+
+        let header = SaveHeader::fresh(None);
+        let mut run = RunSave::empty(header);
+        run.player_health = Some(HealthSave { hp: 42, max: 80 });
+        run.hostiles = vec![HostileSave {
+            x: 10,
+            y: 12,
+            hp: 65,
+            max_hp: 80,
+            wielded_kind: "spear".to_string(),
+            flavor: "cornish_bandit".to_string(),
+        }];
+        save_atomic(&path, &run).unwrap();
+
+        let loaded = load_run(&path).unwrap();
+        assert_eq!(loaded.player_health.map(|h| (h.hp, h.max)), Some((42, 80)));
+        assert_eq!(loaded.hostiles.len(), 1);
+        assert_eq!(loaded.hostiles[0].x, 10);
+        assert_eq!(loaded.hostiles[0].hp, 65);
+        assert_eq!(loaded.hostiles[0].wielded_kind, "spear");
+        assert_eq!(loaded.hostiles[0].flavor, "cornish_bandit");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn round_trip_run() {
         let dir = std::env::temp_dir().join(format!("survival-run-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
@@ -568,6 +650,8 @@ mod tests {
             tree_species_mutations: Vec::new(),
             decoration_mutations: Vec::new(),
             seed: 0xABCD_1234_5678_9ABC,
+            player_health: None,
+            hostiles: Vec::new(),
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
@@ -664,6 +748,8 @@ mod tests {
             tree_species_mutations: Vec::new(),
             decoration_mutations: Vec::new(),
             seed: DEFAULT_WORLD_SEED,
+            player_health: None,
+            hostiles: Vec::new(),
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();

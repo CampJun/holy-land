@@ -479,6 +479,136 @@ impl Default for Speed {
     }
 }
 
+/// Combat health. Phase-1 vertical slice is a single pool; phase 2
+/// splits it into per-body-part HP per `Survival - Combat - Damage
+/// math and hit roll.md`. Saturating at i16 keeps headroom for the
+/// overflow-spills-to-torso math when body parts land.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Health {
+    pub hp: i16,
+    pub max: i16,
+}
+
+impl Health {
+    /// Player baseline. Matches the torso scale on the cards so phase
+    /// 2's body-part struct can swap in without a visible HP jump.
+    pub fn starting_player() -> Self {
+        Self { hp: 80, max: 80 }
+    }
+
+    /// Cornish bandit baseline (Yeoman tier).
+    pub fn starting_bandit() -> Self {
+        Self { hp: 80, max: 80 }
+    }
+}
+
+/// Tag — drives the AI scan and the bump-attack branch. A friendly NPC
+/// with the same loadout would lack this tag.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Hostile;
+
+/// Behavior selector for hostile NPCs. Phase 1 has the one variant
+/// described in `Bestiary slice 1.md` (chase + bump).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AiKind {
+    ChaseAndBump,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Ai(pub AiKind);
+
+/// What this actor is swinging. Phase 1 reuses `ItemKind`; phase 3
+/// lifts weapon stats onto `ItemDef` so this stays the right shape.
+/// Not serde-derived because `ItemKind` round-trips via `save_key()`
+/// strings; the save layer projects this manually.
+#[derive(Clone, Copy, Debug)]
+pub struct Wielded(pub crate::items::ItemKind);
+
+/// Marker for the Cornish bandit entity flavor — picks the glyph in
+/// `render_entities` and the death-cause string. Phase 3+ folds this
+/// into a richer NPC-flavor tag.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct CornishBandit;
+
+/// Topmost non-player entity glyph + fg at a world cell, if any.
+/// Used by the render loop to paint hostiles on their tile. Returned
+/// as a tuple (not Renderable) to keep the SDL color conversion in
+/// main.rs's render path where the rest of the palette work lives.
+pub fn entity_glyph_at(world: &World, wx: i32, wy: i32) -> Option<(u8, [u8; 3])> {
+    for (e, (pos, r)) in world.ecs.query::<(&Position, &Renderable)>().iter() {
+        if e == world.player {
+            continue;
+        }
+        if pos.x == wx && pos.y == wy {
+            return Some((r.glyph, [r.fg[0], r.fg[1], r.fg[2]]));
+        }
+    }
+    None
+}
+
+/// Spawn one Cornish bandit at `pos`. Phase 1 hardcodes the loadout
+/// (always spear); phase 3 wires the Yeoman tier roll table from
+/// `Status armament tiers.md`. Returns the new entity for callers that
+/// want to record its id (save load takes this branch).
+pub fn spawn_cornish_bandit(ecs: &mut Ecs, pos: Position) -> Entity {
+    ecs.spawn((
+        pos,
+        Renderable {
+            glyph: b'b',
+            fg: [210, 80, 70, 255],
+            bg: [20, 17, 13, 255],
+        },
+        Speed::default(),
+        Health::starting_bandit(),
+        Hostile,
+        Ai(AiKind::ChaseAndBump),
+        CornishBandit,
+        Wielded(crate::items::ItemKind::Spear),
+        CombatSkills::starting_bandit(),
+    ))
+}
+
+/// Combat skill block carried on every combatant. Slice-1 hardcodes
+/// these; phase 3 hooks them up to the Skills XP cluster proper.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct CombatSkills {
+    pub melee: i16,
+    pub dodge: i16,
+    /// Stand-in for the per-weapon proficiency the phase-3 card unlocks.
+    pub weapon_prof: i16,
+    pub str_bonus: i16,
+    pub agi_mod: i16,
+    pub encumbrance: i16,
+}
+
+impl CombatSkills {
+    /// Rabble-tier player baseline.
+    pub fn starting_player() -> Self {
+        Self {
+            melee: 15,
+            dodge: 10,
+            weapon_prof: 5,
+            str_bonus: 1,
+            agi_mod: 1,
+            encumbrance: 0,
+        }
+    }
+
+    /// Yeoman-tier Cornish bandit.
+    pub fn starting_bandit() -> Self {
+        Self {
+            melee: 20,
+            dodge: 12,
+            weapon_prof: 5,
+            str_bonus: 1,
+            agi_mod: 0,
+            // Padded doublet costs a couple Dodge points; phase 2 will
+            // compute this from per-piece encumbrance.
+            encumbrance: 2,
+        }
+    }
+}
+
 pub struct World {
     /// Chunk store keyed on grid coords. Outside this module, prefer the
     /// `tile_at` / `cell_at` / `cell_at_mut` / `snapshot_*` accessor
@@ -536,6 +666,15 @@ pub struct World {
     /// hunger / sleep / warmth stay pinned at their current values.
     /// Transient — not saved; cleared on World::new and a fresh boot.
     pub godmode: bool,
+    /// Most-recent combat / interaction messages. Capped at
+    /// `MAX_MESSAGE_LOG`; the renderer surfaces the last entry just
+    /// above the here-line. Transient — not saved (the log file is
+    /// the durable record).
+    pub message_log: VecDeque<String>,
+    /// Set whenever a player-vs-hostile resolution leaves the player
+    /// at 0 HP. main.rs reads this each frame for the death overlay
+    /// alongside the existing needs-based gate. Cleared on new-run.
+    pub player_killed_by_combat: bool,
 }
 
 /// Outcome of one `tick_fast_travel` call. The main loop matches on
@@ -652,7 +791,19 @@ impl World {
             Needs::starting(),
             Skills::starting(),
             Speed::default(),
+            Health::starting_player(),
+            CombatSkills::starting_player(),
+            // Rabble-tier player wields a knife (the cards' "dagger")
+            // off the starting pack. The pack copy stays put so the
+            // player can also Drop / inspect it; phase 3's Equip verb
+            // makes this a real bind.
+            Wielded(crate::items::ItemKind::Knife),
         ));
+
+        // Bandit spawn intentionally NOT here — main.rs's fresh-run
+        // init places one Cornish bandit near the player. Keeping
+        // World::new entity-clean lets the unit tests reason about
+        // movement / needs / clock without combat interference.
 
         let mut world = Self {
             chunks,
@@ -668,11 +819,32 @@ impl World {
             decoration_mutations: HashMap::new(),
             fast_travel: None,
             godmode: false,
+            message_log: VecDeque::new(),
+            player_killed_by_combat: false,
         };
         // First-frame FOV so the renderer doesn't draw a black screen on
         // the very first paint.
         world.recompute_fov();
         world
+    }
+
+    /// Cap on the in-game message ring buffer. Sized for the single-
+    /// line HUD surface; bumping this just keeps more history (the UI
+    /// only shows the latest).
+    pub const MAX_MESSAGE_LOG: usize = 8;
+
+    /// Append a one-line message to the in-game log. The frame loop
+    /// surfaces the newest entry above the here-line; older entries
+    /// stay around for a future scrollback panel.
+    pub fn push_message(&mut self, msg: impl Into<String>) {
+        let s = msg.into();
+        // Mirror to the disk log so we have a durable trail of fights
+        // even without scrollback.
+        crate::log_info!("[combat] {}", s);
+        self.message_log.push_back(s);
+        while self.message_log.len() > Self::MAX_MESSAGE_LOG {
+            self.message_log.pop_front();
+        }
     }
 
     fn chunk_coord_for(wx: i64, wy: i64) -> (ChunkCoord, u32, u32) {
@@ -961,6 +1133,16 @@ impl World {
         // move would be rejected.
         let (target_cc, _, _) = Self::chunk_coord_for(nx as i64, ny as i64);
         self.ensure_chunk_ring(target_cc);
+        // Bump-attack: if a hostile occupies the destination cell, swing
+        // at it instead of moving. The action-economy clock advances by
+        // the weapon's swing cost (not the tile move-cost) so a fast
+        // dagger user attacks more often than they'd walk. After the
+        // swing, the hostile AI gets a chance to retaliate.
+        if let Some(target) = self.find_hostile_at(nx, ny) {
+            self.perform_melee_attack(self.player, target);
+            self.tick_hostiles();
+            return;
+        }
         // Godmode walks through trees / water / gorse. The OOB-Wall
         // fallback still applies (you can't stand outside a loaded
         // chunk's bounds) — ensure_chunk_ring above already loaded the
@@ -969,7 +1151,23 @@ impl World {
             self.set_player_pos(Position { x: nx, y: ny });
             self.spend_moves(MOVE_COST_TILE);
             self.recompute_fov();
+            // After the player moves, any hostile in the chunk gets a
+            // turn. Phase 1 wakes hostiles via player-action ticks (no
+            // free-running schedulr yet); phase 2's accumulator gets
+            // proper CDDA speed-based interleaving.
+            self.tick_hostiles();
         }
+    }
+
+    /// First hostile entity standing on `(x, y)`, if any. Used by the
+    /// bump-attack branch; phase 1's only hostile is the Cornish bandit.
+    fn find_hostile_at(&self, x: i32, y: i32) -> Option<Entity> {
+        for (e, (pos, _h)) in self.ecs.query::<(&Position, &Hostile)>().iter() {
+            if pos.x == x && pos.y == y {
+                return Some(e);
+            }
+        }
+        None
     }
 
     pub fn player_needs(&self) -> Needs {
@@ -998,6 +1196,105 @@ impl World {
             .ecs
             .get::<&mut Skills>(self.player)
             .expect("player has Skills") = skills;
+    }
+
+    /// Read the player's current `Health` for save serialization.
+    pub fn player_health(&self) -> Health {
+        self.ecs
+            .get::<&Health>(self.player)
+            .map(|h| *h)
+            .unwrap_or_else(|_| Health::starting_player())
+    }
+
+    /// Restore the player's `Health` from a save (or any future
+    /// regen/heal verb). No-op if the player entity lacks the
+    /// component (forward-compat).
+    pub fn set_player_health(&mut self, h: Health) {
+        if let Ok(mut hp) = self.ecs.get::<&mut Health>(self.player) {
+            *hp = h;
+        }
+    }
+
+    /// True if the world currently has any `Hostile` entity. Used by
+    /// the main-loop fresh-game init to decide whether to drop a
+    /// starter bandit (skip if a v3 save already restored them).
+    pub fn has_any_hostile(&self) -> bool {
+        self.ecs.query::<&Hostile>().iter().next().is_some()
+    }
+
+    /// Spawn one Cornish bandit a few tiles east of the player. The
+    /// bestiary card explicitly calls this out as the phase-1 first-
+    /// encounter target. Idempotent only via the caller's
+    /// `has_any_hostile()` guard.
+    pub fn spawn_starter_bandit(&mut self) {
+        let p = self.player_pos();
+        let mut pos = Position { x: p.x + 5, y: p.y };
+        // Walk a couple of cells until we land somewhere walkable —
+        // the spawn cell can land on a tree or stream depending on
+        // chunk seed.
+        for dx in 5..15 {
+            let candidate = Position { x: p.x + dx, y: p.y };
+            if self.cell_walkable_at(candidate.x as i64, candidate.y as i64) {
+                pos = candidate;
+                break;
+            }
+        }
+        spawn_cornish_bandit(&mut self.ecs, pos);
+    }
+
+    /// Snapshot every hostile entity for save serialization. Returns
+    /// (position, health, wielded ItemKind, flavor key). Phase 1 only
+    /// emits "cornish_bandit" but the flavor field is stringly-typed
+    /// so future hostiles fit without a schema bump.
+    pub fn snapshot_hostiles(&self) -> Vec<(Position, Health, Option<crate::items::ItemKind>, &'static str)> {
+        let mut out = Vec::new();
+        for (e, (pos, _h)) in self.ecs.query::<(&Position, &Hostile)>().iter() {
+            let health = self
+                .ecs
+                .get::<&Health>(e)
+                .map(|h| *h)
+                .unwrap_or_else(|_| Health::starting_bandit());
+            let wielded = self.ecs.get::<&Wielded>(e).ok().map(|w| w.0);
+            let flavor = if self.ecs.satisfies::<&CornishBandit>(e).unwrap_or(false) {
+                "cornish_bandit"
+            } else {
+                "unknown"
+            };
+            out.push((*pos, health, wielded, flavor));
+        }
+        out
+    }
+
+    /// Replace the world's hostile entities with the supplied snapshot.
+    /// Used by save load. Despawns all existing hostiles first so a
+    /// re-load doesn't double up the World::new spawn.
+    pub fn restore_hostiles<I>(&mut self, snapshot: I)
+    where
+        I: IntoIterator<Item = (Position, Health, Option<crate::items::ItemKind>, String)>,
+    {
+        let existing: Vec<Entity> = self
+            .ecs
+            .query::<&Hostile>()
+            .iter()
+            .map(|(e, _)| e)
+            .collect();
+        for e in existing {
+            let _ = self.ecs.despawn(e);
+        }
+        for (pos, health, wielded, flavor) in snapshot {
+            // Phase-1 only supports the Cornish bandit flavor. Unknown
+            // flavors still spawn as bandits (forward-compat default).
+            let _ = flavor; // reserved for future dispatch
+            let entity = spawn_cornish_bandit(&mut self.ecs, pos);
+            if let Ok(mut h) = self.ecs.get::<&mut Health>(entity) {
+                *h = health;
+            }
+            if let Some(kind) = wielded {
+                if let Ok(mut w) = self.ecs.get::<&mut Wielded>(entity) {
+                    *w = Wielded(kind);
+                }
+            }
+        }
     }
 
     /// Read the player's current `Speed` (CDDA-style action-economy
@@ -1808,6 +2105,216 @@ impl World {
             self.ensure_chunk_loaded(cc);
             if let Some(c) = self.cell_at_mut(wx as i64, wy as i64) {
                 c.items = items;
+            }
+        }
+    }
+
+    // ---- Combat resolution -----------------------------------------
+    //
+    // Phase-1 vertical slice. `try_move_player` invokes
+    // `perform_melee_attack` on bump; after a player swing or move,
+    // `tick_hostiles` walks every Hostile entity once. Hits route
+    // through `apply_damage`; entities at 0 HP route to `on_death`,
+    // which drops the wielded weapon and despawns.
+
+    /// Run one melee swing from `attacker` against `target`. Spends the
+    /// weapon's swing cost on the attacker if it's the player (NPCs
+    /// don't share the player's clock yet — that's a phase-2 concern).
+    /// Logs hit/miss/kill via `push_message`.
+    pub fn perform_melee_attack(&mut self, attacker: Entity, target: Entity) {
+        let Some((atk_stats, weapon_kind)) = self.attacker_loadout(attacker) else {
+            return;
+        };
+        let def_stats = self.defender_stats(target);
+        let armor = self.defender_armor(target);
+        let weapon = match crate::combat::weapon_profile_for(weapon_kind) {
+            Some(w) => w,
+            None => return, // unarmored fist combat lands in phase 2
+        };
+        let outcome = crate::combat::resolve_hit(atk_stats, def_stats, weapon, &mut self.rng);
+        let weapon_label = weapon_kind.name();
+        let attacker_is_player = attacker == self.player;
+        let target_is_player = target == self.player;
+        match outcome {
+            crate::combat::HitOutcome::Miss => {
+                self.push_message(self.miss_line(attacker_is_player, target_is_player, weapon_label));
+            }
+            crate::combat::HitOutcome::Hit { .. } | crate::combat::HitOutcome::Crit { .. } => {
+                let crit = outcome.is_crit();
+                let dmg = crate::combat::roll_damage(weapon, atk_stats, armor, crit, &mut self.rng);
+                let total = dmg.total();
+                self.push_message(self.hit_line(
+                    attacker_is_player,
+                    target_is_player,
+                    weapon_label,
+                    total,
+                    crit,
+                ));
+                self.apply_damage(target, dmg);
+            }
+        }
+        // Attacker swing cost. Only spent on the player's clock — hostile
+        // swings are free in phase 1 (their AI tick is gated on the
+        // player taking an action, which already cost real time).
+        if attacker_is_player {
+            self.spend_moves(weapon.move_cost);
+        }
+    }
+
+    fn attacker_loadout(&self, e: Entity) -> Option<(crate::combat::AttackerStats, crate::items::ItemKind)> {
+        let wielded = self.ecs.get::<&Wielded>(e).ok()?;
+        let skills = self.ecs.get::<&CombatSkills>(e).ok()?;
+        Some((
+            crate::combat::AttackerStats {
+                melee_skill: skills.melee,
+                weapon_prof: skills.weapon_prof,
+                agi_mod: skills.agi_mod,
+                str_bonus: skills.str_bonus,
+            },
+            wielded.0,
+        ))
+    }
+
+    fn defender_stats(&self, e: Entity) -> crate::combat::DefenderStats {
+        let Ok(skills) = self.ecs.get::<&CombatSkills>(e) else {
+            return crate::combat::DefenderStats::default();
+        };
+        crate::combat::DefenderStats {
+            dodge_skill: skills.dodge,
+            agi_mod: skills.agi_mod,
+            encumbrance: skills.encumbrance,
+        }
+    }
+
+    fn defender_armor(&self, e: Entity) -> crate::combat::ArmorDr {
+        // Phase 1 hardcodes: only the bandit has armor (padded doublet);
+        // the player is Rabble tier and runs naked. Phase 2 walks
+        // per-piece armor on equip slots.
+        if self.ecs.satisfies::<&CornishBandit>(e).unwrap_or(false) {
+            crate::combat::padded_doublet_dr()
+        } else {
+            crate::combat::unarmored()
+        }
+    }
+
+    fn miss_line(&self, attacker_is_player: bool, target_is_player: bool, weapon: &str) -> String {
+        match (attacker_is_player, target_is_player) {
+            (true, _) => format!("You swing your {} but miss.", weapon),
+            (_, true) => format!("The bandit's {} swings wide.", weapon),
+            _ => format!("A {} swing misses.", weapon),
+        }
+    }
+
+    fn hit_line(
+        &self,
+        attacker_is_player: bool,
+        target_is_player: bool,
+        weapon: &str,
+        dmg: u16,
+        crit: bool,
+    ) -> String {
+        let bang = if crit { "CRIT — " } else { "" };
+        match (attacker_is_player, target_is_player) {
+            (true, _) => format!("{}You strike the bandit with your {} ({} dmg).", bang, weapon, dmg),
+            (_, true) => format!("{}The bandit's {} bites you ({} dmg).", bang, weapon, dmg),
+            _ => format!("{}A {} strike lands ({} dmg).", bang, weapon, dmg),
+        }
+    }
+
+    fn apply_damage(&mut self, target: Entity, dmg: crate::combat::DamageTriplet) {
+        let total = dmg.total() as i16;
+        let died;
+        {
+            let Ok(mut h) = self.ecs.get::<&mut Health>(target) else { return; };
+            h.hp = h.hp.saturating_sub(total);
+            died = h.hp <= 0;
+        }
+        if died {
+            self.on_death(target);
+        }
+    }
+
+    fn on_death(&mut self, e: Entity) {
+        // Snapshot what we need before despawning so the borrow checker
+        // is happy and we can do the cell-items mutation cleanly.
+        let pos = match self.ecs.get::<&Position>(e) {
+            Ok(p) => *p,
+            Err(_) => return,
+        };
+        let wielded = self.ecs.get::<&Wielded>(e).ok().map(|w| w.0);
+        let is_player = e == self.player;
+        let is_bandit = self.ecs.satisfies::<&CornishBandit>(e).unwrap_or(false);
+        if is_player {
+            // Defer the actual game-over UI to main.rs's existing death
+            // screen; just raise the flag and log a final line.
+            self.player_killed_by_combat = true;
+            self.push_message("You die.".to_string());
+            return;
+        }
+        // Drop the wielded weapon at the death cell so the player can
+        // loot it. Cell-items append (not replace) to preserve any
+        // ground items already there. Phase 3 extends to the full
+        // loadout once equipment slots exist.
+        if let Some(kind) = wielded {
+            let instance = kind.make_default_instance(1);
+            if let Some(cell) = self.cell_at_mut(pos.x as i64, pos.y as i64) {
+                cell.items.push(instance);
+            }
+        }
+        if is_bandit {
+            self.push_message("You slay the bandit.".to_string());
+        } else {
+            self.push_message("It dies.".to_string());
+        }
+        let _ = self.ecs.despawn(e);
+    }
+
+    /// Walk every hostile entity once; chase + bump per
+    /// `Bestiary slice 1.md`. Phase 1 keeps it strictly turn-based
+    /// (one swing per hostile per player action); the CDDA speed
+    /// accumulator lands in phase 2 alongside body parts.
+    pub fn tick_hostiles(&mut self) {
+        if self.player_killed_by_combat {
+            return;
+        }
+        let player_pos = self.player_pos();
+        let hostiles: Vec<Entity> = self
+            .ecs
+            .query::<(&Hostile, &Position)>()
+            .iter()
+            .map(|(e, _)| e)
+            .collect();
+        for e in hostiles {
+            // Re-check Position each loop in case a prior tick despawned
+            // someone (not currently possible — hostiles don't fight each
+            // other — but cheap insurance).
+            let Ok(pos_ref) = self.ecs.get::<&Position>(e) else { continue };
+            let pos = *pos_ref;
+            drop(pos_ref);
+            let dx = (player_pos.x - pos.x).signum();
+            let dy = (player_pos.y - pos.y).signum();
+            let adjacent =
+                (player_pos.x - pos.x).abs() <= 1 && (player_pos.y - pos.y).abs() <= 1;
+            if adjacent {
+                self.perform_melee_attack(e, self.player);
+                if self.player_killed_by_combat {
+                    return;
+                }
+            } else {
+                // Step toward the player; greedy chase good enough for
+                // a single open chunk. Phase 2 can swap to A* once
+                // obstacles matter.
+                let nx = pos.x + dx;
+                let ny = pos.y + dy;
+                if self.cell_walkable_at(nx as i64, ny as i64)
+                    && self.find_hostile_at(nx, ny).is_none()
+                    && !(nx == player_pos.x && ny == player_pos.y)
+                {
+                    if let Ok(mut p) = self.ecs.get::<&mut Position>(e) {
+                        p.x = nx;
+                        p.y = ny;
+                    }
+                }
             }
         }
     }

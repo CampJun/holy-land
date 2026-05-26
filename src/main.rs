@@ -1,6 +1,7 @@
 mod action;
 mod calendar;
 mod chunkgen;
+mod combat;
 mod cornwall;
 mod crafting;
 #[cfg(not(target_arch = "arm"))]
@@ -133,6 +134,7 @@ enum DeathCause {
     Hunger,
     Cold,
     Exhaustion,
+    Combat,
 }
 
 impl DeathCause {
@@ -156,6 +158,7 @@ impl DeathCause {
             Self::Hunger => "You died of starvation.",
             Self::Cold => "You froze to death.",
             Self::Exhaustion => "You died of exhaustion.",
+            Self::Combat => "Slain by a bandit.",
         }
     }
 }
@@ -412,6 +415,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // field existed default to BASELINE via #[serde(default)], so
         // loading is a one-liner — no zero-guard needed.
         world.set_player_speed(run.speed);
+        // Schema v3 combat: restore player HP + hostile entities. A v2
+        // save has player_health == None and hostiles == empty, so the
+        // World::new defaults stand (player at full HP, one fresh
+        // bandit spawn). v3+ overrides with the saved values.
+        if let Some(ph) = run.player_health {
+            if ph.max > 0 {
+                world.set_player_health(world::Health { hp: ph.hp, max: ph.max });
+            }
+        }
+        if !run.hostiles.is_empty() {
+            let restored: Vec<(world::Position, world::Health, Option<items::ItemKind>, String)> =
+                run.hostiles
+                    .iter()
+                    .map(|h| {
+                        let wielded = if h.wielded_kind.is_empty() {
+                            None
+                        } else {
+                            items::ItemKind::from_save_key(&h.wielded_kind)
+                        };
+                        (
+                            world::Position { x: h.x, y: h.y },
+                            world::Health {
+                                hp: h.hp,
+                                max: if h.max_hp > 0 { h.max_hp } else { h.hp.max(1) },
+                            },
+                            wielded,
+                            h.flavor.clone(),
+                        )
+                    })
+                    .collect();
+            world.restore_hostiles(restored);
+        }
         // Phase-11b: restore terrain mutations (chopped trees, etc.)
         // after chunkgen has produced the chunk defaults.
         if !run.terrain_mutations.is_empty() {
@@ -458,6 +493,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // correct for the loaded clock + player coord. (World::new already
         // did a recompute, but the loaded position may differ.)
         world.recompute_fov();
+    }
+
+    // First-encounter bandit. Drops in on a fresh run AND on v2 saves
+    // that predate the hostile-save field — both leave `has_any_hostile`
+    // false. v3+ saves with hostiles restored skip this.
+    if !world.has_any_hostile() {
+        world.spawn_starter_bandit();
     }
 
     // Track dawn crossings for auto-save-on-dawn. Init from the (possibly
@@ -652,6 +694,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Action::A => {
                         let _ = std::fs::remove_file(save_dir.join(RUN_FILE));
                         world = World::new(WORLD_W, WORLD_H);
+                        world.spawn_starter_bandit();
                         prev_run_header = None;
                         last_dawn_idx = dawns_elapsed(world.clock_seconds);
                         command_menu = None;
@@ -697,6 +740,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let _ = std::fs::remove_file(save_dir.join(META_FILE));
                                 let _ = std::fs::remove_file(save_dir.join(RUN_FILE));
                                 world = World::new(WORLD_W, WORLD_H);
+                                world.spawn_starter_bandit();
                                 meta = MetaSave::empty(SaveHeader::fresh(None));
                                 prev_meta_header = meta.header.clone();
                                 prev_run_header = None;
@@ -1024,6 +1068,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = std::fs::remove_file(save_dir.join(RUN_FILE));
                 world = World::with_seed(WORLD_W, WORLD_H, new_seed);
                 world.ensure_player_ring();
+                world.spawn_starter_bandit();
                 world.recompute_fov();
                 prev_run_header = None;
                 command_menu = None;
@@ -1041,16 +1086,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // pitch-tent banner.
         if dead.is_none() {
             let needs_now = world.player_needs();
-            if needs_now.is_dead() {
-                if let Some(cause) = DeathCause::from_needs(&needs_now) {
-                    if world.active_action.is_some() {
-                        world.cancel_multi_turn();
-                    }
-                    command_menu = None;
-                    info_menu = None;
-                    log_info!("[death] {:?}", cause);
-                    dead = Some(cause);
+            let combat_kill = world.player_killed_by_combat;
+            let needs_cause = if needs_now.is_dead() {
+                DeathCause::from_needs(&needs_now)
+            } else {
+                None
+            };
+            // Combat kill takes priority over needs decay so the right
+            // epitaph shows when a bandit finishes a thirsty player.
+            let cause = if combat_kill {
+                Some(DeathCause::Combat)
+            } else {
+                needs_cause
+            };
+            if let Some(cause) = cause {
+                if world.active_action.is_some() {
+                    world.cancel_multi_turn();
                 }
+                command_menu = None;
+                info_menu = None;
+                log_info!("[death] {:?}", cause);
+                dead = Some(cause);
             }
         }
 
@@ -1124,6 +1180,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             player_skills,
             calendar_day,
         );
+        draw_message_line(&mut ui_cells, &world, &palette);
         draw_here_line(&mut ui_cells, &world, &palette);
         if let Some(active) = world.active_action.as_ref() {
             draw_multi_turn_banner(&mut ui_cells, active, &palette);
@@ -1289,6 +1346,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             Color::RGB(r, gn, b)
                         };
+                    }
+                    // Non-player entities (bandits etc.) render above
+                    // ground items but below the player @ — so a bandit
+                    // standing on a dropped spear shows the bandit, but
+                    // if the player and a bandit ever overlap (death
+                    // tile) the @ wins.
+                    if let Some((g, ec)) = world::entity_glyph_at(&world, wx as i32, wy as i32) {
+                        glyph = g;
+                        fg = Color::RGB(ec[0], ec[1], ec[2]);
                     }
                     if wx == pwx && wy == pwy {
                         glyph = b'@';
@@ -1509,6 +1575,23 @@ fn save_game(
             x,
             y,
             decoration: d,
+        })
+        .collect();
+    let player_hp = world.player_health();
+    run.player_health = Some(save::HealthSave {
+        hp: player_hp.hp,
+        max: player_hp.max,
+    });
+    run.hostiles = world
+        .snapshot_hostiles()
+        .into_iter()
+        .map(|(pos, hp, wielded, flavor)| save::HostileSave {
+            x: pos.x,
+            y: pos.y,
+            hp: hp.hp,
+            max_hp: hp.max,
+            wielded_kind: wielded.map(|k| k.save_key().to_string()).unwrap_or_default(),
+            flavor: flavor.to_string(),
         })
         .collect();
     run.active_action = world.active_action.as_ref().map(|active| ActiveActionSave {
@@ -1762,6 +1845,21 @@ fn grass_dot_visible(x: i32, y: i32, seed: u64) -> bool {
 ///
 /// Width budget: starts at col 1, ends before col 39. Truncates with
 /// `...` if the join overflows.
+/// Surface the most recent combat / interaction log entry one row
+/// above the here-line. Single line keeps the HUD light; phase-2+
+/// might split it into a scroll-back overlay.
+fn draw_message_line(cells: &mut [Option<Cell>], world: &World, palette: &Palette) {
+    let Some(msg) = world.message_log.back() else { return };
+    let row = WORLD_H as i32 - 2;
+    let max = (WORLD_W as usize).saturating_sub(2);
+    let mut s = msg.clone();
+    if s.len() > max {
+        s.truncate(max.saturating_sub(3));
+        s.push_str("...");
+    }
+    put_text(cells, 1, row, &s, palette.hud_fg, palette.hud_bg);
+}
+
 fn draw_here_line(cells: &mut [Option<Cell>], world: &World, palette: &Palette) {
     let row = WORLD_H as i32 - 1;
     // Godmode badge — render flush-right so it doesn't collide with

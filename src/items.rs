@@ -52,6 +52,10 @@ pub enum ItemKind {
     Hazelnut,
     Acorn,
     RowanBerry,
+    /// Two-handed thrusting weapon. Yeoman-tier main_hand for the
+    /// Cornish bandit (50% of rolls per `Bestiary slice 1.md`).
+    /// Combat profile lives in `combat::weapon_profile_for`.
+    Spear,
 }
 
 /// All per-kind metadata in one place. Adding a new `ItemKind` variant is
@@ -108,6 +112,7 @@ const ALL_KINDS: &[ItemKind] = &[
     ItemKind::Hazelnut,
     ItemKind::Acorn,
     ItemKind::RowanBerry,
+    ItemKind::Spear,
 ];
 
 impl ItemKind {
@@ -382,6 +387,15 @@ impl ItemKind {
                 glyph: 0xFA,
                 color: [200, 70, 50],
                 default_weight_g: 10,
+                blends_with_terrain: false,
+            },
+            ItemKind::Spear => ItemDef {
+                save_key: "spear",
+                name: "spear",
+                is_fungible: false,
+                glyph: b'/',
+                color: [170, 140, 90],
+                default_weight_g: 1_800,
                 blends_with_terrain: false,
             },
         }
