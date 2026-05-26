@@ -1547,9 +1547,32 @@ impl World {
         // dagger user attacks more often than they'd walk. After the
         // swing, the hostile AI gets a chance to retaliate.
         if let Some(target) = self.find_hostile_at(nx, ny) {
-            self.perform_melee_attack(self.player, target);
+            self.perform_melee_attack(self.player, target, 1);
             self.tick_hostiles();
             return;
+        }
+        // Reach-2 attack via the same movement key: if the player's
+        // wielded weapon has reach ≥ 2, the adjacent cell is empty,
+        // and a hostile sits one tile further along the same direction
+        // with line-of-sight, swing at the far hostile instead of
+        // moving. This makes the spear feel like a spear — first-strike
+        // a closing bandit rather than waiting for the bump.
+        if let Some(weapon) = self.player_wielded_profile() {
+            if weapon.reach >= 2 {
+                let fx = pos.x + dx * 2;
+                let fy = pos.y + dy * 2;
+                // Intermediate cell (the adjacent square between us and
+                // the target) must not block sight. Walls, trees, and
+                // gorse all block per `cell_blocks_sight_at`.
+                let intermediate_clear = !self.cell_blocks_sight_at(nx as i64, ny as i64);
+                if intermediate_clear {
+                    if let Some(target) = self.find_hostile_at(fx, fy) {
+                        self.perform_melee_attack(self.player, target, 2);
+                        self.tick_hostiles();
+                        return;
+                    }
+                }
+            }
         }
         // Godmode walks through trees / water / gorse. The OOB-Wall
         // fallback still applies (you can't stand outside a loaded
@@ -1561,10 +1584,18 @@ impl World {
             self.recompute_fov();
             // After the player moves, any hostile in the chunk gets a
             // turn. Phase 1 wakes hostiles via player-action ticks (no
-            // free-running schedulr yet); phase 2's accumulator gets
+            // free-running scheduler yet); phase 2's accumulator gets
             // proper CDDA speed-based interleaving.
             self.tick_hostiles();
         }
+    }
+
+    /// Player's currently-wielded weapon profile, if any. Used by the
+    /// reach-attack branch and any future "what can I swing right now"
+    /// query.
+    fn player_wielded_profile(&self) -> Option<crate::combat::WeaponProfile> {
+        let kind = self.ecs.get::<&Wielded>(self.player).ok().map(|w| w.0)?;
+        crate::combat::weapon_profile_for(kind)
     }
 
     /// First hostile entity standing on `(x, y)`, if any. Used by the
@@ -2573,11 +2604,13 @@ impl World {
     // through `apply_damage`; entities at 0 HP route to `on_death`,
     // which drops the wielded weapon and despawns.
 
-    /// Run one melee swing from `attacker` against `target`. Spends the
-    /// weapon's swing cost on the attacker if it's the player (NPCs
-    /// don't share the player's clock yet — that's a phase-2 concern).
-    /// Logs hit/miss/kill via `push_message`.
-    pub fn perform_melee_attack(&mut self, attacker: Entity, target: Entity) {
+    /// Run one melee swing from `attacker` against `target`. `range` is
+    /// the Chebyshev distance between the two (1 = adjacent, 2 = reach).
+    /// A reach-≥2 weapon used at range 1 takes the no-reach damage
+    /// penalty per `Reach and ranged.md`. Spends the weapon's swing
+    /// cost on the player's clock; hostile swings are free in the
+    /// phase-1 turn-by-turn loop.
+    pub fn perform_melee_attack(&mut self, attacker: Entity, target: Entity, range: u8) {
         let Some((atk_stats, weapon_kind)) = self.attacker_loadout(attacker) else {
             return;
         };
@@ -2596,16 +2629,22 @@ impl World {
             }
             crate::combat::HitOutcome::Hit { .. } | crate::combat::HitOutcome::Crit { .. } => {
                 let crit = outcome.is_crit();
-                // Phase 2 body-part roll. Crit lets the attacker pick a
-                // weighted part (CDDA-style "you swing for the head");
-                // for phase 2 we keep it random even on crit — the
-                // aimed-shot UI lands with the verb in a later phase.
                 let part = crate::combat::roll_body_part(&mut self.rng);
-                // Walk layered armor pieces covering this part: each
-                // rolls 1d100 ≤ coverage_pct; if it catches, its DR
-                // contributes to the post-layering subtraction.
                 let armor = self.layered_dr_for(target, part);
-                let dmg = crate::combat::roll_damage(weapon, atk_stats, armor, crit, &mut self.rng);
+                // No-reach penalty: reach-2 swung at adjacent loses 30%.
+                let situational_pct = if weapon.reach >= 2 && range == 1 {
+                    crate::combat::NO_REACH_DAMAGE_PCT
+                } else {
+                    100
+                };
+                let dmg = crate::combat::roll_damage_with_mult(
+                    weapon,
+                    atk_stats,
+                    armor,
+                    crit,
+                    situational_pct,
+                    &mut self.rng,
+                );
                 let total = dmg.total();
                 self.push_message(self.hit_line(
                     attacker_is_player,
@@ -2618,9 +2657,6 @@ impl World {
                 self.apply_damage_to_part(target, part, dmg);
             }
         }
-        // Attacker swing cost. Only spent on the player's clock — hostile
-        // swings are free in phase 2 (their AI tick is gated on the
-        // player taking an action, which already cost real time).
         if attacker_is_player {
             self.spend_moves(weapon.move_cost);
         }
@@ -2996,10 +3032,32 @@ impl World {
             drop(pos_ref);
             let dx = (player_pos.x - pos.x).signum();
             let dy = (player_pos.y - pos.y).signum();
-            let adjacent =
-                (player_pos.x - pos.x).abs() <= 1 && (player_pos.y - pos.y).abs() <= 1;
-            if adjacent {
-                self.perform_melee_attack(e, self.player);
+            let chebyshev =
+                (player_pos.x - pos.x).abs().max((player_pos.y - pos.y).abs()) as u8;
+            // Look up the hostile's weapon reach (defaults to 1 if no
+            // wielded weapon or non-weapon item — same fallback the
+            // player's bump-attack path uses).
+            let reach = self
+                .ecs
+                .get::<&Wielded>(e)
+                .ok()
+                .and_then(|w| crate::combat::weapon_profile_for(w.0))
+                .map(|w| w.reach)
+                .unwrap_or(1);
+            // Reach-2 swing also needs the intermediate cell clear of
+            // sight blockers. For adjacent (range 1) the LoS check is
+            // trivial.
+            let in_range = chebyshev >= 1 && chebyshev <= reach;
+            let los_clear = if chebyshev <= 1 {
+                true
+            } else {
+                // Intermediate cell sits one step toward the player.
+                let ix = pos.x + dx;
+                let iy = pos.y + dy;
+                !self.cell_blocks_sight_at(ix as i64, iy as i64)
+            };
+            if in_range && los_clear {
+                self.perform_melee_attack(e, self.player, chebyshev);
                 if self.player_killed_by_combat {
                     return;
                 }
@@ -4342,6 +4400,121 @@ mod tests {
             "bandit crit rate {:.3} too high — skills overpowered vs CRIT_MARGIN",
             b_rate
         );
+    }
+
+    #[test]
+    fn spear_has_reach_two_knife_has_reach_one() {
+        let knife = crate::combat::weapon_profile_for(ItemKind::Knife).unwrap();
+        let spear = crate::combat::weapon_profile_for(ItemKind::Spear).unwrap();
+        assert_eq!(knife.reach, 1);
+        assert_eq!(spear.reach, 2);
+    }
+
+    #[test]
+    fn no_reach_penalty_reduces_adjacent_spear_damage() {
+        use crate::combat::*;
+        // Same seed, same inputs — only difference is mult_pct.
+        let spear = weapon_profile_for(ItemKind::Spear).unwrap();
+        let atk = AttackerStats { str_bonus: 2, weapon_prof: 1, ..Default::default() };
+        let mut rng_full = crate::skill::Rng::from_state(0x1234_5678);
+        let mut rng_pen = crate::skill::Rng::from_state(0x1234_5678);
+        let full = roll_damage_with_mult(spear, atk, ArmorDr::default(), false, 100, &mut rng_full);
+        let pen = roll_damage_with_mult(
+            spear,
+            atk,
+            ArmorDr::default(),
+            false,
+            NO_REACH_DAMAGE_PCT,
+            &mut rng_pen,
+        );
+        // Total should drop by ~30%. Allow ±1 per component for floor.
+        let full_total = full.total() as i32;
+        let pen_total = pen.total() as i32;
+        let expected = full_total * NO_REACH_DAMAGE_PCT as i32 / 100;
+        assert!(
+            (pen_total - expected).abs() <= 3,
+            "pen {} expected ~{} (full {} × {}%)",
+            pen_total, expected, full_total, NO_REACH_DAMAGE_PCT
+        );
+    }
+
+    #[test]
+    fn player_reach_attack_swings_at_distance_two() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Give the player a spear so they have reach 2.
+        {
+            let mut eq = world.ecs.get::<&mut Equipment>(world.player).unwrap();
+            eq.main_hand = Some(ItemKind::Spear);
+        }
+        world.sync_equipment(world.player);
+        // Spawn bandit exactly 2 east of the player on a clear line.
+        let p = world.player_pos();
+        let bandit = spawn_cornish_bandit(
+            &mut world.ecs,
+            Position { x: p.x + 2, y: p.y },
+            YeomanLoadout {
+                main_hand: Some(ItemKind::Knife),
+                off_hand: None,
+                head: None,
+                torso: None,
+            },
+        );
+        let before = world.ecs.get::<&BodyParts>(bandit).map(|b| b.torso.hp).unwrap();
+        // Press east — destination (p.x+1, p.y) is empty, (p.x+2, p.y)
+        // has the bandit, spear reach 2 ⇒ should reach-attack.
+        let p_before = world.player_pos();
+        world.try_move_player(1, 0);
+        let p_after = world.player_pos();
+        assert_eq!(p_before, p_after, "reach-attack must not move the player");
+        let after = world.ecs.get::<&BodyParts>(bandit).map(|b| b.torso.hp).unwrap();
+        // The bandit may have crippled an arm or hit torso etc. Either
+        // way SOME body part should have taken damage — sum all parts
+        // for a robust check.
+        let total_before = before;
+        let after_bp = world.ecs.get::<&BodyParts>(bandit).map(|b| *b).unwrap();
+        let after_total = after_bp.head.hp + after_bp.torso.hp
+            + after_bp.l_arm.hp + after_bp.r_arm.hp
+            + after_bp.l_leg.hp + after_bp.r_leg.hp;
+        let expected_full = BodyParts::HEAD_MAX + BodyParts::TORSO_MAX
+            + 2 * BodyParts::ARM_MAX + 2 * BodyParts::LEG_MAX;
+        assert!(
+            after_total < expected_full || after < total_before,
+            "bandit should have taken some damage on the reach swing"
+        );
+    }
+
+    #[test]
+    fn player_reach_attack_blocked_by_intervening_tree() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        {
+            let mut eq = world.ecs.get::<&mut Equipment>(world.player).unwrap();
+            eq.main_hand = Some(ItemKind::Spear);
+        }
+        world.sync_equipment(world.player);
+        let p = world.player_pos();
+        // Plant a tree on the intermediate cell (p.x+1, p.y).
+        if let Some(c) = world.cell_at_mut((p.x + 1) as i64, p.y as i64) {
+            c.terrain = TerrainKind::TreeTrunk;
+            c.decoration = Decoration::None;
+        }
+        let bandit = spawn_cornish_bandit(
+            &mut world.ecs,
+            Position { x: p.x + 2, y: p.y },
+            YeomanLoadout::default(),
+        );
+        // Snapshot bandit body before; pressing east should walk INTO
+        // the tree (blocked) — no reach attack happens because the
+        // intermediate cell blocks sight.
+        let body_before = world.ecs.get::<&BodyParts>(bandit).map(|b| *b).unwrap();
+        world.try_move_player(1, 0);
+        let body_after = world.ecs.get::<&BodyParts>(bandit).map(|b| *b).unwrap();
+        let unchanged = body_before.head.hp == body_after.head.hp
+            && body_before.torso.hp == body_after.torso.hp
+            && body_before.l_arm.hp == body_after.l_arm.hp
+            && body_before.r_arm.hp == body_after.r_arm.hp
+            && body_before.l_leg.hp == body_after.l_leg.hp
+            && body_before.r_leg.hp == body_after.r_leg.hp;
+        assert!(unchanged, "tree should block the reach attack");
     }
 
     #[test]

@@ -155,8 +155,8 @@ pub struct ArmorDr {
     pub stab: u16,
 }
 
-/// Static weapon characteristics. Phase 1 keys these off `ItemKind` in
-/// world.rs; phase 3 lifts them onto `ItemDef`.
+/// Static weapon characteristics. Phase 3 lifts these off hardcoded
+/// matches onto `ItemDef.weapon`.
 #[derive(Clone, Copy, Debug)]
 pub struct WeaponProfile {
     /// Additive hit bonus on the contested roll.
@@ -167,7 +167,16 @@ pub struct WeaponProfile {
     pub damage_die: DamageTriplet,
     /// Swing cost in CDDA-style moves (see `world::MOVES_PER_SECOND`).
     pub move_cost: u32,
+    /// Max attack distance in Chebyshev tiles. `1` = adjacent only;
+    /// `2` = reach-2 polearm (spear / gisarme / lance). Per
+    /// `Reach and ranged.md`, swinging a reach-2 weapon at an adjacent
+    /// target takes a no-reach penalty (see `NO_REACH_DAMAGE_PCT`).
+    pub reach: u8,
 }
+
+/// Damage multiplier (percent) when a reach-≥2 weapon strikes an
+/// adjacent target — the cards' "no-reach penalty" placeholder ~30%.
+pub const NO_REACH_DAMAGE_PCT: u16 = 70;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AttackerStats {
@@ -243,15 +252,31 @@ pub fn resolve_hit(
     }
 }
 
-/// Roll the per-type damage triplet for a landed hit. Crit applies the
-/// multiplier per-type AFTER the Str + proficiency adds so a single
-/// 1.5× lift covers everything; armor DR is subtracted last and the
-/// result is floored at 0 per the damage-math card.
+/// Roll the per-type damage triplet for a landed hit. Crit and the
+/// no-reach penalty compose into a single percent multiplier applied
+/// per-type after the Str + proficiency adds so the lift covers
+/// everything uniformly; armor DR is subtracted last and the result
+/// is floored at 0 per the damage-math card.
 pub fn roll_damage(
     weapon: WeaponProfile,
     atk: AttackerStats,
     armor: ArmorDr,
     crit: bool,
+    rng: &mut Rng,
+) -> DamageTriplet {
+    roll_damage_with_mult(weapon, atk, armor, crit, 100, rng)
+}
+
+/// Like `roll_damage` but with an extra percent multiplier applied
+/// on top of the crit multiplier. Used for the no-reach polearm
+/// penalty (mult_pct = NO_REACH_DAMAGE_PCT) and any future situational
+/// modifiers (cover, prone, etc.).
+pub fn roll_damage_with_mult(
+    weapon: WeaponProfile,
+    atk: AttackerStats,
+    armor: ArmorDr,
+    crit: bool,
+    mult_pct: u16,
     rng: &mut Rng,
 ) -> DamageTriplet {
     let bash_raw =
@@ -261,11 +286,18 @@ pub fn roll_damage(
     let stab_raw = roll_die(weapon.damage_die.stab, rng)
         + (atk.str_bonus.max(0) as u16) / 2
         + bonus_u16(atk.weapon_prof);
-    let mult = if crit { CRIT_DMG_MULT_PCT } else { 100 };
+    let crit_mult = if crit { CRIT_DMG_MULT_PCT } else { 100 };
+    // Compose crit + situational into one percent factor so the math
+    // matches whether you swap order. Divide by 10_000 (two ×100s) at
+    // the end to keep precision.
+    let factor = crit_mult as u32 * mult_pct as u32;
+    let scale = |raw: u16| -> u16 {
+        ((raw as u32) * factor / 10_000).min(u16::MAX as u32) as u16
+    };
     DamageTriplet {
-        bash: apply_dr(bash_raw * mult / 100, armor.bash),
-        cut: apply_dr(cut_raw * mult / 100, armor.cut),
-        stab: apply_dr(stab_raw * mult / 100, armor.stab),
+        bash: apply_dr(scale(bash_raw), armor.bash),
+        cut: apply_dr(scale(cut_raw), armor.cut),
+        stab: apply_dr(scale(stab_raw), armor.stab),
     }
 }
 
@@ -300,6 +332,7 @@ mod tests {
             to_hit: 1,
             damage_die: DamageTriplet { bash: 0, cut: 2, stab: 8 },
             move_cost: 70,
+            reach: 1,
         }
     }
 
@@ -375,6 +408,7 @@ mod tests {
             to_hit: 0,
             damage_die: DamageTriplet { bash: 0, cut: 0, stab: 0 },
             move_cost: 100,
+            reach: 1,
         };
         let atk = AttackerStats { str_bonus: 5, weapon_prof: 2, ..Default::default() };
         let dmg = roll_damage(pure_weapon, atk, no_armor(), false, &mut rng);

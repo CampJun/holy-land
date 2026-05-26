@@ -176,6 +176,7 @@ impl ItemKind {
                     to_hit: 0,
                     damage_die: DamageTriplet { bash: 3, cut: 9, stab: 0 },
                     move_cost: 130,
+                    reach: 1,
                 }),
                 armor: None,
             },
@@ -191,6 +192,7 @@ impl ItemKind {
                     to_hit: 1,
                     damage_die: DamageTriplet { bash: 0, cut: 2, stab: 8 },
                     move_cost: 70,
+                    reach: 1,
                 }),
                 armor: None,
             },
@@ -507,10 +509,12 @@ impl ItemKind {
                 weapon: Some(WeaponProfile {
                     to_hit: 1,
                     damage_die: DamageTriplet { bash: 1, cut: 0, stab: 9 },
-                    // Reach-2 polearm; the adjacent-only swing is the
-                    // phase-3 baseline. Phase 5 lifts reach onto the
-                    // weapon profile and adds the no-reach penalty.
                     move_cost: 110,
+                    // Reach-2 polearm. Player + bandit can swing at a
+                    // hostile 2 cells away in a cardinal/diagonal line
+                    // (subject to LoS). Adjacent swings take the
+                    // NO_REACH_DAMAGE_PCT penalty per the cards.
+                    reach: 2,
                 }),
                 armor: None,
             },
@@ -526,6 +530,7 @@ impl ItemKind {
                     to_hit: 2,
                     damage_die: DamageTriplet { bash: 1, cut: 6, stab: 6 },
                     move_cost: 90,
+                    reach: 1,
                 }),
                 armor: None,
             },
@@ -541,6 +546,7 @@ impl ItemKind {
                     to_hit: 1,
                     damage_die: DamageTriplet { bash: 2, cut: 9, stab: 1 },
                     move_cost: 100,
+                    reach: 1,
                 }),
                 armor: None,
             },
