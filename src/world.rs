@@ -598,6 +598,49 @@ pub struct Wielded(pub crate::items::ItemKind);
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct CornishBandit;
 
+/// Stamina pool per the Stamina card. Drained by heavy actions
+/// (grapple verbs, running, future brace / crossbow reload / aimed
+/// swings); normal melee swings are FREE. Regens passively while not
+/// in a heavy action. Out-of-stamina = slower swings + lower hit.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Stamina {
+    pub cur: i16,
+    pub max: i16,
+}
+
+impl Stamina {
+    pub fn starting_human() -> Self {
+        Self { cur: 100, max: 100 }
+    }
+    /// Stamina threshold below which heavy actions are blocked.
+    pub const HEAVY_FLOOR: i16 = 15;
+    /// Penalty to attacker `to_hit` when current stamina is below the
+    /// heavy floor. Modest; full out-of-stamina state lands here.
+    pub const LOW_HIT_PENALTY: i16 = 4;
+}
+
+/// Target is in a grapple — can't move or attack until the hold
+/// breaks. Duration_secs ticks down each `tick_combat_states` call.
+#[derive(Clone, Copy, Debug)]
+pub struct Grappled {
+    pub remaining_secs: u32,
+}
+
+/// Target is on the ground — heavy defender penalty until they stand
+/// back up (currently auto-stands after `Prone::DURATION_SECS`).
+#[derive(Clone, Copy, Debug)]
+pub struct Prone {
+    pub remaining_secs: u32,
+}
+
+impl Prone {
+    pub const DURATION_SECS: u32 = 4;
+    /// Flat hit penalty added to the defender's roll when prone (i.e.
+    /// the defender_stats encumbrance bump). Heavy enough that prone is
+    /// genuinely punishing.
+    pub const DEFENDER_PENALTY: i16 = 8;
+}
+
 /// Bitmask over `combat::BodyPart` regions a single armor piece covers.
 /// Stored as a u8 (six parts use six bits). Phase 3 lifts piece-region
 /// data onto `ItemDef` so the piece can be both worn and dropped.
@@ -805,6 +848,7 @@ pub fn spawn_cornish_bandit(ecs: &mut Ecs, pos: Position, loadout: YeomanLoadout
         Wielded(main_hand),
         CombatSkills::starting_bandit(),
         worn_from_items(&worn_kinds),
+        Stamina::starting_human(),
     ));
     if let Some(off) = loadout.off_hand {
         let _ = ecs.insert_one(entity, OffHand(off));
@@ -1223,6 +1267,7 @@ impl World {
             Speed::default(),
             BodyParts::starting_human(),
             CombatSkills::starting_player(),
+            Stamina::starting_human(),
             // Player's equipment is the source of truth; Wielded /
             // OffHand / Worn are derived caches kept in sync via
             // `sync_equipment`. Rabble-tier player starts with a knife
@@ -1555,6 +1600,14 @@ impl World {
     }
 
     pub fn try_move_player(&mut self, dx: i32, dy: i32) {
+        // Grappled — can't move or attack until the hold breaks. Drain
+        // a small stamina cost on each attempted move so the player
+        // can "struggle" their way out by wasting moves.
+        if self.ecs.satisfies::<&Grappled>(self.player).unwrap_or(false) {
+            self.push_message("You're held — struggle!".to_string());
+            self.spend_moves(50);
+            return;
+        }
         let pos = self.player_pos();
         let nx = pos.x + dx;
         let ny = pos.y + dy;
@@ -1933,6 +1986,9 @@ impl World {
         let was_night = self.is_night();
         let before = self.clock_seconds;
         self.clock_seconds = self.clock_seconds.saturating_add(secs as u64);
+        // Stamina regen + grapple/prone timer decay ride the same tick
+        // path so save / load reproduce identically.
+        self.tick_combat_states(secs);
         // Calendar day advances at each midnight (24h) crossing. Use
         // floor-division on before/after so multi-day jumps from debug
         // commands or long sleeps land on the right calendar_day.
@@ -3012,19 +3068,193 @@ impl World {
         let Ok(skills) = self.ecs.get::<&CombatSkills>(e) else {
             return crate::combat::DefenderStats::default();
         };
-        // Per `Armor model.md` §Encumbrance penalties: torso + arm
-        // encumbrance drops Dodge. Sum it from Worn each call rather
-        // than baking into CombatSkills so equip/unequip in phase 3
-        // is instant.
         let worn_enc = self
             .ecs
             .get::<&Worn>(e)
             .map(|w| w.upper_body_encumbrance())
             .unwrap_or(0);
+        // Stamina drain: when below the heavy floor, the defender's
+        // effective Dodge drops by LOW_HIT_PENALTY too (gasping for
+        // breath is hard to dodge through).
+        let stam_penalty = self
+            .ecs
+            .get::<&Stamina>(e)
+            .map(|s| if s.cur < Stamina::HEAVY_FLOOR { Stamina::LOW_HIT_PENALTY } else { 0 })
+            .unwrap_or(0);
+        // Grappled = can't dodge well; treat as +6 encumbrance.
+        let grappled_pen = if self.ecs.satisfies::<&Grappled>(e).unwrap_or(false) {
+            6
+        } else {
+            0
+        };
+        let prone_pen = if self.ecs.satisfies::<&Prone>(e).unwrap_or(false) {
+            Prone::DEFENDER_PENALTY
+        } else {
+            0
+        };
         crate::combat::DefenderStats {
             dodge_skill: skills.dodge,
             agi_mod: skills.agi_mod,
-            encumbrance: skills.encumbrance + worn_enc,
+            encumbrance: skills.encumbrance + worn_enc + stam_penalty + grappled_pen + prone_pen,
+        }
+    }
+
+    /// Spend `cost` stamina on an entity. No-op if no Stamina component.
+    /// Used by heavy actions (Grapple/Throw/Disarm and later brace,
+    /// reload, aimed shots).
+    pub fn spend_stamina(&mut self, e: Entity, cost: i16) {
+        if let Ok(mut s) = self.ecs.get::<&mut Stamina>(e) {
+            s.cur = (s.cur - cost).max(0);
+        }
+    }
+
+    /// Tick every Stamina component by `secs` of regen (passive +2/sec
+    /// while not in a heavy action). Also decays Grappled / Prone
+    /// timers and removes the components when they expire.
+    pub fn tick_combat_states(&mut self, secs: u32) {
+        if secs == 0 {
+            return;
+        }
+        // Regen first.
+        for (_, s) in self.ecs.query::<&mut Stamina>().iter() {
+            let regen = 2 * secs as i16;
+            s.cur = (s.cur + regen).min(s.max);
+        }
+        // Grappled timers.
+        let expired_grapples: Vec<Entity> = self
+            .ecs
+            .query::<&mut Grappled>()
+            .iter()
+            .filter_map(|(e, g)| {
+                g.remaining_secs = g.remaining_secs.saturating_sub(secs);
+                if g.remaining_secs == 0 { Some(e) } else { None }
+            })
+            .collect();
+        for e in expired_grapples {
+            let _ = self.ecs.remove_one::<Grappled>(e);
+        }
+        // Prone timers.
+        let stood: Vec<Entity> = self
+            .ecs
+            .query::<&mut Prone>()
+            .iter()
+            .filter_map(|(e, p)| {
+                p.remaining_secs = p.remaining_secs.saturating_sub(secs);
+                if p.remaining_secs == 0 { Some(e) } else { None }
+            })
+            .collect();
+        for e in stood {
+            let _ = self.ecs.remove_one::<Prone>(e);
+        }
+    }
+
+    /// Read the player's current stamina (cur, max). Used by the HUD.
+    pub fn player_stamina(&self) -> (i16, i16) {
+        self.ecs
+            .get::<&Stamina>(self.player)
+            .map(|s| (s.cur, s.max))
+            .unwrap_or((0, 0))
+    }
+
+    /// True if the player has enough stamina to attempt a heavy action.
+    pub fn player_has_stamina_for_heavy(&self) -> bool {
+        self.player_stamina().0 >= Stamina::HEAVY_FLOOR
+    }
+
+    /// Cheapest adjacent hostile to the player, if any. Used by the
+    /// grapple / throw / disarm verbs to auto-target.
+    pub fn adjacent_hostile(&self) -> Option<Entity> {
+        let p = self.player_pos();
+        let mut best: Option<(Entity, i32)> = None;
+        for (e, (pos, _h)) in self.ecs.query::<(&Position, &Hostile)>().iter() {
+            let dx = (pos.x - p.x).abs();
+            let dy = (pos.y - p.y).abs();
+            if dx <= 1 && dy <= 1 && (dx + dy) > 0 {
+                let dist = dx + dy;
+                if best.map(|(_, d)| dist < d).unwrap_or(true) {
+                    best = Some((e, dist));
+                }
+            }
+        }
+        best.map(|(e, _)| e)
+    }
+
+    pub fn entity_has_wielded(&self, e: Entity) -> bool {
+        self.ecs.satisfies::<&Wielded>(e).unwrap_or(false)
+    }
+
+    pub fn entity_is_grappled(&self, e: Entity) -> bool {
+        self.ecs.satisfies::<&Grappled>(e).unwrap_or(false)
+    }
+
+    // ---- Heavy wrestling actions ----
+
+    /// Str contest between player and target. Returns true if attacker
+    /// wins. Stamina also folds in — exhausted attacker loses points.
+    fn str_contest(&mut self, attacker: Entity, target: Entity) -> bool {
+        let atk_str = self
+            .ecs
+            .get::<&CombatSkills>(attacker)
+            .map(|s| s.str_bonus)
+            .unwrap_or(0);
+        let def_str = self
+            .ecs
+            .get::<&CombatSkills>(target)
+            .map(|s| s.str_bonus)
+            .unwrap_or(0);
+        let stam_pen = self
+            .ecs
+            .get::<&Stamina>(attacker)
+            .map(|s| if s.cur < Stamina::HEAVY_FLOOR { 2 } else { 0 })
+            .unwrap_or(0);
+        let atk_roll = atk_str as i32 + (self.rng.d100() as i32 / 5) - stam_pen as i32;
+        let def_roll = def_str as i32 + (self.rng.d100() as i32 / 5);
+        atk_roll > def_roll
+    }
+
+    pub fn perform_grapple(&mut self, target: Entity) -> String {
+        let attacker = self.player;
+        self.spend_stamina(attacker, 20);
+        let win = self.str_contest(attacker, target);
+        if win {
+            let _ = self.ecs.insert_one(target, Grappled { remaining_secs: 3 });
+            "You lock up the bandit.".to_string()
+        } else {
+            "Bandit shrugs your grapple off.".to_string()
+        }
+    }
+
+    pub fn perform_throw(&mut self, target: Entity) -> String {
+        let attacker = self.player;
+        self.spend_stamina(attacker, 25);
+        let win = self.str_contest(attacker, target);
+        if win {
+            let _ = self.ecs.insert_one(target, Prone { remaining_secs: Prone::DURATION_SECS });
+            // Throw breaks the grapple too — they're on the floor now.
+            let _ = self.ecs.remove_one::<Grappled>(target);
+            "You slam the bandit to the ground.".to_string()
+        } else {
+            "Throw fails — bandit holds footing.".to_string()
+        }
+    }
+
+    pub fn perform_disarm(&mut self, target: Entity) -> String {
+        let attacker = self.player;
+        self.spend_stamina(attacker, 15);
+        let win = self.str_contest(attacker, target);
+        if !win {
+            return "Disarm fails.".to_string();
+        }
+        let weapon = self.ecs.get::<&Wielded>(target).ok().map(|w| w.0);
+        let pos = self.ecs.get::<&Position>(target).ok().map(|p| *p);
+        if let (Some(kind), Some(p)) = (weapon, pos) {
+            let _ = self.ecs.remove_one::<Wielded>(target);
+            if let Some(cell) = self.cell_at_mut(p.x as i64, p.y as i64) {
+                cell.items.push(kind.make_default_instance(1));
+            }
+            format!("Bandit drops their {}!", kind.name())
+        } else {
+            "Bandit had nothing to drop.".to_string()
         }
     }
 
@@ -3333,9 +3563,12 @@ impl World {
             .map(|(e, _)| e)
             .collect();
         for e in hostiles {
-            // Re-check Position each loop in case a prior tick despawned
-            // someone (not currently possible — hostiles don't fight each
-            // other — but cheap insurance).
+            // Grappled hostiles can't act — they're tied up trying to
+            // break the hold. Stamina regen still applies via the
+            // tick_combat_states path.
+            if self.ecs.satisfies::<&Grappled>(e).unwrap_or(false) {
+                continue;
+            }
             let Ok(pos_ref) = self.ecs.get::<&Position>(e) else { continue };
             let pos = *pos_ref;
             drop(pos_ref);
@@ -5019,6 +5252,89 @@ mod tests {
         let has = |k: ItemKind| drops.iter().any(|i| i.kind == k);
         assert!(has(ItemKind::Bow), "bow dropped");
         assert!(has(ItemKind::Arrow), "arrows dropped from pack");
+    }
+
+    #[test]
+    fn stamina_starts_full_and_regens_on_tick() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let (cur, max) = world.player_stamina();
+        assert_eq!(cur, max);
+        // Drain some, then tick — stamina should climb back.
+        world.spend_stamina(world.player, 50);
+        let after_drain = world.player_stamina().0;
+        assert_eq!(after_drain, max - 50);
+        world.tick_combat_states(10);
+        let after_regen = world.player_stamina().0;
+        assert!(after_regen > after_drain);
+    }
+
+    #[test]
+    fn grapple_immobilizes_target() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let bandit = drop_test_bandit(&mut world, 1, 0);
+        let result = world.perform_grapple(bandit);
+        // Result string varies on win/loss — but if it says "lock up"
+        // we expect Grappled component on the bandit.
+        if result.contains("lock up") {
+            assert!(world.entity_is_grappled(bandit));
+        }
+    }
+
+    #[test]
+    fn throw_makes_target_prone_when_strong_enough() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let bandit = drop_test_bandit(&mut world, 1, 0);
+        // Force the player to be much stronger so the contest reliably
+        // wins. Player default str_bonus = 1; bump to 20.
+        {
+            let mut cs = world.ecs.get::<&mut CombatSkills>(world.player).unwrap();
+            cs.str_bonus = 20;
+        }
+        // Grapple first so throw has a valid target state. We'll also
+        // confirm Prone arrives.
+        for _ in 0..3 {
+            let _ = world.perform_grapple(bandit);
+            if world.entity_is_grappled(bandit) {
+                break;
+            }
+        }
+        let _ = world.perform_throw(bandit);
+        assert!(world.ecs.satisfies::<&Prone>(bandit).unwrap_or(false));
+        assert!(!world.entity_is_grappled(bandit), "throw should break the grapple");
+    }
+
+    #[test]
+    fn disarm_drops_wielded_weapon_when_strong_enough() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let bandit = drop_test_bandit(&mut world, 1, 0);
+        {
+            let mut cs = world.ecs.get::<&mut CombatSkills>(world.player).unwrap();
+            cs.str_bonus = 20;
+        }
+        let pos = world.ecs.get::<&Position>(bandit).map(|p| *p).unwrap();
+        // Drop a kid: a few attempts since contest variance is small.
+        let mut dropped = false;
+        for _ in 0..6 {
+            let _ = world.perform_disarm(bandit);
+            if !world.entity_has_wielded(bandit) {
+                dropped = true;
+                break;
+            }
+        }
+        assert!(dropped, "high-str disarm should eventually succeed");
+        let cell = world.cell_at(pos.x as i64, pos.y as i64).unwrap();
+        assert!(cell.items.iter().any(|i| i.kind == ItemKind::Spear));
+    }
+
+    #[test]
+    fn grappled_player_cannot_walk_away() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let player = world.player;
+        let _ = world.ecs.insert_one(player, Grappled { remaining_secs: 5 });
+        let before = world.player_pos();
+        world.try_move_player(1, 0);
+        let after = world.player_pos();
+        assert_eq!(before, after);
     }
 
     #[test]

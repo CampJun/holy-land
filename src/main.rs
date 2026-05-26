@@ -1299,6 +1299,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let player_skills = world.player_skills();
         let calendar_day = world.calendar_day;
         let player_body = world.player_body();
+        let player_stamina = world.player_stamina();
         let mut ui_cells = build_ui_cells(
             &palette,
             needs,
@@ -1309,6 +1310,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             player_skills,
             calendar_day,
             player_body,
+            player_stamina,
         );
         if target_cursor.is_none() {
             draw_message_line(&mut ui_cells, &world, &palette);
@@ -1854,6 +1856,7 @@ fn build_ui_cells(
     skills: Skills,
     calendar_day: u32,
     body: world::BodyParts,
+    stamina: (i16, i16),
 ) -> Vec<Option<Cell>> {
     let mut cells = vec![None; (WORLD_W * WORLD_H) as usize];
 
@@ -1945,23 +1948,39 @@ fn build_ui_cells(
     let hp_line = format!("HP H{} T{}", body.head.hp.max(0), body.torso.hp.max(0));
     put_text(&mut cells, 1, 2, &hp_line, hp_fg, palette.hud_bg);
 
-    // Crippled-status badge directly after HP. Reads functionally
-    // rather than anatomically — what the player can't do matters more
-    // than which limb. Phase 2 rules: any arm crippled → can't wield
-    // (any wielded weapon drops); any leg crippled → effective speed
-    // halved. Specific limb identity surfaces in the original cripple-
-    // event log line.
+    // Stamina readout right after HP. Mirror of HP coloring: dims to
+    // critical at low stamina. Only shown when stamina is meaningful
+    // (max > 0).
+    let (stam_cur, stam_max) = stamina;
+    if stam_max > 0 {
+        let stam_pct = stam_cur.max(0) as i32 * 100 / stam_max as i32;
+        let stam_fg = if stam_pct <= 15 {
+            palette.need_critical_fg
+        } else if stam_pct <= 35 {
+            Color::RGB(230, 200, 90)
+        } else {
+            palette.hud_fg
+        };
+        let stam_line = format!(" SP {}", stam_cur.max(0));
+        let after_hp_x = 1 + hp_line.len() as i32;
+        put_text(&mut cells, after_hp_x, 2, &stam_line, stam_fg, palette.hud_bg);
+    }
+
+    // Crippled-status badge after stamina. Reads functionally rather
+    // than anatomically — what the player can't do matters more than
+    // which limb. Phase 2 rules: any arm crippled → can't wield (any
+    // wielded weapon drops); any leg crippled → effective speed halved.
     let arm_out = body.l_arm.is_crippled() || body.r_arm.is_crippled();
     let leg_out = body.l_leg.is_crippled() || body.r_leg.is_crippled();
     if arm_out || leg_out {
-        let after_hp_x = 1 + hp_line.len() as i32 + 2;
+        let after_x = 1 + hp_line.len() as i32 + 1 + format!(" SP {}", stam_cur.max(0)).len() as i32 + 1;
         let tag = match (arm_out, leg_out) {
             (true, true) => "[no weapon / lame]",
             (true, false) => "[no weapon]",
             (false, true) => "[lame]",
             (false, false) => "",
         };
-        put_text(&mut cells, after_hp_x, 2, tag, palette.need_critical_fg, palette.hud_bg);
+        put_text(&mut cells, after_x, 2, tag, palette.need_critical_fg, palette.hud_bg);
     }
 
     // Per-skill readouts live in the Select info menu's Skills tab —

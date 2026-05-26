@@ -87,6 +87,16 @@ pub enum ActionId {
     /// commits to a shot via A; cancel via B. Execution lives in main.rs
     /// — the verb itself just signals "open targeting mode."
     Aim,
+    /// Devon-wrestling grapple. Adjacent hostile only. Str contest;
+    /// success Grapples target (can't move/attack until break).
+    /// Drains stamina; requires Stamina >= HEAVY_FLOOR.
+    Grapple,
+    /// Throw a grappled hostile to the ground (Prone). Adjacent
+    /// grappled hostile only.
+    Throw,
+    /// Knock the wielded weapon out of an adjacent hostile's hand.
+    /// Str contest; success drops their Wielded onto their cell.
+    Disarm,
 }
 
 impl ActionId {
@@ -141,6 +151,12 @@ impl ActionId {
             // commit path (`World::perform_ranged_attack`), which
             // charges the bow's `RangedProfile.move_cost`.
             ActionId::Aim => 0,
+            // Heavy wrestling actions take longer than a normal swing
+            // (per the stamina card — grapple/throw/disarm are the
+            // canonical heavy-action examples).
+            ActionId::Grapple => 200,
+            ActionId::Throw => 150,
+            ActionId::Disarm => 150,
         }
     }
 
@@ -175,6 +191,9 @@ impl ActionId {
             ActionId::CutGorse => "cut_gorse",
             ActionId::CutBracken => "cut_bracken",
             ActionId::Aim => "aim",
+            ActionId::Grapple => "grapple",
+            ActionId::Throw => "throw",
+            ActionId::Disarm => "disarm",
         }
     }
 
@@ -206,6 +225,9 @@ impl ActionId {
             "cut_gorse" => ActionId::CutGorse,
             "cut_bracken" => ActionId::CutBracken,
             "aim" => ActionId::Aim,
+            "grapple" => ActionId::Grapple,
+            "throw" => ActionId::Throw,
+            "disarm" => ActionId::Disarm,
             _ => return None,
         })
     }
@@ -326,6 +348,21 @@ pub const ALL_ACTIONS: &[ContextAction] = &[
         name: "Aim",
         description: "Raise your bow and pick a target.",
     },
+    ContextAction {
+        id: ActionId::Grapple,
+        name: "Grapple",
+        description: "Lock up the adjacent foe — they can't act.",
+    },
+    ContextAction {
+        id: ActionId::Throw,
+        name: "Throw",
+        description: "Slam a grappled foe to the ground (Prone).",
+    },
+    ContextAction {
+        id: ActionId::Disarm,
+        name: "Disarm",
+        description: "Strike an adjacent foe's weapon free.",
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -429,7 +466,36 @@ pub fn evaluate(world: &World, id: ActionId) -> Availability {
             "no bracken adjacent",
         ),
         ActionId::Aim => eval_aim(world),
+        ActionId::Grapple => eval_grapple_or_disarm(world, false),
+        ActionId::Disarm => eval_grapple_or_disarm(world, true),
+        ActionId::Throw => eval_throw(world),
     }
+}
+
+fn eval_grapple_or_disarm(world: &World, require_wielded: bool) -> Availability {
+    if !world.player_has_stamina_for_heavy() {
+        return Availability::Unavailable { reason: "winded" };
+    }
+    let Some(target) = world.adjacent_hostile() else {
+        return Availability::Unavailable { reason: "no foe adjacent" };
+    };
+    if require_wielded && !world.entity_has_wielded(target) {
+        return Availability::Unavailable { reason: "foe is unarmed" };
+    }
+    Availability::Available { cost_game_seconds: 0 }
+}
+
+fn eval_throw(world: &World) -> Availability {
+    if !world.player_has_stamina_for_heavy() {
+        return Availability::Unavailable { reason: "winded" };
+    }
+    let Some(target) = world.adjacent_hostile() else {
+        return Availability::Unavailable { reason: "no foe adjacent" };
+    };
+    if !world.entity_is_grappled(target) {
+        return Availability::Unavailable { reason: "grapple them first" };
+    }
+    Availability::Available { cost_game_seconds: 0 }
 }
 
 fn eval_aim(world: &World) -> Availability {
@@ -684,7 +750,37 @@ pub fn execute(world: &mut World, id: ActionId) -> ExecuteOutcome {
         ActionId::CutGorse => execute_cut_gorse(world),
         ActionId::CutBracken => execute_cut_bracken(world),
         ActionId::Aim => ExecuteOutcome::OpenAim,
+        ActionId::Grapple => execute_grapple(world),
+        ActionId::Throw => execute_throw(world),
+        ActionId::Disarm => execute_disarm(world),
     }
+}
+
+fn execute_grapple(world: &mut World) -> ExecuteOutcome {
+    let Some(target) = world.adjacent_hostile() else {
+        return ExecuteOutcome::Done("no foe adjacent".to_string());
+    };
+    let msg = world.perform_grapple(target);
+    world.spend_moves(ActionId::Grapple.move_cost());
+    ExecuteOutcome::Done(msg)
+}
+
+fn execute_throw(world: &mut World) -> ExecuteOutcome {
+    let Some(target) = world.adjacent_hostile() else {
+        return ExecuteOutcome::Done("no foe adjacent".to_string());
+    };
+    let msg = world.perform_throw(target);
+    world.spend_moves(ActionId::Throw.move_cost());
+    ExecuteOutcome::Done(msg)
+}
+
+fn execute_disarm(world: &mut World) -> ExecuteOutcome {
+    let Some(target) = world.adjacent_hostile() else {
+        return ExecuteOutcome::Done("no foe adjacent".to_string());
+    };
+    let msg = world.perform_disarm(target);
+    world.spend_moves(ActionId::Disarm.move_cost());
+    ExecuteOutcome::Done(msg)
 }
 
 /// Crafting verbs share a single 5-second multi-turn queue path; the
