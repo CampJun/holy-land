@@ -415,17 +415,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // field existed default to BASELINE via #[serde(default)], so
         // loading is a one-liner — no zero-guard needed.
         world.set_player_speed(run.speed);
-        // Schema v3 combat: restore player HP + hostile entities. A v2
-        // save has player_health == None and hostiles == empty, so the
-        // World::new defaults stand (player at full HP, one fresh
-        // bandit spawn). v3+ overrides with the saved values.
-        if let Some(ph) = run.player_health {
-            if ph.max > 0 {
-                world.set_player_health(world::Health { hp: ph.hp, max: ph.max });
-            }
+        // Schema v3 combat: restore player + hostiles. A v2 save has
+        // both fields default and the World::new defaults stand. v3+
+        // saves may carry either the legacy single-pool `player_health`
+        // (no-op now — phase 2 ignores it) or the new body-part split.
+        if let Some(bp) = run.player_body_parts.as_ref() {
+            world.set_player_body(save_bp_to_world(bp));
         }
         if !run.hostiles.is_empty() {
-            let restored: Vec<(world::Position, world::Health, Option<items::ItemKind>, String)> =
+            let restored: Vec<(world::Position, world::BodyParts, Option<items::ItemKind>, String)> =
                 run.hostiles
                     .iter()
                     .map(|h| {
@@ -434,12 +432,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             items::ItemKind::from_save_key(&h.wielded_kind)
                         };
+                        let body = match h.body_parts.as_ref() {
+                            Some(bp) => save_bp_to_world(bp),
+                            None => world::BodyParts::starting_human(),
+                        };
                         (
                             world::Position { x: h.x, y: h.y },
-                            world::Health {
-                                hp: h.hp,
-                                max: if h.max_hp > 0 { h.max_hp } else { h.hp.max(1) },
-                            },
+                            body,
                             wielded,
                             h.flavor.clone(),
                         )
@@ -1489,6 +1488,41 @@ fn fresh_world_seed() -> u64 {
     z ^ (z >> 31)
 }
 
+/// Convert in-memory body-part HP into the save struct.
+fn world_bp_to_save(bp: &world::BodyParts) -> save::BodyPartsSave {
+    let c = |p: world::BodyPartHp| save::BodyPartSaveCell { hp: p.hp, max: p.max };
+    save::BodyPartsSave {
+        head: c(bp.head),
+        torso: c(bp.torso),
+        l_arm: c(bp.l_arm),
+        r_arm: c(bp.r_arm),
+        l_leg: c(bp.l_leg),
+        r_leg: c(bp.r_leg),
+    }
+}
+
+/// Reverse of `world_bp_to_save`. Defaults a zero-max cell to the
+/// canonical starting maxes so a partial save (e.g. only torso written)
+/// still loads into a sane body.
+fn save_bp_to_world(bp: &save::BodyPartsSave) -> world::BodyParts {
+    let starting = world::BodyParts::starting_human();
+    let cell = |saved: save::BodyPartSaveCell, fallback: world::BodyPartHp| {
+        if saved.max <= 0 {
+            fallback
+        } else {
+            world::BodyPartHp { hp: saved.hp, max: saved.max }
+        }
+    };
+    world::BodyParts {
+        head: cell(bp.head, starting.head),
+        torso: cell(bp.torso, starting.torso),
+        l_arm: cell(bp.l_arm, starting.l_arm),
+        r_arm: cell(bp.r_arm, starting.r_arm),
+        l_leg: cell(bp.l_leg, starting.l_leg),
+        r_leg: cell(bp.r_leg, starting.r_leg),
+    }
+}
+
 fn save_game(
     save_dir: &std::path::Path,
     meta: &mut MetaSave,
@@ -1577,21 +1611,26 @@ fn save_game(
             decoration: d,
         })
         .collect();
-    let player_hp = world.player_health();
-    run.player_health = Some(save::HealthSave {
-        hp: player_hp.hp,
-        max: player_hp.max,
-    });
+    let player_body = world.player_body();
+    run.player_body_parts = Some(world_bp_to_save(&player_body));
+    // Leave the legacy single-pool field empty; phase 2 + later writes
+    // route through body_parts. A v3 player_health field still loads
+    // cleanly via serde but is never written.
+    run.player_health = None;
     run.hostiles = world
         .snapshot_hostiles()
         .into_iter()
-        .map(|(pos, hp, wielded, flavor)| save::HostileSave {
+        .map(|(pos, bp, wielded, flavor)| save::HostileSave {
             x: pos.x,
             y: pos.y,
-            hp: hp.hp,
-            max_hp: hp.max,
+            // hp + max_hp stay populated for any older binary that
+            // wants to read the file — surface the torso pool as the
+            // closest single-pool analog.
+            hp: bp.torso.hp,
+            max_hp: bp.torso.max,
             wielded_kind: wielded.map(|k| k.save_key().to_string()).unwrap_or_default(),
             flavor: flavor.to_string(),
+            body_parts: Some(world_bp_to_save(&bp)),
         })
         .collect();
     run.active_action = world.active_action.as_ref().map(|active| ActiveActionSave {

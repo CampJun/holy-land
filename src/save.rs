@@ -159,16 +159,51 @@ pub struct RunSave {
     pub player_health: Option<HealthSave>,
     #[serde(default)]
     pub hostiles: Vec<HostileSave>,
+    // Phase 2 (combat body parts): split single-pool HP into six body
+    // parts per `Armor model.md`. Additive — v3 saves with only
+    // player_health load with a defaulted (full-HP) BodyParts and
+    // the previous single pool is ignored. Phase 2 stops writing
+    // player_health for new saves.
+    #[serde(default)]
+    pub player_body_parts: Option<BodyPartsSave>,
 }
 
-/// Single-pool combat health (phase 1). Phase 2's body-part split adds
-/// fields here additively; older saves load with hp == max.
+/// Single-pool combat health (phase 1). Phase 2's body-part split
+/// retired this in favor of `BodyPartsSave`; the struct stays so v3
+/// saves still parse cleanly.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct HealthSave {
     #[serde(default)]
     pub hp: i16,
     #[serde(default)]
     pub max: i16,
+}
+
+/// Per-body-part HP round-trip (phase 2). Each part carries its own
+/// `(hp, max)`; serde defaults round-trip a fresh-spawn human (40/80/
+/// 60/60/60/60). Additive — older v3 saves load via `#[serde(default)]`.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct BodyPartSaveCell {
+    #[serde(default)]
+    pub hp: i16,
+    #[serde(default)]
+    pub max: i16,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct BodyPartsSave {
+    #[serde(default)]
+    pub head: BodyPartSaveCell,
+    #[serde(default)]
+    pub torso: BodyPartSaveCell,
+    #[serde(default)]
+    pub l_arm: BodyPartSaveCell,
+    #[serde(default)]
+    pub r_arm: BodyPartSaveCell,
+    #[serde(default)]
+    pub l_leg: BodyPartSaveCell,
+    #[serde(default)]
+    pub r_leg: BodyPartSaveCell,
 }
 
 /// One hostile entity round-trip. `wielded_kind` is an `ItemKind`
@@ -181,6 +216,9 @@ pub struct HostileSave {
     pub x: i32,
     #[serde(default)]
     pub y: i32,
+    /// Phase-1 single-pool HP; phase 2 surfaces the torso pool here as
+    /// the closest analog so older binaries reading the file get a
+    /// plausible total. Authoritative HP lives in `body_parts`.
     #[serde(default)]
     pub hp: i16,
     #[serde(default)]
@@ -193,6 +231,10 @@ pub struct HostileSave {
     /// unknown values (forward-compat).
     #[serde(default)]
     pub flavor: String,
+    /// Phase-2 body-part HP split. Additive — v3 saves without this
+    /// field load with a defaulted full-HP body.
+    #[serde(default)]
+    pub body_parts: Option<BodyPartsSave>,
 }
 
 /// Backwards-compat seed value matching `world::DEFAULT_SEED`. Used by
@@ -337,6 +379,7 @@ impl RunSave {
             seed: DEFAULT_WORLD_SEED,
             player_health: None,
             hostiles: Vec::new(),
+            player_body_parts: None,
         }
     }
 }
@@ -602,6 +645,7 @@ mod tests {
             max_hp: 80,
             wielded_kind: "spear".to_string(),
             flavor: "cornish_bandit".to_string(),
+            body_parts: None,
         }];
         save_atomic(&path, &run).unwrap();
 
@@ -652,6 +696,7 @@ mod tests {
             seed: 0xABCD_1234_5678_9ABC,
             player_health: None,
             hostiles: Vec::new(),
+            player_body_parts: None,
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
@@ -750,6 +795,7 @@ mod tests {
             seed: DEFAULT_WORLD_SEED,
             player_health: None,
             hostiles: Vec::new(),
+            player_body_parts: None,
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();

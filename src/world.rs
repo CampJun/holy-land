@@ -479,26 +479,94 @@ impl Default for Speed {
     }
 }
 
-/// Combat health. Phase-1 vertical slice is a single pool; phase 2
-/// splits it into per-body-part HP per `Survival - Combat - Damage
-/// math and hit roll.md`. Saturating at i16 keeps headroom for the
-/// overflow-spills-to-torso math when body parts land.
+/// One body-part HP pool. Crippling is a derived state (`hp <= 0`);
+/// the crippled flag is recomputed on each damage application rather
+/// than stored — that way save-load can't get the two out of sync.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-pub struct Health {
+pub struct BodyPartHp {
     pub hp: i16,
     pub max: i16,
 }
 
-impl Health {
-    /// Player baseline. Matches the torso scale on the cards so phase
-    /// 2's body-part struct can swap in without a visible HP jump.
-    pub fn starting_player() -> Self {
-        Self { hp: 80, max: 80 }
+impl BodyPartHp {
+    pub fn full(max: i16) -> Self {
+        Self { hp: max, max }
+    }
+    pub fn is_crippled(self) -> bool {
+        self.hp <= 0
+    }
+}
+
+/// Six-part HP pool per `Survival - Combat - Damage math and hit roll.md`.
+/// Coverage weights live on `combat::BodyPart`; the per-part HP scales
+/// live here. Torso ~80 (highest), head 40 (fragile), limbs 60.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct BodyParts {
+    pub head: BodyPartHp,
+    pub torso: BodyPartHp,
+    pub l_arm: BodyPartHp,
+    pub r_arm: BodyPartHp,
+    pub l_leg: BodyPartHp,
+    pub r_leg: BodyPartHp,
+}
+
+impl BodyParts {
+    /// Per-part max-HP scale used by both player and bandit baselines.
+    /// Phase 3 will scale these by the Stam attribute per the damage-
+    /// math card; phase 2 keeps them flat.
+    pub const HEAD_MAX: i16 = 40;
+    pub const TORSO_MAX: i16 = 80;
+    pub const ARM_MAX: i16 = 60;
+    pub const LEG_MAX: i16 = 60;
+
+    pub fn starting_human() -> Self {
+        Self {
+            head: BodyPartHp::full(Self::HEAD_MAX),
+            torso: BodyPartHp::full(Self::TORSO_MAX),
+            l_arm: BodyPartHp::full(Self::ARM_MAX),
+            r_arm: BodyPartHp::full(Self::ARM_MAX),
+            l_leg: BodyPartHp::full(Self::LEG_MAX),
+            r_leg: BodyPartHp::full(Self::LEG_MAX),
+        }
     }
 
-    /// Cornish bandit baseline (Yeoman tier).
-    pub fn starting_bandit() -> Self {
-        Self { hp: 80, max: 80 }
+    pub fn get(&self, part: crate::combat::BodyPart) -> BodyPartHp {
+        match part {
+            crate::combat::BodyPart::Head => self.head,
+            crate::combat::BodyPart::Torso => self.torso,
+            crate::combat::BodyPart::LArm => self.l_arm,
+            crate::combat::BodyPart::RArm => self.r_arm,
+            crate::combat::BodyPart::LLeg => self.l_leg,
+            crate::combat::BodyPart::RLeg => self.r_leg,
+        }
+    }
+
+    pub fn get_mut(&mut self, part: crate::combat::BodyPart) -> &mut BodyPartHp {
+        match part {
+            crate::combat::BodyPart::Head => &mut self.head,
+            crate::combat::BodyPart::Torso => &mut self.torso,
+            crate::combat::BodyPart::LArm => &mut self.l_arm,
+            crate::combat::BodyPart::RArm => &mut self.r_arm,
+            crate::combat::BodyPart::LLeg => &mut self.l_leg,
+            crate::combat::BodyPart::RLeg => &mut self.r_leg,
+        }
+    }
+
+    /// True if either vital (head/torso) is at or below zero — fires
+    /// the death event.
+    pub fn is_dead(&self) -> bool {
+        self.head.is_crippled() || self.torso.is_crippled()
+    }
+
+    /// True if either leg is crippled — caller halves effective speed.
+    pub fn any_leg_crippled(&self) -> bool {
+        self.l_leg.is_crippled() || self.r_leg.is_crippled()
+    }
+
+    /// True if either arm is crippled — caller drops the wielded
+    /// weapon in phase 2 (no L/R hand distinction yet).
+    pub fn any_arm_crippled(&self) -> bool {
+        self.l_arm.is_crippled() || self.r_arm.is_crippled()
     }
 }
 
@@ -530,6 +598,111 @@ pub struct Wielded(pub crate::items::ItemKind);
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct CornishBandit;
 
+/// Bitmask over `combat::BodyPart` regions a single armor piece covers.
+/// Stored as a u8 (six parts use six bits). Phase 3 lifts piece-region
+/// data onto `ItemDef` so the piece can be both worn and dropped.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BodyRegionMask(pub u8);
+
+impl BodyRegionMask {
+    pub fn empty() -> Self {
+        Self(0)
+    }
+    pub fn with(mut self, part: crate::combat::BodyPart) -> Self {
+        self.0 |= 1 << part as u8;
+        self
+    }
+    pub fn contains(self, part: crate::combat::BodyPart) -> bool {
+        (self.0 >> part as u8) & 1 == 1
+    }
+}
+
+/// One worn armor piece. Coverage % drives the per-hit catch roll
+/// (1d100 ≤ coverage_pct → piece intercepts the strike). DR is
+/// subtracted per damage type if the piece catches. Encumbrance is
+/// added per region the piece covers — the sum across torso+arms
+/// drops the wearer's Dodge, leg sum bumps move-cost.
+#[derive(Clone, Copy, Debug)]
+pub struct ArmorPiece {
+    pub regions: BodyRegionMask,
+    pub coverage_pct: u8,
+    pub dr: crate::combat::ArmorDr,
+    /// Encumbrance contribution per covered region.
+    pub encumbrance: u8,
+    /// Phase-3 hook: which ItemKind this piece corresponds to so the
+    /// piece can drop on death. Phase 2 only uses this on the bandit's
+    /// hardcoded loadout; phase 3 lifts piece data onto `ItemDef`.
+    pub item_kind: Option<crate::items::ItemKind>,
+}
+
+/// Layered armor worn on the body. Pieces are checked outer→inner in
+/// push order; the layering currently affects only "first to catch
+/// blocks damage" semantics — phase 3 will wire explicit layer ordering
+/// once equip slots land.
+#[derive(Clone, Debug, Default)]
+pub struct Worn {
+    pub pieces: Vec<ArmorPiece>,
+}
+
+impl Worn {
+    pub fn new(pieces: Vec<ArmorPiece>) -> Self {
+        Self { pieces }
+    }
+
+    /// Total encumbrance across torso + arms — feeds the Dodge
+    /// penalty (per `Armor model.md` §Encumbrance penalties).
+    pub fn upper_body_encumbrance(&self) -> i16 {
+        self.region_encumbrance(&[
+            crate::combat::BodyPart::Torso,
+            crate::combat::BodyPart::LArm,
+            crate::combat::BodyPart::RArm,
+        ])
+    }
+
+    /// Total leg encumbrance — bumps the per-tile move-cost.
+    pub fn leg_encumbrance(&self) -> i16 {
+        self.region_encumbrance(&[crate::combat::BodyPart::LLeg, crate::combat::BodyPart::RLeg])
+    }
+
+    fn region_encumbrance(&self, parts: &[crate::combat::BodyPart]) -> i16 {
+        let mut total: i16 = 0;
+        for piece in &self.pieces {
+            for &part in parts {
+                if piece.regions.contains(part) {
+                    total = total.saturating_add(piece.encumbrance as i16);
+                }
+            }
+        }
+        total
+    }
+}
+
+/// Bandit Yeoman-tier loadout: padded doublet (torso + arms) + iron
+/// skullcap (head). Phase 3 lifts this to the rolled-per-spawn table
+/// from `Status armament tiers.md`.
+pub fn bandit_starting_worn() -> Worn {
+    use crate::combat::BodyPart;
+    Worn::new(vec![
+        ArmorPiece {
+            regions: BodyRegionMask::empty()
+                .with(BodyPart::Torso)
+                .with(BodyPart::LArm)
+                .with(BodyPart::RArm),
+            coverage_pct: 80,
+            dr: crate::combat::ArmorDr { bash: 4, cut: 2, stab: 1 },
+            encumbrance: 2,
+            item_kind: None,
+        },
+        ArmorPiece {
+            regions: BodyRegionMask::empty().with(BodyPart::Head),
+            coverage_pct: 70,
+            dr: crate::combat::ArmorDr { bash: 3, cut: 4, stab: 3 },
+            encumbrance: 1,
+            item_kind: None,
+        },
+    ])
+}
+
 /// Topmost non-player entity glyph + fg at a world cell, if any.
 /// Used by the render loop to paint hostiles on their tile. Returned
 /// as a tuple (not Renderable) to keep the SDL color conversion in
@@ -559,12 +732,13 @@ pub fn spawn_cornish_bandit(ecs: &mut Ecs, pos: Position) -> Entity {
             bg: [20, 17, 13, 255],
         },
         Speed::default(),
-        Health::starting_bandit(),
+        BodyParts::starting_human(),
         Hostile,
         Ai(AiKind::ChaseAndBump),
         CornishBandit,
         Wielded(crate::items::ItemKind::Spear),
         CombatSkills::starting_bandit(),
+        bandit_starting_worn(),
     ))
 }
 
@@ -594,7 +768,8 @@ impl CombatSkills {
         }
     }
 
-    /// Yeoman-tier Cornish bandit.
+    /// Yeoman-tier Cornish bandit. Encumbrance comes from the bandit's
+    /// `Worn` pieces via `defender_stats`; the base value here stays 0.
     pub fn starting_bandit() -> Self {
         Self {
             melee: 20,
@@ -602,9 +777,7 @@ impl CombatSkills {
             weapon_prof: 5,
             str_bonus: 1,
             agi_mod: 0,
-            // Padded doublet costs a couple Dodge points; phase 2 will
-            // compute this from per-piece encumbrance.
-            encumbrance: 2,
+            encumbrance: 0,
         }
     }
 }
@@ -791,7 +964,7 @@ impl World {
             Needs::starting(),
             Skills::starting(),
             Speed::default(),
-            Health::starting_player(),
+            BodyParts::starting_human(),
             CombatSkills::starting_player(),
             // Rabble-tier player wields a knife (the cards' "dagger")
             // off the starting pack. The pack copy stays put so the
@@ -1198,20 +1371,20 @@ impl World {
             .expect("player has Skills") = skills;
     }
 
-    /// Read the player's current `Health` for save serialization.
-    pub fn player_health(&self) -> Health {
+    /// Read the player's per-body-part HP for save serialization.
+    pub fn player_body(&self) -> BodyParts {
         self.ecs
-            .get::<&Health>(self.player)
-            .map(|h| *h)
-            .unwrap_or_else(|_| Health::starting_player())
+            .get::<&BodyParts>(self.player)
+            .map(|b| *b)
+            .unwrap_or_else(|_| BodyParts::starting_human())
     }
 
-    /// Restore the player's `Health` from a save (or any future
+    /// Restore the player's body-part HP from a save (or any future
     /// regen/heal verb). No-op if the player entity lacks the
     /// component (forward-compat).
-    pub fn set_player_health(&mut self, h: Health) {
-        if let Ok(mut hp) = self.ecs.get::<&mut Health>(self.player) {
-            *hp = h;
+    pub fn set_player_body(&mut self, b: BodyParts) {
+        if let Ok(mut bp) = self.ecs.get::<&mut BodyParts>(self.player) {
+            *bp = b;
         }
     }
 
@@ -1246,21 +1419,21 @@ impl World {
     /// (position, health, wielded ItemKind, flavor key). Phase 1 only
     /// emits "cornish_bandit" but the flavor field is stringly-typed
     /// so future hostiles fit without a schema bump.
-    pub fn snapshot_hostiles(&self) -> Vec<(Position, Health, Option<crate::items::ItemKind>, &'static str)> {
+    pub fn snapshot_hostiles(&self) -> Vec<(Position, BodyParts, Option<crate::items::ItemKind>, &'static str)> {
         let mut out = Vec::new();
         for (e, (pos, _h)) in self.ecs.query::<(&Position, &Hostile)>().iter() {
-            let health = self
+            let body = self
                 .ecs
-                .get::<&Health>(e)
-                .map(|h| *h)
-                .unwrap_or_else(|_| Health::starting_bandit());
+                .get::<&BodyParts>(e)
+                .map(|b| *b)
+                .unwrap_or_else(|_| BodyParts::starting_human());
             let wielded = self.ecs.get::<&Wielded>(e).ok().map(|w| w.0);
             let flavor = if self.ecs.satisfies::<&CornishBandit>(e).unwrap_or(false) {
                 "cornish_bandit"
             } else {
                 "unknown"
             };
-            out.push((*pos, health, wielded, flavor));
+            out.push((*pos, body, wielded, flavor));
         }
         out
     }
@@ -1270,7 +1443,7 @@ impl World {
     /// re-load doesn't double up the World::new spawn.
     pub fn restore_hostiles<I>(&mut self, snapshot: I)
     where
-        I: IntoIterator<Item = (Position, Health, Option<crate::items::ItemKind>, String)>,
+        I: IntoIterator<Item = (Position, BodyParts, Option<crate::items::ItemKind>, String)>,
     {
         let existing: Vec<Entity> = self
             .ecs
@@ -1281,13 +1454,13 @@ impl World {
         for e in existing {
             let _ = self.ecs.despawn(e);
         }
-        for (pos, health, wielded, flavor) in snapshot {
+        for (pos, body, wielded, flavor) in snapshot {
             // Phase-1 only supports the Cornish bandit flavor. Unknown
             // flavors still spawn as bandits (forward-compat default).
             let _ = flavor; // reserved for future dispatch
             let entity = spawn_cornish_bandit(&mut self.ecs, pos);
-            if let Ok(mut h) = self.ecs.get::<&mut Health>(entity) {
-                *h = health;
+            if let Ok(mut b) = self.ecs.get::<&mut BodyParts>(entity) {
+                *b = body;
             }
             if let Some(kind) = wielded {
                 if let Ok(mut w) = self.ecs.get::<&mut Wielded>(entity) {
@@ -1297,15 +1470,37 @@ impl World {
         }
     }
 
-    /// Read the player's current `Speed` (CDDA-style action-economy
-    /// rate). Slice-1 returns the raw component value; future status
-    /// effects (haste/slow), encumbrance, and crippled-limb modifiers
-    /// will compose into the effective value through this accessor.
-    pub fn player_speed(&self) -> u16 {
-        self.ecs
-            .get::<&Speed>(self.player)
+    /// Effective `Speed` for an entity, folding in:
+    /// - leg-cripple penalty (any crippled leg halves speed per
+    ///   `Damage math and hit roll.md`),
+    /// - leg encumbrance from Worn pieces (1% per encumbrance point).
+    /// Future status effects (haste/slow) compose through here too.
+    pub fn effective_speed_of(&self, entity: Entity) -> u16 {
+        let base = self
+            .ecs
+            .get::<&Speed>(entity)
             .map(|s| s.value)
-            .unwrap_or(Speed::BASELINE)
+            .unwrap_or(Speed::BASELINE);
+        let mut eff = base as i32;
+        if let Ok(bp) = self.ecs.get::<&BodyParts>(entity) {
+            if bp.any_leg_crippled() {
+                eff /= 2;
+            }
+        }
+        if let Ok(worn) = self.ecs.get::<&Worn>(entity) {
+            // 1% of base speed per leg-encumbrance point; gentle phase-2
+            // penalty pending the stamina card.
+            let leg_enc = worn.leg_encumbrance().max(0);
+            eff -= (base as i32 * leg_enc as i32) / 100;
+        }
+        eff.max(1) as u16
+    }
+
+    /// Read the player's effective `Speed`. Folded through
+    /// `effective_speed_of` so crippled legs + encumbrance compose for
+    /// free.
+    pub fn player_speed(&self) -> u16 {
+        self.effective_speed_of(self.player)
     }
 
     /// Overwrite the player's base speed. Used by save load; debug
@@ -2126,10 +2321,9 @@ impl World {
             return;
         };
         let def_stats = self.defender_stats(target);
-        let armor = self.defender_armor(target);
         let weapon = match crate::combat::weapon_profile_for(weapon_kind) {
             Some(w) => w,
-            None => return, // unarmored fist combat lands in phase 2
+            None => return, // unarmored fist combat lands in a later phase
         };
         let outcome = crate::combat::resolve_hit(atk_stats, def_stats, weapon, &mut self.rng);
         let weapon_label = weapon_kind.name();
@@ -2141,24 +2335,64 @@ impl World {
             }
             crate::combat::HitOutcome::Hit { .. } | crate::combat::HitOutcome::Crit { .. } => {
                 let crit = outcome.is_crit();
+                // Phase 2 body-part roll. Crit lets the attacker pick a
+                // weighted part (CDDA-style "you swing for the head");
+                // for phase 2 we keep it random even on crit — the
+                // aimed-shot UI lands with the verb in a later phase.
+                let part = crate::combat::roll_body_part(&mut self.rng);
+                // Walk layered armor pieces covering this part: each
+                // rolls 1d100 ≤ coverage_pct; if it catches, its DR
+                // contributes to the post-layering subtraction.
+                let armor = self.layered_dr_for(target, part);
                 let dmg = crate::combat::roll_damage(weapon, atk_stats, armor, crit, &mut self.rng);
                 let total = dmg.total();
                 self.push_message(self.hit_line(
                     attacker_is_player,
                     target_is_player,
                     weapon_label,
+                    part,
                     total,
                     crit,
                 ));
-                self.apply_damage(target, dmg);
+                self.apply_damage_to_part(target, part, dmg);
             }
         }
         // Attacker swing cost. Only spent on the player's clock — hostile
-        // swings are free in phase 1 (their AI tick is gated on the
+        // swings are free in phase 2 (their AI tick is gated on the
         // player taking an action, which already cost real time).
         if attacker_is_player {
             self.spend_moves(weapon.move_cost);
         }
+    }
+
+    /// Sum the DR contribution of every Worn piece that covers `part`
+    /// and rolls under its coverage %. The roll happens per-piece, not
+    /// per-type — a single piece either catches the swing or it doesn't.
+    fn layered_dr_for(&mut self, target: Entity, part: crate::combat::BodyPart) -> crate::combat::ArmorDr {
+        let Ok(worn) = self.ecs.get::<&Worn>(target) else {
+            return crate::combat::ArmorDr::default();
+        };
+        // Collect into a local Vec so we can drop the ECS borrow before
+        // touching the Rng (rng.d100 doesn't borrow the ECS but the
+        // Worn ref is &; keeping it open across a self.rng call is fine
+        // but the small alloc keeps the surface simple).
+        let pieces: Vec<(u8, crate::combat::ArmorDr)> = worn
+            .pieces
+            .iter()
+            .filter(|p| p.regions.contains(part))
+            .map(|p| (p.coverage_pct, p.dr))
+            .collect();
+        drop(worn);
+        let mut total = crate::combat::ArmorDr::default();
+        for (coverage_pct, dr) in pieces {
+            let roll = self.rng.d100();
+            if roll <= coverage_pct {
+                total.bash = total.bash.saturating_add(dr.bash);
+                total.cut = total.cut.saturating_add(dr.cut);
+                total.stab = total.stab.saturating_add(dr.stab);
+            }
+        }
+        total
     }
 
     fn attacker_loadout(&self, e: Entity) -> Option<(crate::combat::AttackerStats, crate::items::ItemKind)> {
@@ -2179,21 +2413,19 @@ impl World {
         let Ok(skills) = self.ecs.get::<&CombatSkills>(e) else {
             return crate::combat::DefenderStats::default();
         };
+        // Per `Armor model.md` §Encumbrance penalties: torso + arm
+        // encumbrance drops Dodge. Sum it from Worn each call rather
+        // than baking into CombatSkills so equip/unequip in phase 3
+        // is instant.
+        let worn_enc = self
+            .ecs
+            .get::<&Worn>(e)
+            .map(|w| w.upper_body_encumbrance())
+            .unwrap_or(0);
         crate::combat::DefenderStats {
             dodge_skill: skills.dodge,
             agi_mod: skills.agi_mod,
-            encumbrance: skills.encumbrance,
-        }
-    }
-
-    fn defender_armor(&self, e: Entity) -> crate::combat::ArmorDr {
-        // Phase 1 hardcodes: only the bandit has armor (padded doublet);
-        // the player is Rabble tier and runs naked. Phase 2 walks
-        // per-piece armor on equip slots.
-        if self.ecs.satisfies::<&CornishBandit>(e).unwrap_or(false) {
-            crate::combat::padded_doublet_dr()
-        } else {
-            crate::combat::unarmored()
+            encumbrance: skills.encumbrance + worn_enc,
         }
     }
 
@@ -2210,27 +2442,103 @@ impl World {
         attacker_is_player: bool,
         target_is_player: bool,
         weapon: &str,
+        part: crate::combat::BodyPart,
         dmg: u16,
         crit: bool,
     ) -> String {
         let bang = if crit { "CRIT — " } else { "" };
+        let where_ = part.label();
         match (attacker_is_player, target_is_player) {
-            (true, _) => format!("{}You strike the bandit with your {} ({} dmg).", bang, weapon, dmg),
-            (_, true) => format!("{}The bandit's {} bites you ({} dmg).", bang, weapon, dmg),
-            _ => format!("{}A {} strike lands ({} dmg).", bang, weapon, dmg),
+            (true, _) => format!(
+                "{}You strike the bandit's {} with your {} ({} dmg).",
+                bang, where_, weapon, dmg
+            ),
+            (_, true) => format!(
+                "{}The bandit's {} hits your {} ({} dmg).",
+                bang, weapon, where_, dmg
+            ),
+            _ => format!("{}A {} strike lands on the {} ({} dmg).", bang, weapon, where_, dmg),
         }
     }
 
-    fn apply_damage(&mut self, target: Entity, dmg: crate::combat::DamageTriplet) {
+    /// Apply damage to a single body part, with overflow-to-torso and
+    /// crippling rules per `Damage math and hit roll.md`. Crippling
+    /// effects (drop wielded on arm, halve speed on leg) fire here so
+    /// they're visible the very next tick.
+    fn apply_damage_to_part(
+        &mut self,
+        target: Entity,
+        part: crate::combat::BodyPart,
+        dmg: crate::combat::DamageTriplet,
+    ) {
         let total = dmg.total() as i16;
+        let mut overflow: i16 = 0;
+        let mut just_crippled = false;
         let died;
         {
-            let Ok(mut h) = self.ecs.get::<&mut Health>(target) else { return; };
-            h.hp = h.hp.saturating_sub(total);
-            died = h.hp <= 0;
+            let Ok(mut bp) = self.ecs.get::<&mut BodyParts>(target) else { return };
+            let was_crippled = bp.get(part).is_crippled();
+            let cell = bp.get_mut(part);
+            let new_hp = (cell.hp as i32) - (total as i32);
+            if new_hp < 0 && !part.is_vital() {
+                // Damage overflow on a limb spills to torso; the limb
+                // pins at 0 so cripple is binary.
+                overflow = (-new_hp).min(i16::MAX as i32) as i16;
+                cell.hp = 0;
+            } else {
+                cell.hp = new_hp.max(i16::MIN as i32) as i16;
+            }
+            if cell.is_crippled() && !was_crippled && !part.is_vital() {
+                just_crippled = true;
+            }
+            if overflow > 0 {
+                let torso = bp.get_mut(crate::combat::BodyPart::Torso);
+                torso.hp = (torso.hp as i32 - overflow as i32).max(i16::MIN as i32) as i16;
+            }
+            died = bp.is_dead();
+        }
+        // Crippling side-effects. Arm → drop wielded weapon. Leg cripple
+        // is implicit (effective_speed_of reads BodyParts each tick).
+        if just_crippled {
+            if part.is_arm() {
+                self.drop_wielded(target, part);
+            } else if part.is_leg() {
+                self.push_message(self.cripple_leg_line(target, part));
+            }
         }
         if died {
             self.on_death(target);
+        }
+    }
+
+    /// Drop the entity's wielded weapon onto its cell as ground loot
+    /// and remove the `Wielded` component. Used by arm-cripple.
+    fn drop_wielded(&mut self, target: Entity, part: crate::combat::BodyPart) {
+        let (kind, pos) = match (
+            self.ecs.get::<&Wielded>(target).ok().map(|w| w.0),
+            self.ecs.get::<&Position>(target).ok().map(|p| *p),
+        ) {
+            (Some(k), Some(p)) => (k, p),
+            _ => return,
+        };
+        let instance = kind.make_default_instance(1);
+        if let Some(cell) = self.cell_at_mut(pos.x as i64, pos.y as i64) {
+            cell.items.push(instance);
+        }
+        let _ = self.ecs.remove_one::<Wielded>(target);
+        let line = if target == self.player {
+            format!("Your {} arm fails; you drop your {}.", part.label().replace("arm", "").trim(), kind.name())
+        } else {
+            format!("The bandit's {} fails; the {} clatters down.", part.label(), kind.name())
+        };
+        self.push_message(line);
+    }
+
+    fn cripple_leg_line(&self, target: Entity, part: crate::combat::BodyPart) -> String {
+        if target == self.player {
+            format!("Your {} buckles — you can barely move.", part.label())
+        } else {
+            format!("The bandit's {} gives out.", part.label())
         }
     }
 
@@ -3347,5 +3655,112 @@ mod tests {
 
         world.restore_cell_items(snap);
         assert!(!world.cell_at(21, 15).expect("cell").items.is_empty());
+    }
+
+    // ---- Phase 2 combat: body parts + crippling -------------------
+
+    fn drop_test_bandit(world: &mut World, dx: i32, dy: i32) -> Entity {
+        let p = world.player_pos();
+        spawn_cornish_bandit(
+            &mut world.ecs,
+            Position { x: p.x + dx, y: p.y + dy },
+        )
+    }
+
+    #[test]
+    fn apply_damage_to_part_routes_to_chosen_part() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let bandit = drop_test_bandit(&mut world, 5, 0);
+        let before_head = world
+            .ecs
+            .get::<&BodyParts>(bandit)
+            .map(|b| b.head.hp)
+            .unwrap();
+        let before_torso = world
+            .ecs
+            .get::<&BodyParts>(bandit)
+            .map(|b| b.torso.hp)
+            .unwrap();
+        world.apply_damage_to_part(
+            bandit,
+            crate::combat::BodyPart::Head,
+            crate::combat::DamageTriplet { bash: 10, cut: 0, stab: 0 },
+        );
+        let bp = world.ecs.get::<&BodyParts>(bandit).map(|b| *b).unwrap();
+        assert_eq!(bp.head.hp, before_head - 10);
+        assert_eq!(bp.torso.hp, before_torso, "torso untouched");
+    }
+
+    #[test]
+    fn limb_overflow_spills_to_torso() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let bandit = drop_test_bandit(&mut world, 5, 0);
+        let starting_torso = BodyParts::TORSO_MAX;
+        // Punch the arm with massively more than its 60 HP.
+        world.apply_damage_to_part(
+            bandit,
+            crate::combat::BodyPart::LArm,
+            crate::combat::DamageTriplet { bash: 100, cut: 0, stab: 0 },
+        );
+        let bp = world.ecs.get::<&BodyParts>(bandit).map(|b| *b).unwrap();
+        assert_eq!(bp.l_arm.hp, 0, "limb pins at 0");
+        assert!(bp.l_arm.is_crippled());
+        // 60 absorbed by arm, 40 spills into torso.
+        assert_eq!(bp.torso.hp, starting_torso - (100 - BodyParts::ARM_MAX));
+    }
+
+    #[test]
+    fn vital_zero_triggers_death_event() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let bandit = drop_test_bandit(&mut world, 5, 0);
+        let pos = world.ecs.get::<&Position>(bandit).map(|p| *p).unwrap();
+        world.apply_damage_to_part(
+            bandit,
+            crate::combat::BodyPart::Head,
+            crate::combat::DamageTriplet { bash: 0, cut: 0, stab: BodyParts::HEAD_MAX as u16 + 5 },
+        );
+        // Bandit should be despawned now and have dropped its weapon.
+        assert!(world.ecs.get::<&Position>(bandit).is_err(), "bandit despawned");
+        let drops = &world.cell_at(pos.x as i64, pos.y as i64).unwrap().items;
+        assert!(drops.iter().any(|i| i.kind == ItemKind::Spear), "spear dropped on death cell");
+    }
+
+    #[test]
+    fn arm_cripple_drops_wielded_weapon() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let bandit = drop_test_bandit(&mut world, 5, 0);
+        let pos = world.ecs.get::<&Position>(bandit).map(|p| *p).unwrap();
+        world.apply_damage_to_part(
+            bandit,
+            crate::combat::BodyPart::LArm,
+            crate::combat::DamageTriplet { bash: BodyParts::ARM_MAX as u16, cut: 0, stab: 0 },
+        );
+        assert!(world.ecs.get::<&Wielded>(bandit).is_err(), "Wielded removed");
+        let drops = &world.cell_at(pos.x as i64, pos.y as i64).unwrap().items;
+        assert!(drops.iter().any(|i| i.kind == ItemKind::Spear), "weapon dropped to cell");
+    }
+
+    #[test]
+    fn leg_cripple_halves_effective_speed() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let player = world.player;
+        let before = world.effective_speed_of(player);
+        world.apply_damage_to_part(
+            player,
+            crate::combat::BodyPart::LLeg,
+            crate::combat::DamageTriplet { bash: BodyParts::LEG_MAX as u16, cut: 0, stab: 0 },
+        );
+        let after = world.effective_speed_of(player);
+        assert_eq!(after, before / 2);
+    }
+
+    #[test]
+    fn worn_upper_body_encumbrance_sums_pieces() {
+        let worn = bandit_starting_worn();
+        // Padded doublet enc 2 over torso + L arm + R arm (3 regions) +
+        // iron skullcap enc 1 over head (0 regions in upper-body sum).
+        // Expected upper_body sum = 2 * 3 = 6.
+        assert_eq!(worn.upper_body_encumbrance(), 6);
+        assert_eq!(worn.leg_encumbrance(), 0);
     }
 }

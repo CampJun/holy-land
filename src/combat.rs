@@ -21,6 +21,112 @@
 use crate::items::ItemKind;
 use crate::skill::Rng;
 
+/// Anatomical slots per the CDDA-classic six. Coverage weights below
+/// drive the post-hit body-part roll; see `Armor model.md`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BodyPart {
+    Head,
+    Torso,
+    LArm,
+    RArm,
+    LLeg,
+    RLeg,
+}
+
+impl BodyPart {
+    /// Stable iteration order. Useful for tests, save round-trip, and
+    /// any "for each part" loop.
+    pub const ALL: [BodyPart; 6] = [
+        BodyPart::Head,
+        BodyPart::Torso,
+        BodyPart::LArm,
+        BodyPart::RArm,
+        BodyPart::LLeg,
+        BodyPart::RLeg,
+    ];
+
+    /// Coverage weight on the post-hit body-part roll. Numbers from
+    /// `Armor model.md` (head 11, torso 35, arms 12 each, legs 15 each
+    /// — sums to 100).
+    pub fn coverage_weight(self) -> u8 {
+        match self {
+            BodyPart::Head => 11,
+            BodyPart::Torso => 35,
+            BodyPart::LArm => 12,
+            BodyPart::RArm => 12,
+            BodyPart::LLeg => 15,
+            BodyPart::RLeg => 15,
+        }
+    }
+
+    /// True for arms — used by the crippling rules (any crippled arm
+    /// drops the wielded weapon in phase 2; phase 3 splits L/R hands).
+    pub fn is_arm(self) -> bool {
+        matches!(self, BodyPart::LArm | BodyPart::RArm)
+    }
+
+    /// True for legs — leg cripple halves effective speed.
+    pub fn is_leg(self) -> bool {
+        matches!(self, BodyPart::LLeg | BodyPart::RLeg)
+    }
+
+    /// True for head + torso — zero HP here is a death event.
+    pub fn is_vital(self) -> bool {
+        matches!(self, BodyPart::Head | BodyPart::Torso)
+    }
+
+    /// Short label for the in-game log line.
+    pub fn label(self) -> &'static str {
+        match self {
+            BodyPart::Head => "head",
+            BodyPart::Torso => "chest",
+            BodyPart::LArm => "left arm",
+            BodyPart::RArm => "right arm",
+            BodyPart::LLeg => "left leg",
+            BodyPart::RLeg => "right leg",
+        }
+    }
+
+    /// Stable save_key for serde round-trip.
+    pub fn save_key(self) -> &'static str {
+        match self {
+            BodyPart::Head => "head",
+            BodyPart::Torso => "torso",
+            BodyPart::LArm => "l_arm",
+            BodyPart::RArm => "r_arm",
+            BodyPart::LLeg => "l_leg",
+            BodyPart::RLeg => "r_leg",
+        }
+    }
+
+    pub fn from_save_key(s: &str) -> Option<Self> {
+        Some(match s {
+            "head" => BodyPart::Head,
+            "torso" => BodyPart::Torso,
+            "l_arm" => BodyPart::LArm,
+            "r_arm" => BodyPart::RArm,
+            "l_leg" => BodyPart::LLeg,
+            "r_leg" => BodyPart::RLeg,
+            _ => return None,
+        })
+    }
+}
+
+/// Roll a body part by coverage weight. Sums to 100 so a single
+/// `rng % 100 + 1` pick works in one pass.
+pub fn roll_body_part(rng: &mut Rng) -> BodyPart {
+    let mut roll = (rng.next_u32() % 100 + 1) as u8;
+    for part in BodyPart::ALL {
+        let w = part.coverage_weight();
+        if roll <= w {
+            return part;
+        }
+        roll -= w;
+    }
+    // Unreachable — coverage weights sum to 100 and roll is in 1..=100.
+    BodyPart::Torso
+}
+
 /// Per-type damage from one swing. Each component is independent because
 /// armor reduces each type independently — see `apply_armor`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -314,6 +420,51 @@ mod tests {
         assert_eq!(dmg.bash, 7);
         assert_eq!(dmg.cut, 7);
         assert_eq!(dmg.stab, 4);
+    }
+
+    #[test]
+    fn body_part_coverage_weights_sum_to_100() {
+        let sum: u32 = BodyPart::ALL.iter().map(|p| p.coverage_weight() as u32).sum();
+        assert_eq!(sum, 100);
+    }
+
+    #[test]
+    fn body_part_roll_distribution_approximates_coverage() {
+        use std::collections::HashMap;
+        let mut rng = Rng::from_state(0xBEEF_F00D);
+        let mut counts: HashMap<BodyPart, u32> = HashMap::new();
+        let n = 20_000u32;
+        for _ in 0..n {
+            *counts.entry(roll_body_part(&mut rng)).or_insert(0) += 1;
+        }
+        // Expect each part within 3 percentage points of its weight.
+        // Loose bound so the test is stable across PRNG variants.
+        for part in BodyPart::ALL {
+            let observed = *counts.get(&part).unwrap_or(&0) as f64 / n as f64;
+            let expected = part.coverage_weight() as f64 / 100.0;
+            let delta = (observed - expected).abs();
+            assert!(
+                delta < 0.03,
+                "{:?}: observed {:.4}, expected {:.4} (delta {:.4})",
+                part, observed, expected, delta
+            );
+        }
+    }
+
+    #[test]
+    fn body_part_save_key_round_trip() {
+        for part in BodyPart::ALL {
+            assert_eq!(BodyPart::from_save_key(part.save_key()), Some(part));
+        }
+        assert_eq!(BodyPart::from_save_key("definitely_not_a_part"), None);
+    }
+
+    #[test]
+    fn body_part_role_helpers() {
+        assert!(BodyPart::Head.is_vital() && !BodyPart::Head.is_arm() && !BodyPart::Head.is_leg());
+        assert!(BodyPart::Torso.is_vital());
+        assert!(BodyPart::LArm.is_arm() && !BodyPart::LArm.is_vital());
+        assert!(BodyPart::RLeg.is_leg() && !BodyPart::RLeg.is_vital());
     }
 
     #[test]
