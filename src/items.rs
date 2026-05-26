@@ -587,7 +587,10 @@ impl ItemKind {
                     regions: &[BodyPart::Torso, BodyPart::LArm, BodyPart::RArm],
                     coverage_pct: 80,
                     dr: ArmorDr { bash: 4, cut: 2, stab: 1 },
-                    encumbrance: 2,
+                    // Per-region enc 1 (sums to 3 across torso + arms) —
+                    // padded is the lightest tier; mail bumps this to 2
+                    // and plate to 3 when those land in a later phase.
+                    encumbrance: 1,
                 }),
             },
             ItemKind::LeatherJerkin => ItemDef {

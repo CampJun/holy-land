@@ -985,25 +985,30 @@ pub struct CombatSkills {
 }
 
 impl CombatSkills {
-    /// Rabble-tier player baseline.
+    /// Rabble-tier player baseline. Numbers tuned so the
+    /// `combat::CRIT_MARGIN = 15` threshold trips on ~5–10% of hits at
+    /// the start of a run rather than every swing — per-weapon proficiency
+    /// XP train-up (later phase) climbs from this floor.
     pub fn starting_player() -> Self {
         Self {
-            melee: 15,
-            dodge: 10,
-            weapon_prof: 5,
+            melee: 6,
+            dodge: 4,
+            weapon_prof: 1,
             str_bonus: 1,
             agi_mod: 1,
             encumbrance: 0,
         }
     }
 
-    /// Yeoman-tier Cornish bandit. Encumbrance comes from the bandit's
-    /// `Worn` pieces via `defender_stats`; the base value here stays 0.
+    /// Yeoman-tier Cornish bandit. A trained roadside thug — slightly
+    /// better than a Rabble-tier player at melee and dodge, with the
+    /// padded-doublet encumbrance making them sluggish on defence.
+    /// Encumbrance from `Worn` pieces folds in via `defender_stats`.
     pub fn starting_bandit() -> Self {
         Self {
-            melee: 20,
-            dodge: 12,
-            weapon_prof: 5,
+            melee: 7,
+            dodge: 5,
+            weapon_prof: 1,
             str_bonus: 1,
             agi_mod: 0,
             encumbrance: 0,
@@ -4156,15 +4161,15 @@ mod tests {
 
     #[test]
     fn worn_upper_body_encumbrance_sums_pieces() {
-        // Bandit's Yeoman default: padded doublet (enc 2, regions
+        // Bandit's Yeoman default: padded doublet (enc 1, regions
         // torso+L arm+R arm) + iron skullcap (enc 1, region head).
-        // Upper-body sum = 2 * 3 = 6; head doesn't contribute to upper-
-        // body encumbrance.
+        // Upper-body sum = 1 * 3 = 3; head doesn't contribute to
+        // upper-body encumbrance.
         let worn = worn_from_items(&[
             ItemKind::PaddedDoublet,
             ItemKind::IronSkullcap,
         ]);
-        assert_eq!(worn.upper_body_encumbrance(), 6);
+        assert_eq!(worn.upper_body_encumbrance(), 3);
         assert_eq!(worn.leg_encumbrance(), 0);
     }
 
@@ -4295,6 +4300,48 @@ mod tests {
         assert!(has(ItemKind::Knife), "off_hand dropped");
         assert!(has(ItemKind::IronSkullcap), "head armor dropped");
         assert!(has(ItemKind::PaddedDoublet), "torso armor dropped");
+    }
+
+    #[test]
+    fn starting_crit_rate_feels_rare_not_every_swing() {
+        // Regression guard against the phase-3 "every swing is a crit"
+        // tuning bug. Simulates 5_000 player-vs-bandit and bandit-vs-
+        // player swings and asserts the crit rate stays under 25%. If a
+        // future change spikes this, the test names the symptom before
+        // the player ever sees it.
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let bandit = drop_test_bandit(&mut world, 5, 0);
+        let player = world.player;
+        let p_to_b_atk = world.attacker_loadout(player).unwrap();
+        let p_to_b_def = world.defender_stats(bandit);
+        let b_to_p_atk = world.attacker_loadout(bandit).unwrap();
+        let b_to_p_def = world.defender_stats(player);
+        let knife = crate::combat::weapon_profile_for(ItemKind::Knife).unwrap();
+        let spear = crate::combat::weapon_profile_for(ItemKind::Spear).unwrap();
+        let n = 5_000;
+        let mut p_crits = 0u32;
+        let mut b_crits = 0u32;
+        let mut rng = world.rng;
+        for _ in 0..n {
+            if crate::combat::resolve_hit(p_to_b_atk.0, p_to_b_def, knife, &mut rng).is_crit() {
+                p_crits += 1;
+            }
+            if crate::combat::resolve_hit(b_to_p_atk.0, b_to_p_def, spear, &mut rng).is_crit() {
+                b_crits += 1;
+            }
+        }
+        let p_rate = p_crits as f64 / n as f64;
+        let b_rate = b_crits as f64 / n as f64;
+        assert!(
+            p_rate < 0.25,
+            "player crit rate {:.3} too high — skills overpowered vs CRIT_MARGIN",
+            p_rate
+        );
+        assert!(
+            b_rate < 0.25,
+            "bandit crit rate {:.3} too high — skills overpowered vs CRIT_MARGIN",
+            b_rate
+        );
     }
 
     #[test]
