@@ -432,13 +432,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 Skills::starting().foraging
             };
+            let conv = |s: save::SkillSave| Skill { value: s.value, daily_xp: s.daily_xp };
             world.set_player_skills(Skills {
                 fire_making: Skill {
                     value: saved_fm.value,
                     daily_xp: saved_fm.daily_xp,
                 },
                 foraging,
+                melee: conv(run.skills.melee),
+                ranged: conv(run.skills.ranged),
+                dodge: conv(run.skills.dodge),
             });
+            // Re-sync combat stats from the loaded URW skill values so
+            // the player's in-fight bonuses reflect their long-run
+            // training right after load.
+            world.sync_combat_skills_from_skills();
         }
         if run.rng_state != 0 {
             world.rng = Rng::from_state(run.rng_state);
@@ -1748,6 +1756,18 @@ fn save_game(
             value: player_skills.foraging.value,
             daily_xp: player_skills.foraging.daily_xp,
         },
+        melee: SkillSave {
+            value: player_skills.melee.value,
+            daily_xp: player_skills.melee.daily_xp,
+        },
+        ranged: SkillSave {
+            value: player_skills.ranged.value,
+            daily_xp: player_skills.ranged.daily_xp,
+        },
+        dodge: SkillSave {
+            value: player_skills.dodge.value,
+            daily_xp: player_skills.dodge.daily_xp,
+        },
     };
     run.rng_state = world.rng.state;
     run.seed = world.seed;
@@ -2440,7 +2460,8 @@ fn info_tab_row_count(world: &World, tab: InfoTab) -> usize {
         // item. A on a slot row unequips; A on a pack row equips.
         InfoTab::Inventory => world::EquipSlot::ALL.len() + world.player_pack().contents.len(),
         InfoTab::Crafting => crafting::RECIPES.len(),
-        InfoTab::Skills => 1, // Fire Making; slice-2 adds more skills
+        // Fire Making, Foraging, Melee, Ranged, Dodge.
+        InfoTab::Skills => 5,
     }
 }
 
@@ -2653,18 +2674,22 @@ fn draw_info_skills(
     palette: &Palette,
 ) {
     let skills = world.player_skills();
-    // Slice-1 has just Fire Making; slice-2 extends the iter() chain
-    // with Cookery/Foraging/Fishing/etc.
-    let rows: Vec<(SkillKind, &skill::Skill)> = vec![(
-        SkillKind::FireMaking,
-        skills.get(SkillKind::FireMaking),
-    )];
+    let rows: [(SkillKind, &skill::Skill); 5] = [
+        (SkillKind::FireMaking, skills.get(SkillKind::FireMaking)),
+        (SkillKind::Foraging, skills.get(SkillKind::Foraging)),
+        (SkillKind::Melee, skills.get(SkillKind::Melee)),
+        (SkillKind::Ranged, skills.get(SkillKind::Ranged)),
+        (SkillKind::Dodge, skills.get(SkillKind::Dodge)),
+    ];
 
     for (i, (kind, s)) in rows.into_iter().enumerate() {
         let row_y = layout.first_row_y() + i as i32;
         let is_selected = i == selected;
         let label = kind.display_name();
-        let value = format!("{}%", s.value);
+        // Single row per skill: value % + daily XP banked toward next
+        // level. Drops the multi-line sub-row pattern so all five fit
+        // in the 22-cell panel without scrolling.
+        let value = format!("{}% (+{}xp)", s.value, s.daily_xp);
         draw_menu_row(
             cells,
             layout,
@@ -2674,16 +2699,6 @@ fn draw_info_skills(
             palette.panel_fg,
             Some((&value, palette.panel_dim_fg)),
             palette,
-        );
-        // Sub-line: daily XP toward next level.
-        let xp_line = format!("  daily XP {}", s.daily_xp);
-        put_text(
-            cells,
-            layout.inner_x(),
-            row_y + 1,
-            &xp_line,
-            palette.panel_dim_fg,
-            palette.panel_bg,
         );
     }
 }

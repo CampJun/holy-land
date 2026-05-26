@@ -344,6 +344,14 @@ pub struct SkillsSave {
     // skill to 0 by accident.
     #[serde(default)]
     pub foraging: SkillSave,
+    // Phase-9 combat skills. Additive — older saves load with all
+    // three at 0 (matches Rabble-tier starting values).
+    #[serde(default)]
+    pub melee: SkillSave,
+    #[serde(default)]
+    pub ranged: SkillSave,
+    #[serde(default)]
+    pub dodge: SkillSave,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -823,6 +831,9 @@ mod tests {
                     daily_xp: 6,
                 },
                 foraging: SkillSave::default(),
+                melee: SkillSave::default(),
+                ranged: SkillSave::default(),
+                dodge: SkillSave::default(),
             },
             rng_state: 0xC0FFEE,
             terrain_mutations: vec![TerrainMutationSave {

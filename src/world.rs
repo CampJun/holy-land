@@ -2854,6 +2854,58 @@ impl World {
     // through `apply_damage`; entities at 0 HP route to `on_death`,
     // which drops the wielded weapon and despawns.
 
+    /// Award XP for a combat outcome and sync CombatSkills if the
+    /// underlying URW skill leveled up. The player is the only entity
+    /// with `Skills`; hostiles short-circuit.
+    fn award_combat_xp(&mut self, entity: Entity, kind: crate::skill::SkillKind, hit: bool) {
+        if entity != self.player {
+            return;
+        }
+        let leveled = {
+            let mut skills = self
+                .ecs
+                .get::<&mut crate::skill::Skills>(entity)
+                .map(|s| *s)
+                .unwrap_or_default();
+            let leveled = crate::skill::award_xp(skills.get_mut(kind), hit);
+            self.set_player_skills(skills);
+            leveled
+        };
+        if leveled {
+            self.sync_combat_skills_from_skills();
+        }
+    }
+
+    /// Sync the player's `CombatSkills` (the in-fight stat block read by
+    /// the resolver) from the URW `Skills` (the long-run training
+    /// ledger). +1 to the matching CombatSkills entry per Skills level.
+    /// Idempotent because each level only counts once via the starting
+    /// floor + Skills.value delta.
+    pub fn sync_combat_skills_from_skills(&mut self) {
+        let skills = self.ecs.get::<&crate::skill::Skills>(self.player).map(|s| *s);
+        let mut cs = self
+            .ecs
+            .get::<&mut CombatSkills>(self.player)
+            .ok()
+            .map(|c| *c);
+        if let (Ok(s), Some(mut combat)) = (skills, cs.as_mut()) {
+            let base = CombatSkills::starting_player();
+            // Each Skills level bumps the matching CombatSkills stat by
+            // +1 above the starting floor. Skills cap at 99 → max bump
+            // is +99, which keeps CombatSkills within signed-i16 safely.
+            combat.melee = base.melee + s.melee.value as i16;
+            combat.dodge = base.dodge + s.dodge.value as i16;
+            // Ranged: stand-in until the resolver splits Melee + Ranged
+            // — for now treat the higher of melee/ranged value as the
+            // weapon_prof bump so an archer who trains Ranged feels the
+            // upgrade on bow shots.
+            let weapon_bump = s.melee.value.max(s.ranged.value) as i16;
+            combat.weapon_prof = base.weapon_prof + weapon_bump / 4;
+            *self.ecs.get::<&mut CombatSkills>(self.player).unwrap() = *combat;
+        }
+        let _ = cs;
+    }
+
     /// Run one melee swing from `attacker` against `target`. `range` is
     /// the Chebyshev distance between the two (1 = adjacent, 2 = reach).
     /// A reach-≥2 weapon used at range 1 takes the no-reach damage
@@ -2873,6 +2925,17 @@ impl World {
         let weapon_label = weapon_kind.name();
         let attacker_is_player = attacker == self.player;
         let target_is_player = target == self.player;
+        // Capture hit-or-miss BEFORE moving the outcome into the match
+        // so we can award XP after the resolution.
+        let landed = outcome.landed();
+        // Capture the margin so we can tell a Dodge-eligible near-miss
+        // (close-call: defender just barely beat the attacker) from a
+        // wide miss (defender wasn't even threatened).
+        let margin = match outcome {
+            crate::combat::HitOutcome::Miss => -1,
+            crate::combat::HitOutcome::Hit { margin } => margin,
+            crate::combat::HitOutcome::Crit { margin } => margin,
+        };
         match outcome {
             crate::combat::HitOutcome::Miss => {
                 self.push_message(self.miss_line(attacker_is_player, target_is_player, weapon_label));
@@ -2881,7 +2944,6 @@ impl World {
                 let crit = outcome.is_crit();
                 let part = crate::combat::roll_body_part(&mut self.rng);
                 let armor = self.layered_dr_for(target, part);
-                // No-reach penalty: reach-2 swung at adjacent loses 30%.
                 let situational_pct = if weapon.reach >= 2 && range == 1 {
                     crate::combat::NO_REACH_DAMAGE_PCT
                 } else {
@@ -2909,6 +2971,13 @@ impl World {
         }
         if attacker_is_player {
             self.spend_moves(weapon.move_cost);
+        }
+        // Skill XP. Attacker always trains Melee; defender trains Dodge
+        // only on a near-miss (margin in [-4, -1]) — pure miss + crit
+        // teach nothing dodge-relevant.
+        self.award_combat_xp(attacker, crate::skill::SkillKind::Melee, landed);
+        if !landed && (-4..0).contains(&margin) {
+            self.award_combat_xp(target, crate::skill::SkillKind::Dodge, true);
         }
     }
 
@@ -2977,6 +3046,7 @@ impl World {
         let outcome = crate::combat::resolve_hit(atk_stats, def_stats, weapon, &mut self.rng);
         let target_is_player = target == self.player;
         let weapon_label = weapon_kind.name();
+        let landed = outcome.landed();
         match outcome {
             crate::combat::HitOutcome::Miss => {
                 self.push_message(self.ranged_miss_line(attacker_is_player, target_is_player));
@@ -3017,6 +3087,10 @@ impl World {
         if attacker_is_player {
             self.spend_moves(ranged.move_cost);
         }
+        // Skill XP. Bow + arrow swing always trains Ranged; defender
+        // trains nothing on a ranged miss — Dodge is a melee construct
+        // until a future card splits Ranged-Dodge.
+        self.award_combat_xp(attacker, crate::skill::SkillKind::Ranged, landed);
     }
 
     fn ranged_loadout(
@@ -5242,6 +5316,70 @@ mod tests {
             && body_before.l_leg.hp == body_after.l_leg.hp
             && body_before.r_leg.hp == body_after.r_leg.hp;
         assert!(unchanged, "tree should block the reach attack");
+    }
+
+    #[test]
+    fn melee_xp_awarded_on_player_swing() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let bandit = drop_test_bandit(&mut world, 1, 0);
+        let before_value = world.player_skills().melee.value;
+        let before_daily = world.player_skills().melee.daily_xp;
+        world.perform_melee_attack(world.player, bandit, 1);
+        let after = world.player_skills().melee;
+        // At starting value=0 the level-up threshold (5) catches a hit
+        // immediately, bumping value and resetting daily_xp. So measure
+        // *combined* progress: either value or daily_xp must climb.
+        let advanced = after.value > before_value || after.daily_xp > before_daily;
+        assert!(advanced, "swing should grant Melee XP (value or daily)");
+    }
+
+    #[test]
+    fn ranged_xp_awarded_on_player_shot() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        {
+            let mut pack = world.ecs.get::<&mut Pack>(world.player).unwrap();
+            pack.contents.clear();
+            pack.try_add(ItemKind::Bow.make_default_instance(1)).unwrap();
+            pack.try_add(ItemKind::Arrow.make_default_instance(5)).unwrap();
+        }
+        world.equip_from_pack(ItemKind::Bow);
+        let p = world.player_pos();
+        for dx in 1..=4 {
+            if let Some(c) = world.cell_at_mut((p.x + dx) as i64, p.y as i64) {
+                c.terrain = TerrainKind::Grass;
+                c.decoration = Decoration::None;
+            }
+        }
+        let bandit = spawn_cornish_bandit(
+            &mut world.ecs,
+            Position { x: p.x + 4, y: p.y },
+            YeomanLoadout::default(),
+        );
+        let before_value = world.player_skills().ranged.value;
+        let before_daily = world.player_skills().ranged.daily_xp;
+        world.perform_ranged_attack(world.player, bandit);
+        let after = world.player_skills().ranged;
+        let advanced = after.value > before_value || after.daily_xp > before_daily;
+        assert!(advanced, "shot should grant Ranged XP (value or daily)");
+    }
+
+    #[test]
+    fn sync_combat_skills_from_skills_bumps_melee() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let base = CombatSkills::starting_player().melee;
+        // Bump Skills.melee directly to simulate many days of training.
+        {
+            let mut s = world.player_skills();
+            s.melee.value = 10;
+            world.set_player_skills(s);
+        }
+        world.sync_combat_skills_from_skills();
+        let after = world
+            .ecs
+            .get::<&CombatSkills>(world.player)
+            .map(|c| c.melee)
+            .unwrap();
+        assert_eq!(after, base + 10);
     }
 
     #[test]
