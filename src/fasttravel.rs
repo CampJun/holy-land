@@ -34,10 +34,11 @@ const ROAD_COST_MULT_NUM: u32 = 40;
 const ROAD_COST_MULT_DEN: u32 = 100;
 
 /// Cell-step cost on the player's clock for each `try_move_player` call
-/// during fast-travel. Matches the existing `COST_MOVE_TILE` constant
-/// in `world.rs`; mirrored here so the planner's time estimate stays
-/// in sync.
-const CELL_STEP_CLOCK_SECS: u32 = 5;
+/// during fast-travel. Derived from `MOVE_COST_TILE / MOVES_PER_SECOND`
+/// at baseline speed so the planner's time estimate stays in sync with
+/// the combat-slice move-cost economy.
+const CELL_STEP_CLOCK_SECS: u32 =
+    crate::world::MOVE_COST_TILE / crate::world::MOVES_PER_SECOND;
 
 /// Node-budget cap for per-leg cell A*. A leg crosses at most one
 /// chunk boundary; 2 KB of nodes (~ a chunk's worth of cells × small
@@ -446,6 +447,12 @@ mod tests {
 
     #[test]
     fn cell_step_clock_secs_matches_world() {
-        assert_eq!(CELL_STEP_CLOCK_SECS, crate::world::COST_MOVE_TILE);
+        // Sanity-check the derivation against the underlying constants
+        // — a future bump to MOVE_COST_TILE or MOVES_PER_SECOND should
+        // recompute this automatically.
+        assert_eq!(
+            CELL_STEP_CLOCK_SECS,
+            crate::world::MOVE_COST_TILE / crate::world::MOVES_PER_SECOND
+        );
     }
 }

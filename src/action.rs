@@ -19,11 +19,13 @@ use crate::world::{TerrainKind, World};
 // ---- Per-verb design constants ---------------------------------------
 //
 // STYLE.md §2: source of truth for verb tuning lives in this module,
-// not in world.rs. World.rs only owns engine-level constants (movement
-// cost, day-length, FOV radii). Verb costs are inlined in
-// `ActionId::base_cost()` so there's literally one match arm per verb
-// to edit when rebalancing. Other verb tuning (materials, modifiers,
-// output) lives as `const`s below, grouped by verb.
+// not in world.rs. World.rs only owns engine-level constants (the
+// MOVES_PER_SECOND denominator, the tile-step move-cost, day-length,
+// FOV radii). Verb costs are inlined in `ActionId::move_cost()` so
+// there's literally one match arm per verb to edit when rebalancing.
+// All values are in CDDA-style moves; multiply by 0.01s at baseline
+// speed to read as wall-clock. Other verb tuning (materials,
+// modifiers, output) lives as `const`s below, grouped by verb.
 
 // Fire Making (verb: StartFire).
 const FIRE_BONUS_FLINT_AND_STEEL: i32 = 30;
@@ -83,45 +85,52 @@ pub enum ActionId {
 }
 
 impl ActionId {
-    /// Base cost in game-seconds before need-penalty amplification.
-    /// Single source of truth for verb tuning — evaluators consult
-    /// this for the menu's "Xs" readout; executors pass it into
-    /// `world.spend_action_time`. Change a value here and every call
-    /// site picks it up.
-    pub fn base_cost(self) -> u32 {
+    /// Base cost in CDDA-style moves before need-penalty amplification.
+    /// Single source of truth for verb tuning. The resolver translates
+    /// to wall-clock game-seconds via `World::moves_to_seconds` (which
+    /// folds in the actor's effective speed) for the menu's "Xs"
+    /// readout; executors pass the move-cost into `world.spend_moves`.
+    /// Change a value here and every call site picks it up.
+    ///
+    /// Baseline player speed is 100, so a move-cost of N maps to
+    /// `N/100` game-seconds at full health. Combat verbs landing in
+    /// later cards (Attack/Shoot/Brace/Grapple/…) will be tuned in
+    /// these same units alongside per-weapon move-cost tables.
+    pub fn move_cost(self) -> u32 {
         match self {
-            ActionId::Pickup => 3,
-            ActionId::EatRation => 10,
-            ActionId::EatHerb => 5,
-            ActionId::DrinkWaterskin => 5,
-            ActionId::DrinkFromStream => 10,
-            ActionId::FillWaterskin => 20,
-            ActionId::PitchTent => 300,
-            ActionId::UnrollBedroll => 30,
+            ActionId::Pickup => 300,
+            ActionId::EatRation => 1_000,
+            ActionId::EatHerb => 500,
+            ActionId::DrinkWaterskin => 500,
+            ActionId::DrinkFromStream => 1_000,
+            ActionId::FillWaterskin => 2_000,
+            ActionId::PitchTent => 30_000,
+            ActionId::UnrollBedroll => 3_000,
             // SetupCamp queues PitchTent + UnrollBedroll; the menu's
             // surfaced cost is the sum so the player sees the total.
-            ActionId::SetupCamp => Self::PitchTent.base_cost() + Self::UnrollBedroll.base_cost(),
-            ActionId::StartFire => 60,
-            ActionId::FeedFire => 15,
-            ActionId::ChopTree => 120,
-            ActionId::PickHerb => 10,
+            ActionId::SetupCamp => Self::PitchTent.move_cost() + Self::UnrollBedroll.move_cost(),
+            ActionId::StartFire => 6_000,
+            ActionId::FeedFire => 1_500,
+            ActionId::ChopTree => 12_000,
+            ActionId::PickHerb => 1_000,
             // Sleep computes its real target duration at execute time
             // (next dawn or 8h, whichever is shorter); the menu's cost
             // readout is just a placeholder. Phase 16 ships the
             // duration math; an explicit "Sleep until..." picker is a
             // future polish item.
             ActionId::Sleep => 0,
-            ActionId::Fishing => 600,
-            ActionId::PlacePan => 5,
-            ActionId::PickUpPan => 5,
-            ActionId::CookFish => 5,
-            ActionId::SeasonPan => 5,
-            ActionId::TakeFromPan => 5,
-            ActionId::HarvestMoss => 30,
-            ActionId::CutFern => 10,
-            ActionId::DigFern => 60,
-            ActionId::CutGorse => 120,
-            ActionId::CutBracken => 20,
+            ActionId::Fishing => 60_000,
+            ActionId::PlacePan => 500,
+            ActionId::PickUpPan => 500,
+            ActionId::CookFish => 500,
+            ActionId::SeasonPan => 500,
+            ActionId::TakeFromPan => 500,
+            // Phase D harvest verbs (moves = old game-seconds × 100).
+            ActionId::HarvestMoss => 3_000,
+            ActionId::CutFern => 1_000,
+            ActionId::DigFern => 6_000,
+            ActionId::CutGorse => 12_000,
+            ActionId::CutBracken => 2_000,
         }
     }
 
@@ -325,7 +334,7 @@ impl Availability {
 
 pub fn evaluate(world: &World, id: ActionId) -> Availability {
     let pack = world.player_pack();
-    let cost = id.base_cost();
+    let cost = world.moves_to_seconds(id.move_cost());
     match id {
         ActionId::Pickup => eval_pickup(world),
         ActionId::EatRation => {
@@ -359,7 +368,7 @@ pub fn evaluate(world: &World, id: ActionId) -> Availability {
         ActionId::StartFire => eval_start_fire(world),
         ActionId::FeedFire => eval_feed_fire(world),
         ActionId::Sleep => Availability::Available {
-            cost_game_seconds: ActionId::Sleep.base_cost(),
+            cost_game_seconds: world.moves_to_seconds(ActionId::Sleep.move_cost()),
         },
         ActionId::Fishing => eval_fishing(world),
         ActionId::PlacePan => eval_place_pan(world),
@@ -474,7 +483,7 @@ fn eval_start_fire(world: &World) -> Availability {
         };
     }
     Availability::Available {
-        cost_game_seconds: ActionId::StartFire.base_cost(),
+        cost_game_seconds: world.moves_to_seconds(ActionId::StartFire.move_cost()),
     }
 }
 
@@ -503,7 +512,7 @@ fn eval_feed_fire(world: &World) -> Availability {
         };
     }
     Availability::Available {
-        cost_game_seconds: ActionId::FeedFire.base_cost(),
+        cost_game_seconds: world.moves_to_seconds(ActionId::FeedFire.move_cost()),
     }
 }
 
@@ -534,7 +543,7 @@ fn eval_pickup(world: &World) -> Availability {
         };
     }
     Availability::Available {
-        cost_game_seconds: ActionId::Pickup.base_cost(),
+        cost_game_seconds: world.moves_to_seconds(ActionId::Pickup.move_cost()),
     }
 }
 
@@ -552,7 +561,7 @@ pub fn execute(world: &mut World, id: ActionId) -> ExecuteOutcome {
         ActionId::Pickup => {
             let picked = world.try_pickup_all_at_player();
             if picked > 0 {
-                world.spend_action_time(ActionId::Pickup.base_cost());
+                world.spend_moves(ActionId::Pickup.move_cost());
             }
             ExecuteOutcome::Done(format!("picked up {} stack(s)", picked))
         }
@@ -561,7 +570,7 @@ pub fn execute(world: &mut World, id: ActionId) -> ExecuteOutcome {
             ConsumeFrom::Stack(ItemKind::Ration),
             NeedKind::Hunger,
             25,
-            ActionId::EatRation.base_cost(),
+            world.moves_to_seconds(ActionId::EatRation.move_cost()),
             "ate a ration (+25 hunger)",
             "no rations to eat",
         ),
@@ -570,7 +579,7 @@ pub fn execute(world: &mut World, id: ActionId) -> ExecuteOutcome {
             ConsumeFrom::Stack(ItemKind::Herb),
             NeedKind::Hunger,
             5,
-            ActionId::EatHerb.base_cost(),
+            world.moves_to_seconds(ActionId::EatHerb.move_cost()),
             "ate a herb (+5 hunger)",
             "no herbs to eat",
         ),
@@ -579,25 +588,26 @@ pub fn execute(world: &mut World, id: ActionId) -> ExecuteOutcome {
             ConsumeFrom::WaterskinCharge,
             NeedKind::Thirst,
             20,
-            ActionId::DrinkWaterskin.base_cost(),
+            world.moves_to_seconds(ActionId::DrinkWaterskin.move_cost()),
             "drank from waterskin (+20 thirst)",
             "no water to drink",
         ),
         ActionId::PitchTent => {
-            world.queue_multi_turn(&[(ActionId::PitchTent, ActionId::PitchTent.base_cost())]);
+            let tgt = world.moves_to_seconds(ActionId::PitchTent.move_cost());
+            world.queue_multi_turn(&[(ActionId::PitchTent, tgt)]);
             ExecuteOutcome::Done("pitching tent...".to_string())
         }
         ActionId::UnrollBedroll => {
-            world.queue_multi_turn(&[(
-                ActionId::UnrollBedroll,
-                ActionId::UnrollBedroll.base_cost(),
-            )]);
+            let tgt = world.moves_to_seconds(ActionId::UnrollBedroll.move_cost());
+            world.queue_multi_turn(&[(ActionId::UnrollBedroll, tgt)]);
             ExecuteOutcome::Done("unrolling bedroll...".to_string())
         }
         ActionId::SetupCamp => {
+            let tent = world.moves_to_seconds(ActionId::PitchTent.move_cost());
+            let bed = world.moves_to_seconds(ActionId::UnrollBedroll.move_cost());
             world.queue_multi_turn(&[
-                (ActionId::PitchTent, ActionId::PitchTent.base_cost()),
-                (ActionId::UnrollBedroll, ActionId::UnrollBedroll.base_cost()),
+                (ActionId::PitchTent, tent),
+                (ActionId::UnrollBedroll, bed),
             ]);
             ExecuteOutcome::Done("setting up camp...".to_string())
         }
@@ -628,7 +638,8 @@ pub fn execute(world: &mut World, id: ActionId) -> ExecuteOutcome {
 /// system surface a progress bar) without each verb reinventing the
 /// queue boilerplate.
 fn execute_queue_5s(world: &mut World, id: ActionId) -> ExecuteOutcome {
-    world.queue_multi_turn(&[(id, id.base_cost())]);
+    let tgt = world.moves_to_seconds(id.move_cost());
+    world.queue_multi_turn(&[(id, tgt)]);
     let msg = match id {
         ActionId::PlacePan => "placing pan on fire...",
         ActionId::PickUpPan => "lifting pan...",
@@ -707,7 +718,7 @@ fn execute_start_fire(world: &mut World) -> ExecuteOutcome {
         format!("strike failed (+1 Fire Making XP)")
     };
 
-    world.spend_action_time(ActionId::StartFire.base_cost());
+    world.spend_moves(ActionId::StartFire.move_cost());
     // Phase 13b: a freshly lit fire bumps night FOV radius — recompute
     // so the extended sight shows on the same frame as the success log,
     // not after the next move.
@@ -754,7 +765,7 @@ const FISHING_SUCCESS_PCT: u8 = 20;
 fn eval_fishing(world: &World) -> Availability {
     Availability::from_has(
         find_adjacent_terrain(world, is_pond).is_some(),
-        ActionId::Fishing.base_cost(),
+        world.moves_to_seconds(ActionId::Fishing.move_cost()),
         "no pond adjacent",
     )
 }
@@ -764,7 +775,7 @@ fn execute_fishing(world: &mut World) -> ExecuteOutcome {
         return ExecuteOutcome::Done("no pond adjacent".to_string());
     }
     let roll = world.rng.d100();
-    world.spend_action_time(ActionId::Fishing.base_cost());
+    world.spend_moves(ActionId::Fishing.move_cost());
     if roll <= FISHING_SUCCESS_PCT {
         let pos = world.player_pos();
         if let Some(cell) = world.cell_at_mut(pos.x as i64, pos.y as i64) {
@@ -811,7 +822,7 @@ fn execute_feed_fire(world: &mut World) -> ExecuteOutcome {
         }
     }
 
-    world.spend_action_time(ActionId::FeedFire.base_cost());
+    world.spend_moves(ActionId::FeedFire.move_cost());
     ExecuteOutcome::Done("fed the fire (+30m burn)".to_string())
 }
 
@@ -1294,14 +1305,14 @@ fn eval_place_pan(world: &World) -> Availability {
         };
     }
     Availability::Available {
-        cost_game_seconds: ActionId::PlacePan.base_cost(),
+        cost_game_seconds: world.moves_to_seconds(ActionId::PlacePan.move_cost()),
     }
 }
 
 fn eval_pick_up_pan(world: &World) -> Availability {
     if any_reachable_pan(world, |c, _f| matches!(c, PanContents::Empty)) {
         Availability::Available {
-            cost_game_seconds: ActionId::PickUpPan.base_cost(),
+            cost_game_seconds: world.moves_to_seconds(ActionId::PickUpPan.move_cost()),
         }
     } else {
         Availability::Unavailable {
@@ -1322,7 +1333,7 @@ fn eval_cook_fish(world: &World) -> Availability {
         };
     }
     Availability::Available {
-        cost_game_seconds: ActionId::CookFish.base_cost(),
+        cost_game_seconds: world.moves_to_seconds(ActionId::CookFish.move_cost()),
     }
 }
 
@@ -1342,7 +1353,7 @@ fn eval_season_pan(world: &World) -> Availability {
         };
     }
     Availability::Available {
-        cost_game_seconds: ActionId::SeasonPan.base_cost(),
+        cost_game_seconds: world.moves_to_seconds(ActionId::SeasonPan.move_cost()),
     }
 }
 
@@ -1357,7 +1368,7 @@ fn eval_take_from_pan(world: &World) -> Availability {
     });
     if ready {
         Availability::Available {
-            cost_game_seconds: ActionId::TakeFromPan.base_cost(),
+            cost_game_seconds: world.moves_to_seconds(ActionId::TakeFromPan.move_cost()),
         }
     } else {
         Availability::Unavailable {
@@ -1419,7 +1430,7 @@ fn is_water(t: TerrainKind) -> bool {
 fn eval_drink_from_stream(world: &World) -> Availability {
     Availability::from_has(
         find_adjacent_terrain(world, is_water).is_some(),
-        ActionId::DrinkFromStream.base_cost(),
+        world.moves_to_seconds(ActionId::DrinkFromStream.move_cost()),
         "no water adjacent",
     )
 }
@@ -1431,7 +1442,7 @@ fn execute_drink_from_stream(world: &mut World) -> ExecuteOutcome {
     let mut needs = world.player_needs();
     needs.restore(NeedKind::Thirst, 20);
     world.set_player_needs(needs);
-    world.spend_action_time(ActionId::DrinkFromStream.base_cost());
+    world.spend_moves(ActionId::DrinkFromStream.move_cost());
     ExecuteOutcome::Done("drank from water (+20 thirst)".to_string())
 }
 
@@ -1447,7 +1458,7 @@ fn eval_fill_waterskin(world: &World) -> Availability {
     });
     Availability::from_has(
         has_partial,
-        ActionId::FillWaterskin.base_cost(),
+        world.moves_to_seconds(ActionId::FillWaterskin.move_cost()),
         "waterskins already full",
     )
 }
@@ -1469,7 +1480,7 @@ fn execute_fill_waterskin(world: &mut World) -> ExecuteOutcome {
         true
     };
     if filled {
-        world.spend_action_time(ActionId::FillWaterskin.base_cost());
+        world.spend_moves(ActionId::FillWaterskin.move_cost());
         ExecuteOutcome::Done("waterskin filled (4 uses)".to_string())
     } else {
         ExecuteOutcome::Done("no empty waterskin".to_string())
@@ -1484,7 +1495,7 @@ fn eval_chop_tree(world: &World) -> Availability {
     }
     Availability::from_has(
         find_adjacent_terrain(world, |t| t == TerrainKind::TreeTrunk).is_some(),
-        ActionId::ChopTree.base_cost(),
+        world.moves_to_seconds(ActionId::ChopTree.move_cost()),
         "no tree adjacent",
     )
 }
@@ -1534,7 +1545,7 @@ fn execute_chop_tree(world: &mut World) -> ExecuteOutcome {
             ItemMetadata::None,
         ));
     }
-    world.spend_action_time(ActionId::ChopTree.base_cost());
+    world.spend_moves(ActionId::ChopTree.move_cost());
     world.recompute_fov();
     ExecuteOutcome::Done(format!("tree felled (+{} firewood on the ground)", count))
 }
@@ -1547,7 +1558,7 @@ fn eval_pick_herb(world: &World) -> Availability {
     }
     Availability::from_has(
         find_adjacent_item(world, |i| i.kind == ItemKind::Herb).is_some(),
-        ActionId::PickHerb.base_cost(),
+        world.moves_to_seconds(ActionId::PickHerb.move_cost()),
         "no herb adjacent",
     )
 }
@@ -1574,7 +1585,7 @@ fn execute_pick_herb(world: &mut World) -> ExecuteOutcome {
     let add_result = world.player_pack_mut().try_add(herb);
     match add_result {
         Ok(()) => {
-            world.spend_action_time(ActionId::PickHerb.base_cost());
+            world.spend_moves(ActionId::PickHerb.move_cost());
             ExecuteOutcome::Done("picked herb".to_string())
         }
         Err(returned) => {
@@ -1642,7 +1653,7 @@ fn eval_harvest_decoration<F: Fn(crate::flora::Decoration) -> bool>(
     }
     Availability::from_has(
         find_adjacent_decoration(world, pred).is_some(),
-        id.base_cost(),
+        world.moves_to_seconds(id.move_cost()),
         missing_reason,
     )
 }
@@ -1691,7 +1702,7 @@ fn execute_harvest_moss(world: &mut World) -> ExecuteOutcome {
     let count = 1 + (world.rng.next_u32() % 2) as u16; // 1..=2
     world.set_decoration_at(wx as i64, wy as i64, crate::flora::Decoration::None);
     deliver_stack(world, wx, wy, ItemKind::Moss, count);
-    world.spend_action_time(ActionId::HarvestMoss.base_cost());
+    world.spend_moves(ActionId::HarvestMoss.move_cost());
     award_foraging_xp(world, true);
     ExecuteOutcome::Done(format!("harvested {} moss", count))
 }
@@ -1707,7 +1718,7 @@ fn execute_cut_fern(world: &mut World) -> ExecuteOutcome {
     };
     world.set_decoration_at(wx as i64, wy as i64, crate::flora::Decoration::None);
     deliver_stack(world, wx, wy, ItemKind::FernFrond, 2);
-    world.spend_action_time(ActionId::CutFern.base_cost());
+    world.spend_moves(ActionId::CutFern.move_cost());
     // CutFern doesn't train Foraging — it's a brute-force cut, no skill.
     ExecuteOutcome::Done("cut fern (+2 fronds)".to_string())
 }
@@ -1725,7 +1736,7 @@ fn execute_dig_fern(world: &mut World) -> ExecuteOutcome {
     world.set_decoration_at(wx as i64, wy as i64, crate::flora::Decoration::None);
     deliver_stack(world, wx, wy, ItemKind::FernRoot, 1);
     deliver_stack(world, wx, wy, ItemKind::FernFrond, frond_count);
-    world.spend_action_time(ActionId::DigFern.base_cost());
+    world.spend_moves(ActionId::DigFern.move_cost());
     award_foraging_xp(world, true);
     ExecuteOutcome::Done(format!("dug fern (+1 root, +{} fronds)", frond_count))
 }
@@ -1741,7 +1752,7 @@ fn execute_cut_gorse(world: &mut World) -> ExecuteOutcome {
     };
     world.set_decoration_at(wx as i64, wy as i64, crate::flora::Decoration::None);
     deliver_stack(world, wx, wy, ItemKind::GorseFaggot, 1);
-    world.spend_action_time(ActionId::CutGorse.base_cost());
+    world.spend_moves(ActionId::CutGorse.move_cost());
     world.recompute_fov();
     ExecuteOutcome::Done("cut gorse (+1 faggot)".to_string())
 }
@@ -1757,7 +1768,7 @@ fn execute_cut_bracken(world: &mut World) -> ExecuteOutcome {
     };
     world.set_decoration_at(wx as i64, wy as i64, crate::flora::Decoration::None);
     deliver_stack(world, wx, wy, ItemKind::BrackenStraw, 3);
-    world.spend_action_time(ActionId::CutBracken.base_cost());
+    world.spend_moves(ActionId::CutBracken.move_cost());
     ExecuteOutcome::Done("cut bracken (+3 straw)".to_string())
 }
 
@@ -1884,7 +1895,10 @@ mod tests {
         let avail = evaluate(&world, ActionId::Pickup);
         match avail {
             Availability::Available { cost_game_seconds } => {
-                assert_eq!(cost_game_seconds, ActionId::Pickup.base_cost());
+                assert_eq!(
+                    cost_game_seconds,
+                    world.moves_to_seconds(ActionId::Pickup.move_cost())
+                );
             }
             other => panic!("expected Available, got {:?}", other),
         }
@@ -1953,7 +1967,10 @@ mod tests {
         let world = World::new(CHUNK_W, CHUNK_H);
         match evaluate(&world, ActionId::EatRation) {
             Availability::Available { cost_game_seconds } => {
-                assert_eq!(cost_game_seconds, ActionId::EatRation.base_cost());
+                assert_eq!(
+                    cost_game_seconds,
+                    world.moves_to_seconds(ActionId::EatRation.move_cost())
+                );
             }
             other => panic!("expected Available, got {:?}", other),
         }
@@ -2119,7 +2136,10 @@ mod tests {
         }
         match eval_start_fire(&world) {
             Availability::Available { cost_game_seconds } => {
-                assert_eq!(cost_game_seconds, ActionId::StartFire.base_cost());
+                assert_eq!(
+                    cost_game_seconds,
+                    world.moves_to_seconds(ActionId::StartFire.move_cost())
+                );
             }
             other => panic!("expected Available, got {:?}", other),
         }
@@ -2224,7 +2244,10 @@ mod tests {
         // Evaluator should report available.
         match evaluate(&world, ActionId::FeedFire) {
             Availability::Available { cost_game_seconds } => {
-                assert_eq!(cost_game_seconds, ActionId::FeedFire.base_cost());
+                assert_eq!(
+                    cost_game_seconds,
+                    world.moves_to_seconds(ActionId::FeedFire.move_cost())
+                );
             }
             other => panic!("expected Available, got {:?}", other),
         }
@@ -2242,12 +2265,14 @@ mod tests {
                 _ => None,
             })
             .expect("lit fire still present");
-        // The world's per-second fire tick fires during spend_action_time,
-        // so the lit fire also burns down by base_cost during the action.
-        // Net: starting 600s + FIRE_FUEL_SECONDS_PER_FEED bump - base_cost burn.
+        // The world's per-second fire tick fires during spend_moves,
+        // so the lit fire also burns down by that wall-clock during the
+        // action. Net: starting 600s + FIRE_FUEL_SECONDS_PER_FEED bump
+        // - elapsed-during-action burn.
+        let elapsed = world.moves_to_seconds(ActionId::FeedFire.move_cost());
         assert_eq!(
             lit_secs,
-            600 + FIRE_FUEL_SECONDS_PER_FEED - ActionId::FeedFire.base_cost()
+            600 + FIRE_FUEL_SECONDS_PER_FEED - elapsed
         );
         // Reserve firewood stack went 2 -> 1.
         let reserve: u32 = cell
@@ -2338,9 +2363,11 @@ mod tests {
             ExecuteOutcome::Done(m) => m,
             other => panic!("expected Done, got {:?}", other),
         };
-        // Clock must advance by base_cost (600s) regardless of catch
-        // outcome — fishing takes the same time whether you succeed.
-        assert!(world.clock_seconds >= clock_before + ActionId::Fishing.base_cost() as u64);
+        // Clock must advance by Fishing's wall-clock cost (600s at
+        // baseline speed) regardless of catch outcome — fishing takes
+        // the same time whether you succeed.
+        let expected = world.moves_to_seconds(ActionId::Fishing.move_cost()) as u64;
+        assert!(world.clock_seconds >= clock_before + expected);
         // Either outcome message is acceptable; one of them must occur.
         assert!(
             msg == "caught a fish!" || msg == "nothing biting",
@@ -2372,8 +2399,9 @@ mod tests {
     }
 
     /// Drive a 5-second multi-turn step to completion. The crafting
-    /// verbs all queue exactly one step at `base_cost()` seconds, so
-    /// this tick-then-finish loop mirrors what the main frame loop
+    /// verbs all queue exactly one step whose `target_secs` is
+    /// `move_cost()` translated through the player's effective speed,
+    /// so this tick-then-finish loop mirrors what the main frame loop
     /// does — keeps the tests honest about the real time flow.
     fn run_to_completion(world: &mut World) -> Vec<ActionId> {
         let mut completed = Vec::new();
