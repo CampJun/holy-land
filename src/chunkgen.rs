@@ -201,7 +201,7 @@ pub fn generate_chunk(coord: ChunkCoord, world_seed: u64, info: OvermapInfo) -> 
     // which is exactly the playability guarantee we want.
     for loaded in crate::city::cities().values() {
         if loaded.intersects_chunk(coord) {
-            loaded.city.stamp_into_chunk(coord, &mut cells, loaded.anchor);
+            loaded.stamp_into_chunk(coord, &mut cells, world_seed);
         }
     }
 
