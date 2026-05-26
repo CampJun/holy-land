@@ -762,22 +762,46 @@ pub fn entity_glyph_at(world: &World, wx: i32, wy: i32) -> Option<(u8, [u8; 3])>
     None
 }
 
-/// Yeoman-tier loadout rolled per spawn from the table in
-/// `Bestiary slice 1.md` §Loadout roll. `None` in a slot means the
-/// piece rolled empty (e.g. some bandits roll no head armor).
+/// Loadout rolled per humanoid spawn — used across all tiers (Rabble
+/// not implemented; Yeoman / Sergeant / Knight all build on the same
+/// shape). `None` in a slot means the piece rolled empty (e.g. Yeoman
+/// bandits with no head armor).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct YeomanLoadout {
     pub main_hand: Option<crate::items::ItemKind>,
     pub off_hand: Option<crate::items::ItemKind>,
     pub head: Option<crate::items::ItemKind>,
     pub torso: Option<crate::items::ItemKind>,
+    pub torso_outer: Option<crate::items::ItemKind>,
+    pub legs: Option<crate::items::ItemKind>,
 }
 
 impl YeomanLoadout {
-    /// Iterator over every non-None worn armor piece (head/torso) for
-    /// the bandit's `Worn` assembly.
+    /// Iterator over every non-None worn armor piece for the entity's
+    /// `Worn` assembly. Includes torso, torso_outer (e.g. plate over
+    /// mail), head, legs.
     pub fn worn_kinds(&self) -> impl Iterator<Item = crate::items::ItemKind> + '_ {
-        [self.head, self.torso].into_iter().flatten()
+        [self.head, self.torso, self.torso_outer, self.legs]
+            .into_iter()
+            .flatten()
+    }
+}
+
+/// Loadout tier per `Status armament tiers.md`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BanditTier {
+    Yeoman,
+    Sergeant,
+    Knight,
+}
+
+impl BanditTier {
+    pub fn save_key(self) -> &'static str {
+        match self {
+            BanditTier::Yeoman => "yeoman",
+            BanditTier::Sergeant => "sergeant",
+            BanditTier::Knight => "knight",
+        }
     }
 }
 
@@ -818,26 +842,121 @@ pub fn roll_yeoman_loadout(rng: &mut Rng) -> YeomanLoadout {
         1..=80 => Some(ItemKind::PaddedDoublet),
         _ => Some(ItemKind::LeatherJerkin),
     };
-    YeomanLoadout { main_hand, off_hand, head, torso }
+    YeomanLoadout {
+        main_hand,
+        off_hand,
+        head,
+        torso,
+        torso_outer: None,
+        legs: None,
+    }
 }
 
-/// Spawn a Cornish bandit at `pos` carrying the explicit `loadout`.
-/// Fresh-game init rolls a Yeoman loadout via `roll_yeoman_loadout`;
-/// save restore passes the loadout reconstructed from disk. The off-
-/// hand is recorded as an `OffHand` component for future block/grapple
-/// hooks but doesn't contribute to combat math yet.
-pub fn spawn_cornish_bandit(ecs: &mut Ecs, pos: Position, loadout: YeomanLoadout) -> Entity {
-    // Main_hand falls back to Spear if the roll somehow produced None —
-    // phase 1 always had a wielded weapon and the AI assumes it.
+/// Sergeant tier — household soldier / sergeant-at-arms. Arming sword
+/// + knife, partial mail (hauberk on torso+arms, often without
+/// chausses), kettle hat or open helm, round shield.
+pub fn roll_sergeant_loadout(rng: &mut Rng) -> YeomanLoadout {
+    use crate::items::ItemKind;
+    let main_hand = match rng.d100() {
+        1..=75 => Some(ItemKind::ArmingSword),
+        _ => Some(ItemKind::Falchion),
+    };
+    let off_hand = match rng.d100() {
+        1..=70 => Some(ItemKind::SmallRoundShield),
+        _ => Some(ItemKind::Knife),
+    };
+    let head = match rng.d100() {
+        1..=50 => Some(ItemKind::KettleHat),
+        51..=80 => Some(ItemKind::IronSkullcap),
+        _ => Some(ItemKind::MailCoif),
+    };
+    // Mail hauberk over a padded doublet underlayer would be most
+    // accurate, but phase 8's Worn only carries one piece per region
+    // — collapse to a hauberk (mail blocks better than the doublet
+    // would underneath at this scale).
+    let torso = Some(ItemKind::Hauberk);
+    let legs = match rng.d100() {
+        1..=30 => Some(ItemKind::MailChausses),
+        _ => None,
+    };
+    YeomanLoadout {
+        main_hand,
+        off_hand,
+        head,
+        torso,
+        torso_outer: None,
+        legs,
+    }
+}
+
+/// Knight tier — mounted noble / retinue captain. Lance OR sword +
+/// knife, full mail (hauberk + chausses + coif), great helm, large
+/// shield, possibly coat-of-plates over mail.
+pub fn roll_knight_loadout(rng: &mut Rng) -> YeomanLoadout {
+    use crate::items::ItemKind;
+    let main_hand = match rng.d100() {
+        1..=60 => Some(ItemKind::Lance),
+        _ => Some(ItemKind::ArmingSword),
+    };
+    let off_hand = match rng.d100() {
+        1..=80 => Some(ItemKind::LargeShield),
+        _ => Some(ItemKind::Knife),
+    };
+    // Knights wear a coif under the great helm; phase 8 picks one to
+    // occupy the head slot.
+    let head = match rng.d100() {
+        1..=70 => Some(ItemKind::GreatHelm),
+        _ => Some(ItemKind::MailCoif),
+    };
+    let torso = Some(ItemKind::Hauberk);
+    // ~40% of knights have a coat-of-plates over the mail. Worn
+    // doesn't support layering in phase 8 — pick the better piece
+    // (coat-of-plates) when it rolls.
+    let torso_outer = match rng.d100() {
+        1..=40 => Some(ItemKind::CoatOfPlates),
+        _ => None,
+    };
+    let legs = Some(ItemKind::MailChausses);
+    YeomanLoadout {
+        main_hand,
+        off_hand,
+        head,
+        torso,
+        torso_outer,
+        legs,
+    }
+}
+
+/// Spawn a Cornish bandit at `pos` at the given `tier` carrying the
+/// explicit `loadout`. Fresh-game init rolls a Yeoman loadout via
+/// `roll_yeoman_loadout`; debug-console + future road encounters can
+/// pick `BanditTier::Sergeant` / `Knight` for richer loadouts. Render
+/// glyph + skill block scale with tier.
+pub fn spawn_humanoid_bandit(
+    ecs: &mut Ecs,
+    pos: Position,
+    tier: BanditTier,
+    loadout: YeomanLoadout,
+) -> Entity {
     let main_hand = loadout
         .main_hand
         .unwrap_or(crate::items::ItemKind::Spear);
     let worn_kinds: Vec<_> = loadout.worn_kinds().collect();
+    let (glyph, fg) = match tier {
+        BanditTier::Yeoman => (b'b', [210, 80, 70, 255]),
+        BanditTier::Sergeant => (b's', [220, 150, 70, 255]),
+        BanditTier::Knight => (b'K', [220, 220, 240, 255]),
+    };
+    let skills = match tier {
+        BanditTier::Yeoman => CombatSkills::starting_bandit(),
+        BanditTier::Sergeant => CombatSkills::starting_sergeant(),
+        BanditTier::Knight => CombatSkills::starting_knight(),
+    };
     let entity = ecs.spawn((
         pos,
         Renderable {
-            glyph: b'b',
-            fg: [210, 80, 70, 255],
+            glyph,
+            fg,
             bg: [20, 17, 13, 255],
         },
         Speed::default(),
@@ -846,7 +965,7 @@ pub fn spawn_cornish_bandit(ecs: &mut Ecs, pos: Position, loadout: YeomanLoadout
         Ai(AiKind::ChaseAndBump),
         CornishBandit,
         Wielded(main_hand),
-        CombatSkills::starting_bandit(),
+        skills,
         worn_from_items(&worn_kinds),
         Stamina::starting_human(),
     ));
@@ -864,6 +983,12 @@ pub fn spawn_cornish_bandit(ecs: &mut Ecs, pos: Position, loadout: YeomanLoadout
         let _ = ecs.insert_one(entity, pack);
     }
     entity
+}
+
+/// Yeoman-tier convenience wrapper preserved for the existing
+/// `restore_hostiles` / test surface that doesn't pick a tier.
+pub fn spawn_cornish_bandit(ecs: &mut Ecs, pos: Position, loadout: YeomanLoadout) -> Entity {
+    spawn_humanoid_bandit(ecs, pos, BanditTier::Yeoman, loadout)
 }
 
 /// Optional off-hand item (knife / small round shield / nothing).
@@ -1078,6 +1203,32 @@ impl CombatSkills {
             weapon_prof: 1,
             str_bonus: 1,
             agi_mod: 0,
+            encumbrance: 0,
+        }
+    }
+
+    /// Sergeant-tier — household soldier. Real training; serious threat
+    /// to a Rabble player.
+    pub fn starting_sergeant() -> Self {
+        Self {
+            melee: 12,
+            dodge: 8,
+            weapon_prof: 3,
+            str_bonus: 2,
+            agi_mod: 1,
+            encumbrance: 0,
+        }
+    }
+
+    /// Knight-tier — aristocratic. Mail + plate + lance; apex Cornwall
+    /// hostile in phase-8 v1.
+    pub fn starting_knight() -> Self {
+        Self {
+            melee: 18,
+            dodge: 10,
+            weapon_prof: 5,
+            str_bonus: 3,
+            agi_mod: 1,
             encumbrance: 0,
         }
     }
@@ -1843,6 +1994,8 @@ impl World {
                 off_hand: snap.off_hand,
                 head: None,
                 torso: None,
+                torso_outer: None,
+                legs: None,
             };
             let entity = spawn_cornish_bandit(&mut self.ecs, snap.pos, loadout);
             if let Ok(mut b) = self.ecs.get::<&mut BodyParts>(entity) {
@@ -4693,6 +4846,8 @@ mod tests {
             off_hand: Some(crate::items::ItemKind::Knife),
             head: Some(crate::items::ItemKind::IronSkullcap),
             torso: Some(crate::items::ItemKind::PaddedDoublet),
+            torso_outer: None,
+            legs: None,
         };
         spawn_cornish_bandit(
             &mut world.ecs,
@@ -5027,6 +5182,8 @@ mod tests {
                 off_hand: None,
                 head: None,
                 torso: None,
+                torso_outer: None,
+                legs: None,
             },
         );
         let before = world.ecs.get::<&BodyParts>(bandit).map(|b| b.torso.hp).unwrap();
@@ -5085,6 +5242,59 @@ mod tests {
             && body_before.l_leg.hp == body_after.l_leg.hp
             && body_before.r_leg.hp == body_after.r_leg.hp;
         assert!(unchanged, "tree should block the reach attack");
+    }
+
+    #[test]
+    fn sergeant_loadout_always_includes_hauberk_and_helm() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        for _ in 0..200 {
+            let l = roll_sergeant_loadout(&mut world.rng);
+            assert_eq!(l.torso, Some(ItemKind::Hauberk));
+            assert!(l.head.is_some(), "sergeant always rolls a head piece");
+            let head = l.head.unwrap();
+            assert!(
+                matches!(
+                    head,
+                    ItemKind::KettleHat | ItemKind::IronSkullcap | ItemKind::MailCoif
+                ),
+                "unexpected sergeant head {:?}",
+                head
+            );
+            assert!(l.main_hand.is_some());
+        }
+    }
+
+    #[test]
+    fn knight_loadout_full_mail_plus_great_helm_or_coif() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        for _ in 0..200 {
+            let l = roll_knight_loadout(&mut world.rng);
+            assert_eq!(l.torso, Some(ItemKind::Hauberk));
+            assert_eq!(l.legs, Some(ItemKind::MailChausses));
+            let head = l.head.expect("knight always wears head");
+            assert!(
+                matches!(head, ItemKind::GreatHelm | ItemKind::MailCoif),
+                "unexpected knight head {:?}",
+                head
+            );
+        }
+    }
+
+    #[test]
+    fn knight_spawn_carries_tier_glyph_and_heavy_skills() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let p = world.player_pos();
+        let loadout = roll_knight_loadout(&mut world.rng);
+        let e = spawn_humanoid_bandit(
+            &mut world.ecs,
+            Position { x: p.x + 6, y: p.y },
+            BanditTier::Knight,
+            loadout,
+        );
+        let rend = world.ecs.get::<&Renderable>(e).map(|r| *r).unwrap();
+        assert_eq!(rend.glyph, b'K');
+        let skills = world.ecs.get::<&CombatSkills>(e).map(|s| *s).unwrap();
+        assert!(skills.melee >= 15, "knight melee should be substantial");
     }
 
     #[test]
@@ -5240,6 +5450,8 @@ mod tests {
                 off_hand: Some(ItemKind::Knife),
                 head: None,
                 torso: Some(ItemKind::PaddedDoublet),
+                torso_outer: None,
+                legs: None,
             },
         );
         let bandit_pos = world.ecs.get::<&Position>(bandit).map(|p| *p).unwrap();

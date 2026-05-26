@@ -78,6 +78,30 @@ pub enum ItemKind {
     /// Stackable bow ammo. Consumed per shot; drops on hit target's
     /// cell for ~70% recovery (phase 6 placeholder break rule).
     Arrow,
+    // ---- Phase 8: Sergeant + Knight tiers ----
+    /// One-handed arming sword. Sergeant-tier main_hand (75% roll per
+    /// Status armament tiers.md). Slightly better balance than the
+    /// Yeoman short sword.
+    ArmingSword,
+    /// Two-handed reach-2 thrusting lance. Knight-tier main_hand. Best
+    /// stab damage in the game; awkward at adjacent (no-reach penalty).
+    Lance,
+    /// Mail shirt covering torso + arms. The signature elite armor of
+    /// the period; rolls on Sergeant + Knight loadouts.
+    Hauberk,
+    /// Mail leggings — legs. Knight tier.
+    MailChausses,
+    /// Mail hood — head. Knight tier (often under a great helm).
+    MailCoif,
+    /// Iron / steel wide-brim helm. Sergeant tier (50% head roll).
+    KettleHat,
+    /// Heavy enclosed cavalry helm. Knight tier.
+    GreatHelm,
+    /// Riveted small plates over fabric — the bleeding-edge transition
+    /// armor of ~1300. Knight tier (40% roll, layered over Hauberk).
+    CoatOfPlates,
+    /// Large kite/round shield — Knight off-hand.
+    LargeShield,
 }
 
 /// All per-kind metadata in one place. Adding a new `ItemKind` variant is
@@ -168,6 +192,15 @@ const ALL_KINDS: &[ItemKind] = &[
     ItemKind::LeatherJerkin,
     ItemKind::Bow,
     ItemKind::Arrow,
+    ItemKind::ArmingSword,
+    ItemKind::Lance,
+    ItemKind::Hauberk,
+    ItemKind::MailChausses,
+    ItemKind::MailCoif,
+    ItemKind::KettleHat,
+    ItemKind::GreatHelm,
+    ItemKind::CoatOfPlates,
+    ItemKind::LargeShield,
 ];
 
 impl ItemKind {
@@ -688,6 +721,157 @@ impl ItemKind {
                 glyph: b'-',
                 color: [180, 150, 100],
                 default_weight_g: 40,
+                blends_with_terrain: false,
+                weapon: None,
+                armor: None,
+                ranged: None,
+            },
+            // ---- Phase 8 Sergeant + Knight items ----
+            ItemKind::ArmingSword => ItemDef {
+                save_key: "arming_sword",
+                name: "arming sword",
+                is_fungible: false,
+                glyph: b'(',
+                color: [210, 210, 225],
+                default_weight_g: 1_200,
+                blends_with_terrain: false,
+                weapon: Some(WeaponProfile {
+                    to_hit: 2,
+                    damage_die: DamageTriplet { bash: 1, cut: 7, stab: 7 },
+                    move_cost: 90,
+                    reach: 1,
+                }),
+                armor: None,
+                ranged: None,
+            },
+            ItemKind::Lance => ItemDef {
+                save_key: "lance",
+                name: "lance",
+                is_fungible: false,
+                glyph: b'|',
+                color: [180, 150, 100],
+                default_weight_g: 2_400,
+                blends_with_terrain: false,
+                weapon: Some(WeaponProfile {
+                    to_hit: 2,
+                    damage_die: DamageTriplet { bash: 2, cut: 1, stab: 12 },
+                    move_cost: 130,
+                    reach: 2,
+                }),
+                armor: None,
+                ranged: None,
+            },
+            ItemKind::Hauberk => ItemDef {
+                save_key: "hauberk",
+                name: "mail hauberk",
+                is_fungible: false,
+                glyph: b'[',
+                color: [160, 165, 180],
+                default_weight_g: 11_000,
+                blends_with_terrain: false,
+                weapon: None,
+                armor: Some(ArmorStats {
+                    regions: &[BodyPart::Torso, BodyPart::LArm, BodyPart::RArm],
+                    coverage_pct: 90,
+                    // Mail: low bash, high cut, medium stab.
+                    dr: ArmorDr { bash: 2, cut: 8, stab: 4 },
+                    encumbrance: 2,
+                }),
+                ranged: None,
+            },
+            ItemKind::MailChausses => ItemDef {
+                save_key: "mail_chausses",
+                name: "mail chausses",
+                is_fungible: false,
+                glyph: b'[',
+                color: [155, 160, 175],
+                default_weight_g: 5_500,
+                blends_with_terrain: false,
+                weapon: None,
+                armor: Some(ArmorStats {
+                    regions: &[BodyPart::LLeg, BodyPart::RLeg],
+                    coverage_pct: 85,
+                    dr: ArmorDr { bash: 2, cut: 7, stab: 3 },
+                    encumbrance: 2,
+                }),
+                ranged: None,
+            },
+            ItemKind::MailCoif => ItemDef {
+                save_key: "mail_coif",
+                name: "mail coif",
+                is_fungible: false,
+                glyph: b'^',
+                color: [150, 155, 170],
+                default_weight_g: 1_400,
+                blends_with_terrain: false,
+                weapon: None,
+                armor: Some(ArmorStats {
+                    regions: &[BodyPart::Head],
+                    coverage_pct: 80,
+                    dr: ArmorDr { bash: 2, cut: 7, stab: 3 },
+                    encumbrance: 1,
+                }),
+                ranged: None,
+            },
+            ItemKind::KettleHat => ItemDef {
+                save_key: "kettle_hat",
+                name: "kettle hat",
+                is_fungible: false,
+                glyph: b'^',
+                color: [170, 170, 180],
+                default_weight_g: 1_500,
+                blends_with_terrain: false,
+                weapon: None,
+                armor: Some(ArmorStats {
+                    regions: &[BodyPart::Head],
+                    coverage_pct: 75,
+                    dr: ArmorDr { bash: 5, cut: 5, stab: 4 },
+                    encumbrance: 1,
+                }),
+                ranged: None,
+            },
+            ItemKind::GreatHelm => ItemDef {
+                save_key: "great_helm",
+                name: "great helm",
+                is_fungible: false,
+                glyph: b'^',
+                color: [200, 200, 210],
+                default_weight_g: 3_200,
+                blends_with_terrain: false,
+                weapon: None,
+                armor: Some(ArmorStats {
+                    regions: &[BodyPart::Head],
+                    coverage_pct: 90,
+                    dr: ArmorDr { bash: 7, cut: 7, stab: 7 },
+                    encumbrance: 3,
+                }),
+                ranged: None,
+            },
+            ItemKind::CoatOfPlates => ItemDef {
+                save_key: "coat_of_plates",
+                name: "coat-of-plates",
+                is_fungible: false,
+                glyph: b'[',
+                color: [180, 175, 165],
+                default_weight_g: 8_500,
+                blends_with_terrain: false,
+                weapon: None,
+                armor: Some(ArmorStats {
+                    regions: &[BodyPart::Torso],
+                    coverage_pct: 95,
+                    // Plate: high all three; heavy enc.
+                    dr: ArmorDr { bash: 7, cut: 8, stab: 7 },
+                    encumbrance: 3,
+                }),
+                ranged: None,
+            },
+            ItemKind::LargeShield => ItemDef {
+                save_key: "large_shield",
+                name: "large shield",
+                is_fungible: false,
+                glyph: b'O',
+                color: [130, 80, 50],
+                default_weight_g: 4_000,
                 blends_with_terrain: false,
                 weapon: None,
                 armor: None,
