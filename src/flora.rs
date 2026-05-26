@@ -15,6 +15,10 @@ pub enum TreeSpecies {
     Holly,
     Ash,
     Rowan,
+    /// Beech anchors the `BeechCombe` biome (east Devon hedgerow vales).
+    /// No mast item yet — `mast_item` returns None until a `Beechnut`
+    /// `ItemKind` is added in a future foraging card.
+    Beech,
 }
 
 #[allow(dead_code)] // exposed for tests + future ManagedSpecies surfaces
@@ -24,6 +28,7 @@ pub const ALL_TREE_SPECIES: &[TreeSpecies] = &[
     TreeSpecies::Holly,
     TreeSpecies::Ash,
     TreeSpecies::Rowan,
+    TreeSpecies::Beech,
 ];
 
 impl TreeSpecies {
@@ -37,6 +42,7 @@ impl TreeSpecies {
             TreeSpecies::Holly => "holly",
             TreeSpecies::Ash => "ash",
             TreeSpecies::Rowan => "rowan",
+            TreeSpecies::Beech => "beech",
         }
     }
 
@@ -48,6 +54,7 @@ impl TreeSpecies {
             "holly" => Some(TreeSpecies::Holly),
             "ash" => Some(TreeSpecies::Ash),
             "rowan" => Some(TreeSpecies::Rowan),
+            "beech" => Some(TreeSpecies::Beech),
             _ => None,
         }
     }
@@ -68,6 +75,7 @@ impl TreeSpecies {
             TreeSpecies::Holly => 0x06,  // ♠
             TreeSpecies::Ash => 0x17,    // ↨
             TreeSpecies::Rowan => 0x18,  // ↑ (same glyph, distinguished by tint)
+            TreeSpecies::Beech => 0x05,  // ♣ (same glyph as Oak, distinguished by tint)
         }
     }
 
@@ -107,6 +115,12 @@ impl TreeSpecies {
                 [210, 90, 40], // characteristic autumn red
                 [160, 150, 120],
             ],
+            TreeSpecies::Beech => [
+                [150, 180, 90],
+                [85, 130, 55],
+                [200, 130, 50], // copper autumn
+                [180, 150, 110], // pale beech bark
+            ],
         };
         row[season as usize]
     }
@@ -121,6 +135,7 @@ impl TreeSpecies {
             TreeSpecies::Ash => 45,
             TreeSpecies::Holly => 60,
             TreeSpecies::Oak => 90,
+            TreeSpecies::Beech => 90,
         }
     }
 

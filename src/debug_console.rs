@@ -29,7 +29,22 @@ pub enum DebugCommand {
     /// capacity). Kind name is the ItemKind's save_key string ("twig",
     /// "firewood", "flint_and_steel", etc.).
     Give(ItemKind, u16),
+    /// Wipe the current run and rebuild the world with a fresh seed.
+    /// `Some(seed)` pins the seed; `None` asks main.rs to pick one.
+    /// Meta save (xp/affinity/unlocks) is preserved.
+    NewWorld(Option<u64>),
+    /// Toggle godmode: walk through blocked cells (trees, water,
+    /// gorse) and freeze needs decay. Transient.
+    Godmode,
     Unknown(String),
+}
+
+/// Side effects that can't be applied inside `apply_debug_command`
+/// because they require resources the debug console doesn't own (save
+/// dir, world re-construction). main.rs handles these.
+#[derive(Debug)]
+pub enum DebugSideEffect {
+    NewWorld(Option<u64>),
 }
 
 pub struct DebugConsole {
@@ -116,7 +131,24 @@ fn parse_command(raw: &str) -> DebugCommand {
             DebugCommand::Give(k, n.max(1))
         }
 
+        ["newworld"] => DebugCommand::NewWorld(None),
+        ["newworld", seed] => match parse_seed(seed) {
+            Some(s) => DebugCommand::NewWorld(Some(s)),
+            None => DebugCommand::Unknown(raw.to_string()),
+        },
+
+        ["god"] | ["godmode"] => DebugCommand::Godmode,
+
         _ => DebugCommand::Unknown(raw.to_string()),
+    }
+}
+
+/// Parse a seed literal in decimal (`12345`) or hex (`0xDEADBEEF`).
+fn parse_seed(s: &str) -> Option<u64> {
+    if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(rest, 16).ok()
+    } else {
+        s.parse::<u64>().ok()
     }
 }
 
@@ -135,14 +167,18 @@ fn parse_hm(s: &str) -> Option<(u8, u8)> {
 /// re-syncing any side trackers (e.g. last_dawn_idx) — clock-rewinding
 /// commands intentionally don't trigger an auto-save, only forward
 /// crossings detected by the regular dawn check do.
-pub fn apply_debug_command(world: &mut World, cmd: DebugCommand) {
+pub fn apply_debug_command(world: &mut World, cmd: DebugCommand) -> Option<DebugSideEffect> {
     match cmd {
-        DebugCommand::Help => print_help(),
+        DebugCommand::Help => {
+            print_help();
+            None
+        }
 
         DebugCommand::Unknown(s) => {
             if !s.is_empty() {
                 crate::log_info!("[debug] unknown command: '{}'. type 'help'.", s);
             }
+            None
         }
 
         DebugCommand::SetTime(h, m) => {
@@ -161,6 +197,7 @@ pub fn apply_debug_command(world: &mut World, cmd: DebugCommand) {
                 world.day_count(),
                 world.clock_seconds
             );
+            None
         }
 
         DebugCommand::AdvanceSecs(secs) => {
@@ -174,6 +211,7 @@ pub fn apply_debug_command(world: &mut World, cmd: DebugCommand) {
                 m,
                 world.day_count()
             );
+            None
         }
 
         DebugCommand::SetNeed(kind, value) => {
@@ -181,12 +219,14 @@ pub fn apply_debug_command(world: &mut World, cmd: DebugCommand) {
             n.set(kind, value);
             world.set_player_needs(n);
             crate::log_info!("[debug] need {:?} = {}", kind, value);
+            None
         }
 
         DebugCommand::Teleport(x, y) => {
             world.set_player_pos(Position { x, y });
             world.recompute_fov();
             crate::log_info!("[debug] teleported to ({}, {})", x, y);
+            None
         }
 
         DebugCommand::Give(kind, count) => {
@@ -217,6 +257,26 @@ pub fn apply_debug_command(world: &mut World, cmd: DebugCommand) {
                     kind.save_key()
                 );
             }
+            None
+        }
+
+        DebugCommand::NewWorld(seed_opt) => {
+            // Defer the actual rebuild to main.rs (it owns the save dir
+            // + the world variable). We just log + signal.
+            match seed_opt {
+                Some(s) => crate::log_info!("[debug] new world requested (seed 0x{:016X})", s),
+                None => crate::log_info!("[debug] new world requested (fresh seed)"),
+            }
+            Some(DebugSideEffect::NewWorld(seed_opt))
+        }
+
+        DebugCommand::Godmode => {
+            world.godmode = !world.godmode;
+            crate::log_info!(
+                "[debug] godmode {}",
+                if world.godmode { "ON" } else { "OFF" }
+            );
+            None
         }
     }
 }
@@ -228,6 +288,8 @@ fn print_help() {
     crate::log_info!("  need NAME VAL     set thirst|hunger|sleep|warmth to 0-100 (alias t|h|s|w)");
     crate::log_info!("  tp X Y            teleport player to world coords (X, Y)");
     crate::log_info!("  give KIND N       drop N of KIND into the pack (uses save_key, e.g. firewood, twig)");
+    crate::log_info!("  newworld [SEED]   rebuild the world with a fresh seed (decimal or 0xHEX); preserves meta");
+    crate::log_info!("  god | godmode     toggle godmode (walk through blockers + needs frozen)");
     crate::log_info!("  help | ? | h      show this");
 }
 
@@ -333,6 +395,23 @@ mod tests {
             DebugCommand::Teleport(-5, 30)
         ));
         assert!(matches!(parse_command("tp foo bar"), DebugCommand::Unknown(_)));
+    }
+
+    #[test]
+    fn newworld_parses_with_and_without_seed() {
+        assert!(matches!(parse_command("newworld"), DebugCommand::NewWorld(None)));
+        match parse_command("newworld 42") {
+            DebugCommand::NewWorld(Some(s)) => assert_eq!(s, 42),
+            other => panic!("got {:?}", other),
+        }
+        match parse_command("newworld 0xDEADBEEF") {
+            DebugCommand::NewWorld(Some(s)) => assert_eq!(s, 0xDEADBEEF),
+            other => panic!("got {:?}", other),
+        }
+        assert!(matches!(
+            parse_command("newworld notanumber"),
+            DebugCommand::Unknown(_)
+        ));
     }
 
     #[test]
