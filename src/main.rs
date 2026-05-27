@@ -164,21 +164,31 @@ impl DeathCause {
     }
 }
 
-/// Select-button info hub tabs. Display order = `INFO_TABS`.
+/// Select-button info hub tabs. Display order = `INFO_TABS`. Attributes
+/// sits between Crafting and Skills — the trained Skills cluster feeds
+/// off the underlying Attribute baseline, so they read naturally
+/// adjacent in the tab strip.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InfoTab {
     Inventory,
     Crafting,
+    Attributes,
     Skills,
 }
 
-const INFO_TABS: &[InfoTab] = &[InfoTab::Inventory, InfoTab::Crafting, InfoTab::Skills];
+const INFO_TABS: &[InfoTab] = &[
+    InfoTab::Inventory,
+    InfoTab::Crafting,
+    InfoTab::Attributes,
+    InfoTab::Skills,
+];
 
 impl InfoTab {
     fn label(self) -> &'static str {
         match self {
             InfoTab::Inventory => "Inventory",
             InfoTab::Crafting => "Crafting",
+            InfoTab::Attributes => "Attrs",
             InfoTab::Skills => "Skills",
         }
     }
@@ -465,6 +475,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(eq) = run.player_equipment.as_ref() {
             world.set_player_equipment(save_equipment_to_world(eq));
+        }
+        if let Some(a) = run.player_attributes.as_ref() {
+            world.set_player_attributes(world::Attributes {
+                str_: a.str_,
+                agi: a.agi,
+                con: a.con,
+                int_: a.int_,
+                spirit: a.spirit,
+                attribute_xp: a.attribute_xp,
+            });
         }
         if !run.hostiles.is_empty() {
             // Cornish-bandit literal is the only flavor we restore as
@@ -1012,7 +1032,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     None => {}
                                 }
                             }
-                            InfoTab::Skills => {}
+                            InfoTab::Attributes | InfoTab::Skills => {}
                         }
                     }
                     Action::B | Action::Select => {
@@ -1804,6 +1824,15 @@ fn save_game(
     run.player_body_parts = Some(world_bp_to_save(&player_body));
     let player_eq = world.player_equipment();
     run.player_equipment = Some(world_equipment_to_save(&player_eq));
+    let attrs = world.player_attributes();
+    run.player_attributes = Some(save::AttributesSave {
+        str_: attrs.str_,
+        agi: attrs.agi,
+        con: attrs.con,
+        int_: attrs.int_,
+        spirit: attrs.spirit,
+        attribute_xp: attrs.attribute_xp,
+    });
     // Leave the legacy single-pool field empty; phase 2 + later writes
     // route through body_parts. A v3 player_health field still loads
     // cleanly via serde but is never written.
@@ -2461,6 +2490,8 @@ fn info_tab_row_count(world: &World, tab: InfoTab) -> usize {
         // item. A on a slot row unequips; A on a pack row equips.
         InfoTab::Inventory => world::EquipSlot::ALL.len() + world.player_pack().contents.len(),
         InfoTab::Crafting => crafting::RECIPES.len(),
+        // STR, AGI, CON, INT, SPIRIT.
+        InfoTab::Attributes => 5,
         // Fire Making, Foraging, Melee, Ranged, Dodge.
         InfoTab::Skills => 5,
     }
@@ -2521,6 +2552,7 @@ fn draw_info_menu(
     match state.tab {
         InfoTab::Inventory => draw_info_inventory(cells, &layout, world, state.selected, palette),
         InfoTab::Crafting => draw_info_crafting(cells, &layout, world, state.selected, palette),
+        InfoTab::Attributes => draw_info_attributes(cells, &layout, world, state.selected, palette),
         InfoTab::Skills => draw_info_skills(cells, &layout, world, state.selected, palette),
     }
 }
@@ -2665,6 +2697,45 @@ fn draw_info_inventory(
         palette.hud_fg,
         palette.panel_bg,
     );
+}
+
+fn draw_info_attributes(
+    cells: &mut [Option<Cell>],
+    layout: &PanelLayout,
+    world: &World,
+    selected: usize,
+    palette: &Palette,
+) {
+    let attrs = world.player_attributes();
+    // STR/AGI/CON drive combat + carry today; INT/SPIRIT are plumbed
+    // through save and shown here but inert in v1 (no system reads
+    // them yet — that lands with later cards).
+    let rows: [(&str, u8, u32); 5] = [
+        ("STR", attrs.str_, attrs.attribute_xp[0]),
+        ("AGI", attrs.agi, attrs.attribute_xp[1]),
+        ("CON", attrs.con, attrs.attribute_xp[2]),
+        ("INT", attrs.int_, attrs.attribute_xp[3]),
+        ("SPIRIT", attrs.spirit, attrs.attribute_xp[4]),
+    ];
+    // Per the Attributes card: training threshold formula is a future
+    // card; show banked XP next to the value so the tab matches the
+    // `STR 10 (xp 47/300)` mock without committing to a number yet.
+    const XP_TO_NEXT_PLACEHOLDER: u32 = 300;
+    for (i, (label, value, xp)) in rows.into_iter().enumerate() {
+        let row_y = layout.first_row_y() + i as i32;
+        let is_selected = i == selected;
+        let detail = format!("{} (xp {}/{})", value, xp, XP_TO_NEXT_PLACEHOLDER);
+        draw_menu_row(
+            cells,
+            layout,
+            row_y,
+            is_selected,
+            label,
+            palette.panel_fg,
+            Some((&detail, palette.panel_dim_fg)),
+            palette,
+        );
+    }
 }
 
 fn draw_info_skills(

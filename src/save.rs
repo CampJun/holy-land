@@ -171,6 +171,29 @@ pub struct RunSave {
     // tier starting equipment (knife in main hand).
     #[serde(default)]
     pub player_equipment: Option<EquipmentSave>,
+    // PR B Attributes card (additive, no schema bump): plumbs STR /
+    // AGI / CON / INT / SPIRIT + per-attribute XP for the player.
+    // Older saves load with `Attributes::starting_player()` defaults.
+    #[serde(default)]
+    pub player_attributes: Option<AttributesSave>,
+}
+
+/// PR B Attributes save block. Five attribute scores + per-attribute
+/// XP ledger. Additive — older saves restore via `Attributes::starting_player()`.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct AttributesSave {
+    #[serde(default)]
+    pub str_: u8,
+    #[serde(default)]
+    pub agi: u8,
+    #[serde(default)]
+    pub con: u8,
+    #[serde(default)]
+    pub int_: u8,
+    #[serde(default)]
+    pub spirit: u8,
+    #[serde(default)]
+    pub attribute_xp: [u32; 5],
 }
 
 /// Per-slot equipment round-trip. Each field is a save_key string; an
@@ -427,6 +450,7 @@ impl RunSave {
             hostiles: Vec::new(),
             player_body_parts: None,
             player_equipment: None,
+            player_attributes: None,
         }
     }
 }
@@ -747,6 +771,7 @@ mod tests {
             hostiles: Vec::new(),
             player_body_parts: None,
             player_equipment: None,
+            player_attributes: None,
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
@@ -850,6 +875,7 @@ mod tests {
             hostiles: Vec::new(),
             player_body_parts: None,
             player_equipment: None,
+            player_attributes: None,
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
@@ -878,6 +904,40 @@ mod tests {
         assert_eq!(loaded.cell_items[0].items[0].kind, "stone");
         assert_eq!(loaded.speed, 150);
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn round_trip_player_attributes() {
+        let dir = std::env::temp_dir().join(format!("survival-attrs-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("run.cbor");
+        let mut run = RunSave::empty(SaveHeader::fresh(None));
+        run.player_attributes = Some(AttributesSave {
+            str_: 14,
+            agi: 12,
+            con: 11,
+            int_: 9,
+            spirit: 13,
+            attribute_xp: [10, 20, 30, 40, 50],
+        });
+        save_atomic(&path, &run).unwrap();
+        let loaded = load_run(&path).unwrap();
+        let attrs = loaded.player_attributes.expect("attributes round-trip");
+        assert_eq!(attrs.str_, 14);
+        assert_eq!(attrs.agi, 12);
+        assert_eq!(attrs.con, 11);
+        assert_eq!(attrs.int_, 9);
+        assert_eq!(attrs.spirit, 13);
+        assert_eq!(attrs.attribute_xp, [10, 20, 30, 40, 50]);
+        // Pre-Attributes saves load with `None` and the world falls
+        // back to `Attributes::starting_player()` at restore time.
+        let mut legacy = RunSave::empty(SaveHeader::fresh(None));
+        legacy.player_attributes = None;
+        let legacy_path = dir.join("legacy.cbor");
+        save_atomic(&legacy_path, &legacy).unwrap();
+        let legacy_loaded = load_run(&legacy_path).unwrap();
+        assert!(legacy_loaded.player_attributes.is_none());
         fs::remove_dir_all(&dir).ok();
     }
 

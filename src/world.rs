@@ -585,22 +585,28 @@ pub struct BodyParts {
 }
 
 impl BodyParts {
-    /// Per-part max-HP scale used by both player and bandit baselines.
-    /// Phase 3 will scale these by the Stam attribute per the damage-
-    /// math card; phase 2 keeps them flat.
+    /// Per-part max-HP scale at `CON = Attributes::BASELINE` (= 10).
+    /// `starting_human_with_con` scales linearly off these — CON 10
+    /// reproduces the original numbers, CON 20 doubles them.
     pub const HEAD_MAX: i16 = 40;
     pub const TORSO_MAX: i16 = 80;
     pub const ARM_MAX: i16 = 60;
     pub const LEG_MAX: i16 = 60;
 
     pub fn starting_human() -> Self {
+        Self::starting_human_with_con(Attributes::BASELINE)
+    }
+
+    pub fn starting_human_with_con(con: u8) -> Self {
+        let scale = con as i16;
+        let denom = Attributes::BASELINE as i16;
         Self {
-            head: BodyPartHp::full(Self::HEAD_MAX),
-            torso: BodyPartHp::full(Self::TORSO_MAX),
-            l_arm: BodyPartHp::full(Self::ARM_MAX),
-            r_arm: BodyPartHp::full(Self::ARM_MAX),
-            l_leg: BodyPartHp::full(Self::LEG_MAX),
-            r_leg: BodyPartHp::full(Self::LEG_MAX),
+            head: BodyPartHp::full(Self::HEAD_MAX * scale / denom),
+            torso: BodyPartHp::full(Self::TORSO_MAX * scale / denom),
+            l_arm: BodyPartHp::full(Self::ARM_MAX * scale / denom),
+            r_arm: BodyPartHp::full(Self::ARM_MAX * scale / denom),
+            l_leg: BodyPartHp::full(Self::LEG_MAX * scale / denom),
+            r_leg: BodyPartHp::full(Self::LEG_MAX * scale / denom),
         }
     }
 
@@ -1026,6 +1032,11 @@ pub fn spawn_humanoid_bandit(
         BanditTier::Sergeant => CombatSkills::starting_sergeant(),
         BanditTier::Knight => CombatSkills::starting_knight(),
     };
+    let attrs = match tier {
+        BanditTier::Yeoman => Attributes::starting_bandit(),
+        BanditTier::Sergeant => Attributes::starting_sergeant(),
+        BanditTier::Knight => Attributes::starting_knight(),
+    };
     let entity = ecs.spawn((
         pos,
         Renderable {
@@ -1034,12 +1045,13 @@ pub fn spawn_humanoid_bandit(
             bg: [20, 17, 13, 255],
         },
         Speed::default(),
-        BodyParts::starting_human(),
+        BodyParts::starting_human_with_con(attrs.con),
         Hostile,
         Ai(AiKind::ChaseAndBump),
         CornishBandit,
         Wielded(main_hand),
         skills,
+        attrs,
         worn_from_items(&worn_kinds),
         Stamina::starting_human(),
     ));
@@ -1245,8 +1257,6 @@ pub struct CombatSkills {
     pub dodge: i16,
     /// Stand-in for the per-weapon proficiency the phase-3 card unlocks.
     pub weapon_prof: i16,
-    pub str_bonus: i16,
-    pub agi_mod: i16,
     pub encumbrance: i16,
 }
 
@@ -1260,8 +1270,6 @@ impl CombatSkills {
             melee: 6,
             dodge: 4,
             weapon_prof: 1,
-            str_bonus: 1,
-            agi_mod: 1,
             encumbrance: 0,
         }
     }
@@ -1275,8 +1283,6 @@ impl CombatSkills {
             melee: 7,
             dodge: 5,
             weapon_prof: 1,
-            str_bonus: 1,
-            agi_mod: 0,
             encumbrance: 0,
         }
     }
@@ -1288,8 +1294,6 @@ impl CombatSkills {
             melee: 12,
             dodge: 8,
             weapon_prof: 3,
-            str_bonus: 2,
-            agi_mod: 1,
             encumbrance: 0,
         }
     }
@@ -1301,10 +1305,78 @@ impl CombatSkills {
             melee: 18,
             dodge: 10,
             weapon_prof: 5,
-            str_bonus: 3,
-            agi_mod: 1,
             encumbrance: 0,
         }
+    }
+}
+
+/// Five core attributes — `STR AGI CON INT SPIRIT`. Per the Attributes
+/// card (`obsidian/Survival.md` Drafts): 10 = average human, 20 = peak
+/// human. `str_bonus()` and `agi_mod()` are linear deltas from 10 —
+/// combat reads these via `attacker_loadout` / `defender_stats` rather
+/// than carrying a separate stat on `CombatSkills`. `int_` and `spirit`
+/// are inert in v1 — plumbed for save + Attributes tab display but no
+/// system reads them yet. `attribute_xp` is the use-based train-up
+/// ledger (CDDA-style per `Combat - Skill XP sources` card); thresholds
+/// land in a later card.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Attributes {
+    pub str_: u8,
+    pub agi: u8,
+    pub con: u8,
+    pub int_: u8,
+    pub spirit: u8,
+    pub attribute_xp: [u32; 5],
+}
+
+impl Attributes {
+    pub const BASELINE: u8 = 10;
+
+    pub fn starting_player() -> Self {
+        Self {
+            str_: Self::BASELINE,
+            agi: Self::BASELINE,
+            con: Self::BASELINE,
+            int_: Self::BASELINE,
+            spirit: Self::BASELINE,
+            attribute_xp: [0; 5],
+        }
+    }
+
+    /// Yeoman-tier bandit: same body as the player. The previous
+    /// `CombatSkills.str_bonus = 1` rolled into `STR = 11`.
+    pub fn starting_bandit() -> Self {
+        Self { str_: 11, ..Self::starting_player() }
+    }
+
+    /// Sergeant-tier. Previous `str_bonus = 2, agi_mod = 1` → STR 12, AGI 11.
+    pub fn starting_sergeant() -> Self {
+        Self {
+            str_: 12,
+            agi: 11,
+            ..Self::starting_player()
+        }
+    }
+
+    /// Knight-tier. Previous `str_bonus = 3, agi_mod = 1` → STR 13, AGI 11.
+    pub fn starting_knight() -> Self {
+        Self {
+            str_: 13,
+            agi: 11,
+            ..Self::starting_player()
+        }
+    }
+
+    /// Damage / to-hit bonus from STR — linear delta from baseline 10.
+    #[inline]
+    pub fn str_bonus(self) -> i16 {
+        self.str_ as i16 - Self::BASELINE as i16
+    }
+
+    /// Dodge / to-hit modifier from AGI — linear delta from baseline 10.
+    #[inline]
+    pub fn agi_mod(self) -> i16 {
+        self.agi as i16 - Self::BASELINE as i16
     }
 }
 
@@ -1478,6 +1550,7 @@ impl World {
         let mut ecs = Ecs::new();
         let (sx, sy) = crate::cornwall::EXETER_SPAWN_CELL;
         let spawn = Position { x: sx, y: sy };
+        let player_attrs = Attributes::starting_player();
         let player = ecs.spawn((
             Player,
             spawn,
@@ -1490,8 +1563,9 @@ impl World {
             Needs::starting(),
             Skills::starting(),
             Speed::default(),
-            BodyParts::starting_human(),
+            BodyParts::starting_human_with_con(player_attrs.con),
             CombatSkills::starting_player(),
+            player_attrs,
             Stamina::starting_human(),
             // Player's equipment is the source of truth; Wielded /
             // OffHand / Worn are derived caches kept in sync via
@@ -1954,6 +2028,24 @@ impl World {
             .ecs
             .get::<&mut Skills>(self.player)
             .expect("player has Skills") = skills;
+    }
+
+    pub fn player_attributes(&self) -> Attributes {
+        self.ecs
+            .get::<&Attributes>(self.player)
+            .map(|a| *a)
+            .unwrap_or_else(|_| Attributes::starting_player())
+    }
+
+    pub fn set_player_attributes(&mut self, attrs: Attributes) {
+        let exists = self.ecs.satisfies::<&Attributes>(self.player).unwrap_or(false);
+        if exists {
+            if let Ok(mut a) = self.ecs.get::<&mut Attributes>(self.player) {
+                *a = attrs;
+            }
+        } else {
+            let _ = self.ecs.insert_one(self.player, attrs);
+        }
     }
 
     /// Read the player's per-body-part HP for save serialization.
@@ -3174,13 +3266,14 @@ impl World {
         let kind = self.ecs.get::<&Wielded>(e).ok().map(|w| w.0)?;
         let ranged = kind.def().ranged?;
         let skills = self.ecs.get::<&CombatSkills>(e).ok()?;
+        let attrs = self.ecs.get::<&Attributes>(e).ok();
         let atk = crate::combat::AttackerStats {
             // Ranged uses melee skill as a stand-in until phase 9 splits
             // Melee + Ranged into separate top-level skills.
             melee_skill: skills.melee,
             weapon_prof: skills.weapon_prof,
-            agi_mod: skills.agi_mod,
-            str_bonus: skills.str_bonus,
+            agi_mod: attrs.as_deref().map(|a| a.agi_mod()).unwrap_or(0),
+            str_bonus: attrs.as_deref().map(|a| a.str_bonus()).unwrap_or(0),
         };
         Some((atk, kind, ranged))
     }
@@ -3354,12 +3447,13 @@ impl World {
     fn attacker_loadout(&self, e: Entity) -> Option<(crate::combat::AttackerStats, crate::items::ItemKind)> {
         let wielded = self.ecs.get::<&Wielded>(e).ok()?;
         let skills = self.ecs.get::<&CombatSkills>(e).ok()?;
+        let attrs = self.ecs.get::<&Attributes>(e).ok();
         Some((
             crate::combat::AttackerStats {
                 melee_skill: skills.melee,
                 weapon_prof: skills.weapon_prof,
-                agi_mod: skills.agi_mod,
-                str_bonus: skills.str_bonus,
+                agi_mod: attrs.as_deref().map(|a| a.agi_mod()).unwrap_or(0),
+                str_bonus: attrs.as_deref().map(|a| a.str_bonus()).unwrap_or(0),
             },
             wielded.0,
         ))
@@ -3369,6 +3463,7 @@ impl World {
         let Ok(skills) = self.ecs.get::<&CombatSkills>(e) else {
             return crate::combat::DefenderStats::default();
         };
+        let attrs = self.ecs.get::<&Attributes>(e).ok();
         let worn_enc = self
             .ecs
             .get::<&Worn>(e)
@@ -3395,7 +3490,7 @@ impl World {
         };
         crate::combat::DefenderStats {
             dodge_skill: skills.dodge,
-            agi_mod: skills.agi_mod,
+            agi_mod: attrs.as_deref().map(|a| a.agi_mod()).unwrap_or(0),
             encumbrance: skills.encumbrance + worn_enc + stam_penalty + grappled_pen + prone_pen,
         }
     }
@@ -3495,13 +3590,13 @@ impl World {
     fn str_contest(&mut self, attacker: Entity, target: Entity) -> bool {
         let atk_str = self
             .ecs
-            .get::<&CombatSkills>(attacker)
-            .map(|s| s.str_bonus)
+            .get::<&Attributes>(attacker)
+            .map(|a| a.str_bonus())
             .unwrap_or(0);
         let def_str = self
             .ecs
-            .get::<&CombatSkills>(target)
-            .map(|s| s.str_bonus)
+            .get::<&Attributes>(target)
+            .map(|a| a.str_bonus())
             .unwrap_or(0);
         let stam_pen = self
             .ecs
@@ -5442,6 +5537,66 @@ mod tests {
     }
 
     #[test]
+    fn attributes_starting_player_has_baseline_ten_with_zero_bonuses() {
+        let a = Attributes::starting_player();
+        assert_eq!(a.str_, 10);
+        assert_eq!(a.agi, 10);
+        assert_eq!(a.con, 10);
+        assert_eq!(a.int_, 10);
+        assert_eq!(a.spirit, 10);
+        assert_eq!(a.str_bonus(), 0);
+        assert_eq!(a.agi_mod(), 0);
+    }
+
+    #[test]
+    fn attributes_bonus_is_linear_delta_from_baseline() {
+        // The old `CombatSkills.str_bonus = N` semantics now ride on
+        // `Attributes.str_ = 10 + N`. The combat resolver still reads
+        // `AttackerStats.str_bonus`, so the only thing that changed is
+        // *where* the bonus is sourced from.
+        let a = Attributes {
+            str_: 13,
+            agi: 8,
+            con: 10,
+            int_: 10,
+            spirit: 10,
+            attribute_xp: [0; 5],
+        };
+        assert_eq!(a.str_bonus(), 3);
+        assert_eq!(a.agi_mod(), -2);
+    }
+
+    #[test]
+    fn player_attributes_round_trip_via_world_setter() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let custom = Attributes {
+            str_: 14,
+            agi: 12,
+            con: 11,
+            int_: 9,
+            spirit: 13,
+            attribute_xp: [10, 20, 30, 40, 50],
+        };
+        world.set_player_attributes(custom);
+        let got = world.player_attributes();
+        assert_eq!(got.str_, 14);
+        assert_eq!(got.agi, 12);
+        assert_eq!(got.con, 11);
+        assert_eq!(got.attribute_xp, [10, 20, 30, 40, 50]);
+    }
+
+    #[test]
+    fn con_scales_starting_body_part_max_hp() {
+        // CON=10 reproduces the legacy flat numbers; CON=20 doubles them.
+        let baseline = BodyParts::starting_human_with_con(10);
+        assert_eq!(baseline.torso.max, BodyParts::TORSO_MAX);
+        assert_eq!(baseline.head.max, BodyParts::HEAD_MAX);
+        let beefy = BodyParts::starting_human_with_con(20);
+        assert_eq!(beefy.torso.max, BodyParts::TORSO_MAX * 2);
+        assert_eq!(beefy.head.max, BodyParts::HEAD_MAX * 2);
+    }
+
+    #[test]
     fn sync_combat_skills_from_skills_bumps_melee() {
         let mut world = World::new(CHUNK_W, CHUNK_H);
         let base = CombatSkills::starting_player().melee;
@@ -5713,10 +5868,10 @@ mod tests {
         let mut world = World::new(CHUNK_W, CHUNK_H);
         let bandit = drop_test_bandit(&mut world, 1, 0);
         // Force the player to be much stronger so the contest reliably
-        // wins. Player default str_bonus = 1; bump to 20.
+        // wins. Player default STR = 10 (bonus 0); bump to 30 (bonus +20).
         {
-            let mut cs = world.ecs.get::<&mut CombatSkills>(world.player).unwrap();
-            cs.str_bonus = 20;
+            let mut attrs = world.ecs.get::<&mut Attributes>(world.player).unwrap();
+            attrs.str_ = 30;
         }
         // Grapple first so throw has a valid target state. We'll also
         // confirm Prone arrives.
@@ -5736,8 +5891,8 @@ mod tests {
         let mut world = World::new(CHUNK_W, CHUNK_H);
         let bandit = drop_test_bandit(&mut world, 1, 0);
         {
-            let mut cs = world.ecs.get::<&mut CombatSkills>(world.player).unwrap();
-            cs.str_bonus = 20;
+            let mut attrs = world.ecs.get::<&mut Attributes>(world.player).unwrap();
+            attrs.str_ = 30;
         }
         let pos = world.ecs.get::<&Position>(bandit).map(|p| *p).unwrap();
         // Drop a kid: a few attempts since contest variance is small.
