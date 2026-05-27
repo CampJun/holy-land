@@ -1197,6 +1197,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         selected: 0,
                     });
                 }
+                // PR B Wait card: desktop `.` and the Miyoo B button
+                // (B is a no-op in open world today since all menu-
+                // close paths fire B from higher-priority `continue`
+                // blocks above) both pass one tile-step of time.
+                // Holding either fires repeats via the input layer's
+                // repeat-on-hold, which approximates the card's
+                // "continuous wait" UX without a dedicated multi-turn
+                // queue wrap.
+                Action::Wait | Action::B => {
+                    match action::execute(&mut world, action::ActionId::Wait) {
+                        action::ExecuteOutcome::Done(msg) => log_debug!("{}", msg),
+                        action::ExecuteOutcome::OpenAim => {}
+                    }
+                }
                 _ => {}
             }
         }

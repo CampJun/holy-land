@@ -5840,6 +5840,26 @@ mod tests {
     }
 
     #[test]
+    fn wait_action_advances_clock_by_one_tile_step() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let before = world.clock_seconds;
+        match crate::action::execute(&mut world, crate::action::ActionId::Wait) {
+            crate::action::ExecuteOutcome::Done(_) => {}
+            other => panic!("expected Done, got {:?}", other),
+        }
+        // MOVE_COST_TILE / MOVES_PER_SECOND = 500 / 100 = 5 game-seconds.
+        assert_eq!(world.clock_seconds, before + 5);
+    }
+
+    #[test]
+    fn wait_action_does_not_move_player() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let before = world.player_pos();
+        let _ = crate::action::execute(&mut world, crate::action::ActionId::Wait);
+        assert_eq!(world.player_pos(), before);
+    }
+
+    #[test]
     fn try_drop_to_cell_merges_into_existing_fungible_stack() {
         let mut world = World::new(CHUNK_W, CHUNK_H);
         let pos = world.player_pos();

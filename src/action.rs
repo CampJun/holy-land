@@ -101,6 +101,11 @@ pub enum ActionId {
     /// Free (0 moves, doesn't advance the clock). Jog is gated by
     /// stamina and the cycle falls through to Creep when blocked.
     CycleStride,
+    /// PR B Wait card: pass one tile-step of moves without moving. Advances
+    /// the world clock, ticks hostiles + needs + stamina via the existing
+    /// `spend_action_time` chain. Cost = `MOVE_COST_TILE` (one tile-step
+    /// of time, regardless of stride).
+    Wait,
 }
 
 impl ActionId {
@@ -162,6 +167,7 @@ impl ActionId {
             ActionId::Throw => 150,
             ActionId::Disarm => 150,
             ActionId::CycleStride => 0,
+            ActionId::Wait => crate::world::MOVE_COST_TILE,
         }
     }
 
@@ -200,6 +206,7 @@ impl ActionId {
             ActionId::Throw => "throw",
             ActionId::Disarm => "disarm",
             ActionId::CycleStride => "cycle_stride",
+            ActionId::Wait => "wait",
         }
     }
 
@@ -235,6 +242,7 @@ impl ActionId {
             "throw" => ActionId::Throw,
             "disarm" => ActionId::Disarm,
             "cycle_stride" => ActionId::CycleStride,
+            "wait" => ActionId::Wait,
             _ => return None,
         })
     }
@@ -375,6 +383,11 @@ pub const ALL_ACTIONS: &[ContextAction] = &[
         name: "Stride",
         description: "Cycle pace: Creep → Walk → Jog. Jog drains stamina.",
     },
+    ContextAction {
+        id: ActionId::Wait,
+        name: "Wait",
+        description: "Pass one tile-step of time without moving.",
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -482,6 +495,7 @@ pub fn evaluate(world: &World, id: ActionId) -> Availability {
         ActionId::Disarm => eval_grapple_or_disarm(world, true),
         ActionId::Throw => eval_throw(world),
         ActionId::CycleStride => Availability::Available { cost_game_seconds: 0 },
+        ActionId::Wait => Availability::Available { cost_game_seconds: cost },
     }
 }
 
@@ -769,6 +783,14 @@ pub fn execute(world: &mut World, id: ActionId) -> ExecuteOutcome {
         ActionId::CycleStride => {
             let next = world.cycle_player_stride();
             ExecuteOutcome::Done(format!("Stride: {}", next.label()))
+        }
+        ActionId::Wait => {
+            // Same time-spend path as one tile of movement, no position
+            // change. tick_hostiles fires so foes still advance during
+            // the wait — the player isn't "frozen out of combat".
+            world.spend_moves(ActionId::Wait.move_cost());
+            world.tick_hostiles();
+            ExecuteOutcome::Done("you wait.".to_string())
         }
     }
 }
