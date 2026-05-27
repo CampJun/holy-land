@@ -11,7 +11,7 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
-use crate::world::{CellState, TerrainKind, CHUNK_H, CHUNK_W, ChunkCoord};
+use crate::world::{CellState, GroundCover, TerrainKind, CHUNK_H, CHUNK_W, ChunkCoord};
 
 #[derive(Debug, Deserialize)]
 pub struct City {
@@ -286,7 +286,7 @@ impl City {
         // so streets and houses sit on cleared earth, not forest.
         // Skipped if the wall doesn't overlap this chunk.
         if wall_overlaps_chunk {
-            self.clear_forest_inside_wall(
+            self.clear_natural_layer_inside_wall(
                 wall_world_polygon,
                 wall_bbox,
                 chunk_origin_x,
@@ -343,23 +343,44 @@ impl City {
         }
 
         // Pass 4: wall polygon edges, gates skipped.
+        //
+        // Bresenham steps diagonally whenever the segment isn't axis-
+        // aligned. Exeter's polygon has zero axis-aligned segments, so
+        // every wall run takes diagonal steps. Two cells that are only
+        // diagonally adjacent aren't seen as connected by the 4-cardinal
+        // `wall_connector_glyph` lookup, and the wall renders as
+        // disconnected stubs. To keep the auto-tile happy we insert a
+        // bridge cell at every diagonal step so consecutive wall cells
+        // are always 4-cardinal adjacent. Bridge is placed at
+        // `(prev.x, new.y)` — Manhattan corner sharing the prev cell's
+        // column and the new cell's row. `prev` is carried across
+        // segments via the shared vertex (no-op diff there).
         let gate_skip = self.gate_skip_cells(anchor);
         let n = self.wall.polygon.len();
+        let mut prev: Option<(i64, i64)> = None;
         for i in 0..n {
             let a = self.wall.polygon[i];
             let b = self.wall.polygon[(i + 1) % n];
             let aw = (a.0 + anchor.0, a.1 + anchor.1);
             let bw = (b.0 + anchor.0, b.1 + anchor.1);
             for (wx, wy) in line_cells(aw, bw) {
-                if gate_skip.contains(&(wx, wy)) {
-                    continue;
+                if let Some((px, py)) = prev {
+                    if (wx - px).abs() == 1 && (wy - py).abs() == 1 {
+                        let bridge = (px, wy);
+                        if !gate_skip.contains(&bridge) {
+                            stamp_wall_cell(
+                                cells,
+                                bridge,
+                                chunk_origin_x,
+                                chunk_origin_y,
+                            );
+                        }
+                    }
                 }
-                let lx = wx - chunk_origin_x;
-                let ly = wy - chunk_origin_y;
-                if lx < 0 || ly < 0 || lx >= CHUNK_W as i64 || ly >= CHUNK_H as i64 {
-                    continue;
+                if !gate_skip.contains(&(wx, wy)) {
+                    stamp_wall_cell(cells, (wx, wy), chunk_origin_x, chunk_origin_y);
                 }
-                set_terrain(cells, lx as usize, ly as usize, TerrainKind::StoneWall);
+                prev = Some((wx, wy));
             }
         }
 
@@ -381,9 +402,13 @@ impl City {
         }
     }
 
-    /// Replace TreeTrunk + decoration with bare Grass inside the wall
+    /// Strip the natural layer (trees, undergrowth decorations, scattered
+    /// debris items, and ground cover) from every cell inside the wall
     /// polygon, so the city's streets and houses sit on cleared land.
-    fn clear_forest_inside_wall(
+    /// "For now" the city is fully swept — no twigs/pebbles inside the
+    /// walls; foraging is a countryside activity. Revisit if/when towns
+    /// want a "littered alley" aesthetic.
+    fn clear_natural_layer_inside_wall(
         &self,
         wall_world_polygon: &[(i64, i64)],
         wall_bbox: (i64, i64, i64, i64),
@@ -410,6 +435,8 @@ impl City {
                 }
                 cells[idx].tree_species = None;
                 cells[idx].decoration = crate::flora::Decoration::None;
+                cells[idx].items.clear();
+                cells[idx].ground_cover = GroundCover::None;
             }
         }
     }
@@ -730,6 +757,23 @@ fn point_in_polygon(p: (i64, i64), poly: &[(i64, i64)]) -> bool {
 
 /// Inclusive Bresenham line between two cells. Yields each cell on the
 /// line exactly once.
+/// Stamp a single `StoneWall` at world cell `wcell`, clipped to the
+/// chunk. No-op outside the chunk. Used by the wall pass to stamp
+/// both Bresenham line cells and the diagonal-step bridge cells.
+fn stamp_wall_cell(
+    cells: &mut [CellState],
+    wcell: (i64, i64),
+    chunk_origin_x: i64,
+    chunk_origin_y: i64,
+) {
+    let lx = wcell.0 - chunk_origin_x;
+    let ly = wcell.1 - chunk_origin_y;
+    if lx < 0 || ly < 0 || lx >= CHUNK_W as i64 || ly >= CHUNK_H as i64 {
+        return;
+    }
+    set_terrain(cells, lx as usize, ly as usize, TerrainKind::StoneWall);
+}
+
 fn line_cells(a: (i64, i64), b: (i64, i64)) -> impl Iterator<Item = (i64, i64)> {
     let (x0, y0) = a;
     let (x1, y1) = b;

@@ -118,6 +118,11 @@ pub enum ActionId {
     /// firewood. Requires an axe in pack. 60 game-seconds = 6000 moves
     /// per the card's spec.
     ChopLog,
+    /// PR A card 4 — chamber a bolt into the wielded crossbow. Heavy
+    /// move + stamina cost; consumes one `CrossbowBolt` from the pack.
+    /// The Aim verb refuses to commit a shot while the crossbow is
+    /// unloaded.
+    Reload,
 }
 
 impl ActionId {
@@ -183,6 +188,10 @@ impl ActionId {
             ActionId::DragStart => 200,
             ActionId::DragEnd => 0,
             ActionId::ChopLog => 6_000,
+            // Crossbow reload — the slow part of the bow/crossbow split
+            // per the Reach and ranged card. Real spend happens inside
+            // `perform_crossbow_reload`; this is just the menu readout.
+            ActionId::Reload => 300,
         }
     }
 
@@ -225,6 +234,7 @@ impl ActionId {
             ActionId::DragStart => "drag_start",
             ActionId::DragEnd => "drag_end",
             ActionId::ChopLog => "chop_log",
+            ActionId::Reload => "reload",
         }
     }
 
@@ -264,6 +274,7 @@ impl ActionId {
             "drag_start" => ActionId::DragStart,
             "drag_end" => ActionId::DragEnd,
             "chop_log" => ActionId::ChopLog,
+            "reload" => ActionId::Reload,
             _ => return None,
         })
     }
@@ -424,6 +435,11 @@ pub const ALL_ACTIONS: &[ContextAction] = &[
         name: "Chop log",
         description: "Split a log on this cell into 3-6 firewood (axe).",
     },
+    ContextAction {
+        id: ActionId::Reload,
+        name: "Reload",
+        description: "Chamber a bolt into your crossbow.",
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -541,6 +557,7 @@ pub fn evaluate(world: &World, id: ActionId) -> Availability {
             }
         }
         ActionId::ChopLog => eval_chop_log(world, cost),
+        ActionId::Reload => eval_reload(world),
     }
 }
 
@@ -590,6 +607,22 @@ fn find_adjacent_log(world: &World) -> Option<(i32, i32)> {
     None
 }
 
+fn eval_reload(world: &World) -> Availability {
+    if world.player_main_hand_kind() != Some(ItemKind::Crossbow) {
+        return Availability::Unavailable { reason: "no crossbow wielded" };
+    }
+    if world.crossbow_loaded {
+        return Availability::Unavailable { reason: "already loaded" };
+    }
+    if !world.player_pack().has_stack(ItemKind::CrossbowBolt) {
+        return Availability::Unavailable { reason: "no bolts in pack" };
+    }
+    if !world.player_has_stamina_for_heavy() {
+        return Availability::Unavailable { reason: "winded" };
+    }
+    Availability::Available { cost_game_seconds: world.moves_to_seconds(ActionId::Reload.move_cost()) }
+}
+
 fn eval_grapple_or_disarm(world: &World, require_wielded: bool) -> Availability {
     if !world.player_has_stamina_for_heavy() {
         return Availability::Unavailable { reason: "winded" };
@@ -618,7 +651,8 @@ fn eval_throw(world: &World) -> Availability {
 
 fn eval_aim(world: &World) -> Availability {
     // Available iff the player is wielding a ranged weapon AND has at
-    // least one round of the matching ammo in pack.
+    // least one round of the matching ammo in pack. Crossbows
+    // additionally require a chambered bolt — fire-then-reload loop.
     use crate::items::ItemKind as IK;
     let pack = world.player_pack();
     let wielded = world
@@ -627,7 +661,9 @@ fn eval_aim(world: &World) -> Availability {
     let Some((kind, ranged)) = wielded else {
         return Availability::Unavailable { reason: "no ranged weapon equipped" };
     };
-    let _ = kind;
+    if kind == IK::Crossbow && !world.crossbow_loaded {
+        return Availability::Unavailable { reason: "crossbow unloaded — Reload" };
+    }
     if !ranged.ammo_kind.is_empty() {
         let Some(ammo) = IK::from_save_key(ranged.ammo_kind) else {
             return Availability::Unavailable { reason: "ammo kind unknown" };
@@ -889,6 +925,19 @@ pub fn execute(world: &mut World, id: ActionId) -> ExecuteOutcome {
             ExecuteOutcome::Done("you release the log.".to_string())
         }
         ActionId::ChopLog => execute_chop_log(world),
+        ActionId::Reload => execute_reload(world),
+    }
+}
+
+fn execute_reload(world: &mut World) -> ExecuteOutcome {
+    // Move-cost and stamina drain land inside perform_crossbow_reload;
+    // the executor just dispatches and surfaces the result line.
+    if world.perform_crossbow_reload() {
+        ExecuteOutcome::Done(String::new())
+    } else {
+        // perform_crossbow_reload already pushed a reason message;
+        // returning an empty Done keeps the action-resolver quiet.
+        ExecuteOutcome::Done(String::new())
     }
 }
 
@@ -1254,12 +1303,14 @@ pub fn complete_step(world: &mut World, id: ActionId) -> Option<String> {
             place_pitched_from_pack(world, ItemKind::Bedroll, 2_000, "bedroll unrolled")
         }
         ActionId::Sleep => {
-            // Sleeping through to dawn (or 8h) restores Sleep to max.
-            // Other needs ticked normally during the queue's
-            // advance_time_raw — those drops are real.
+            // Sleeping through to dawn (or 8h) restores Sleep to max
+            // and refills stamina (per the Stamina card). Other needs
+            // ticked normally during the queue's advance_time_raw —
+            // those drops are real.
             let mut needs = world.player_needs();
             needs.restore(NeedKind::Sleep, crate::needs::NEED_MAX);
             world.set_player_needs(needs);
+            world.restore_player_stamina_full();
             Some("woke rested".to_string())
         }
         ActionId::PlacePan => complete_place_pan(world),

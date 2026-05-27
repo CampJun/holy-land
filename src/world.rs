@@ -325,9 +325,11 @@ pub enum GroundCover {
 /// burnt-out groves) — see assets/CP437_MAP.md.
 pub const TREE_VARIANT_GLYPHS: &[u8] = &[0x05, 0x06, 0x17, 0x18];
 
-/// Iteration order for `TerrainKind::from_save_key`. Keep in sync with
-/// the enum variants — adding a kind here makes from_save_key find it.
-const ALL_TERRAINS: &[TerrainKind] = &[
+/// Canonical iteration order for `TerrainKind::from_save_key`. Keep in
+/// sync with the enum variants — adding a kind here makes from_save_key
+/// find it. The in-game tile-remap UI uses `REMAPPABLE_TERRAINS`
+/// (a filtered subset) instead.
+pub const ALL_TERRAINS: &[TerrainKind] = &[
     TerrainKind::Grass,
     TerrainKind::BareDirt,
     TerrainKind::SandShore,
@@ -337,6 +339,21 @@ const ALL_TERRAINS: &[TerrainKind] = &[
     TerrainKind::Wall,
     TerrainKind::StoneWall,
     TerrainKind::WoodWall,
+    TerrainKind::Floor,
+    TerrainKind::CobbleRoad,
+];
+
+/// Subset of `ALL_TERRAINS` shown in the tile-remap UI. Walls and the
+/// OOB sentinel are excluded — `StoneWall` / `WoodWall` auto-tile via
+/// `wall_connector_glyph` and don't have a single representative glyph;
+/// `Wall` is internal (out-of-loaded-chunks sentinel).
+pub const REMAPPABLE_TERRAINS: &[TerrainKind] = &[
+    TerrainKind::Grass,
+    TerrainKind::BareDirt,
+    TerrainKind::SandShore,
+    TerrainKind::TreeTrunk,
+    TerrainKind::StreamWater,
+    TerrainKind::PondWater,
     TerrainKind::Floor,
     TerrainKind::CobbleRoad,
 ];
@@ -351,6 +368,14 @@ impl TerrainKind {
 
     pub fn from_save_key(s: &str) -> Option<Self> {
         ALL_TERRAINS.iter().copied().find(|t| t.def().save_key == s)
+    }
+
+    /// True for kinds that connect via the wall auto-tiling tables in
+    /// `wall_connector_glyph`. Excludes `Wall` (the OOB sentinel).
+    /// TODO: add future `Door` / `Gate` kinds here so wall runs stitch
+    /// across openings.
+    pub fn is_wall_like(self) -> bool {
+        matches!(self, TerrainKind::StoneWall | TerrainKind::WoodWall)
     }
 
     /// Cells where weather (snow, frost, rain) can land directly.
@@ -534,6 +559,60 @@ impl TerrainKind {
                 blocks_sight: false,
             },
         }
+    }
+}
+
+/// Neighbor-aware connector glyph for a wall cell. Reads the 4 cardinal
+/// neighbors via `World::tile_at` and picks the matching CP437
+/// box-drawing glyph from the thick (double-line) or thin (single-line)
+/// set depending on `kind`. Cross-tier neighbors still count as
+/// connections — a thin house wall abutting Exeter's thick perimeter
+/// renders connected (the perimeter cell picks its thick stub or T,
+/// the house cell picks its thin stub or T). Isolated cell (no wall
+/// neighbors) renders as a vertical pillar.
+pub fn wall_connector_glyph(world: &World, wx: i64, wy: i64, kind: TerrainKind) -> u8 {
+    let n = world.tile_at(wx, wy - 1).is_wall_like();
+    let s = world.tile_at(wx, wy + 1).is_wall_like();
+    let e = world.tile_at(wx + 1, wy).is_wall_like();
+    let w = world.tile_at(wx - 1, wy).is_wall_like();
+    match kind {
+        TerrainKind::StoneWall => match (n, s, e, w) {
+            (true, true, true, true) => 0xCE,    // ╬
+            (true, true, true, false) => 0xCC,   // ╠
+            (true, true, false, true) => 0xB9,   // ╣
+            (true, false, true, true) => 0xCA,   // ╩
+            (false, true, true, true) => 0xCB,   // ╦
+            (true, true, false, false) => 0xBA,  // ║
+            (false, false, true, true) => 0xCD,  // ═
+            (true, false, true, false) => 0xC8,  // ╚
+            (true, false, false, true) => 0xBC,  // ╝
+            (false, true, true, false) => 0xC9,  // ╔
+            (false, true, false, true) => 0xBB,  // ╗
+            (true, false, false, false) => 0xBA, // ║ (N stub)
+            (false, true, false, false) => 0xBA, // ║ (S stub)
+            (false, false, true, false) => 0xCD, // ═ (E stub)
+            (false, false, false, true) => 0xCD, // ═ (W stub)
+            (false, false, false, false) => 0xBA, // ║ isolated
+        },
+        TerrainKind::WoodWall => match (n, s, e, w) {
+            (true, true, true, true) => 0xC5,    // ┼
+            (true, true, true, false) => 0xC3,   // ├
+            (true, true, false, true) => 0xB4,   // ┤
+            (true, false, true, true) => 0xC1,   // ┴
+            (false, true, true, true) => 0xC2,   // ┬
+            (true, true, false, false) => 0xB3,  // │
+            (false, false, true, true) => 0xC4,  // ─
+            (true, false, true, false) => 0xC0,  // └
+            (true, false, false, true) => 0xD9,  // ┘
+            (false, true, true, false) => 0xDA,  // ┌
+            (false, true, false, true) => 0xBF,  // ┐
+            (true, false, false, false) => 0xB3, // │ (N stub)
+            (false, true, false, false) => 0xB3, // │ (S stub)
+            (false, false, true, false) => 0xC4, // ─ (E stub)
+            (false, false, false, true) => 0xC4, // ─ (W stub)
+            (false, false, false, false) => 0xB3, // │ isolated
+        },
+        _ => kind.def().glyph,
     }
 }
 
@@ -756,24 +835,36 @@ pub struct Wielded(pub crate::items::ItemKind);
 pub struct CornishBandit;
 
 /// Stamina pool per the Stamina card. Drained by heavy actions
-/// (grapple verbs, running, future brace / crossbow reload / aimed
-/// swings); normal melee swings are FREE. Regens passively while not
-/// in a heavy action. Out-of-stamina = slower swings + lower hit.
+/// (grapple verbs, reach-2 polearm from full extension, future brace /
+/// crossbow reload / aimed swings); normal melee swings are FREE.
+/// Regens passively, slowed by recent combat and by upper-body
+/// encumbrance. Out-of-stamina = slower swings + lower hit.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Stamina {
     pub cur: i16,
     pub max: i16,
+    /// Seconds since the entity last attacked or was attacked. While
+    /// > 0 the passive regen is halved per the card's "in combat =
+    /// slower" rule. Decremented inside `tick_combat_states`.
+    #[serde(default)]
+    pub recent_combat_secs: u16,
 }
 
 impl Stamina {
     pub fn starting_human() -> Self {
-        Self { cur: 100, max: 100 }
+        Self { cur: 100, max: 100, recent_combat_secs: 0 }
     }
     /// Stamina threshold below which heavy actions are blocked.
     pub const HEAVY_FLOOR: i16 = 15;
     /// Penalty to attacker `to_hit` when current stamina is below the
     /// heavy floor. Modest; full out-of-stamina state lands here.
     pub const LOW_HIT_PENALTY: i16 = 4;
+    /// How long an entity is considered "in combat" after a swing,
+    /// for regen-modulation purposes.
+    pub const COMBAT_COOLDOWN_SECS: u16 = 6;
+    /// Stamina spent by a reach-2 attack at full extension. Adjacent
+    /// reach-2 swings are still free.
+    pub const REACH_EXTENSION_COST: i16 = 10;
 }
 
 /// Target is in a grapple — can't move or attack until the hold
@@ -947,6 +1038,7 @@ impl YeomanLoadout {
 /// Loadout tier per `Status armament tiers.md`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BanditTier {
+    Rabble,
     Yeoman,
     Sergeant,
     Knight,
@@ -955,6 +1047,7 @@ pub enum BanditTier {
 impl BanditTier {
     pub fn save_key(self) -> &'static str {
         match self {
+            BanditTier::Rabble => "rabble",
             BanditTier::Yeoman => "yeoman",
             BanditTier::Sergeant => "sergeant",
             BanditTier::Knight => "knight",
@@ -1003,6 +1096,41 @@ pub fn roll_yeoman_loadout(rng: &mut Rng) -> YeomanLoadout {
         main_hand,
         off_hand,
         head,
+        torso,
+        torso_outer: None,
+        legs: None,
+    }
+}
+
+/// Rabble tier — bandits, vagrants, broken men. Per the Status
+/// armament tiers card: knife always; plus one of cudgel / quarterstaff
+/// / gisarme / stone / nothing-improvised. No real armor — sometimes a
+/// leather jerkin scrap; shield uncommon.
+pub fn roll_rabble_loadout(rng: &mut Rng) -> YeomanLoadout {
+    use crate::items::ItemKind;
+    // Main hand draws from the rabble pool.
+    let main_hand = match rng.d100() {
+        1..=30 => Some(ItemKind::Cudgel),
+        31..=55 => Some(ItemKind::Quarterstaff),
+        56..=70 => Some(ItemKind::Gisarme),
+        71..=85 => Some(ItemKind::Stone),
+        _ => Some(ItemKind::Knife),
+    };
+    // Knife is universal per the Statute, in the off-hand if the main
+    // hand is something else; "nothing" otherwise (card: "shield typically").
+    let off_hand = match main_hand {
+        Some(ItemKind::Knife) => None,
+        _ => Some(ItemKind::Knife),
+    };
+    // No real armor — maybe a leather jerkin scrap.
+    let torso = match rng.d100() {
+        1..=25 => Some(ItemKind::LeatherJerkin),
+        _ => None,
+    };
+    YeomanLoadout {
+        main_hand,
+        off_hand,
+        head: None,
         torso,
         torso_outer: None,
         legs: None,
@@ -1100,16 +1228,21 @@ pub fn spawn_humanoid_bandit(
         .unwrap_or(crate::items::ItemKind::Spear);
     let worn_kinds: Vec<_> = loadout.worn_kinds().collect();
     let (glyph, fg) = match tier {
+        BanditTier::Rabble => (b'r', [170, 110, 90, 255]),
         BanditTier::Yeoman => (b'b', [210, 80, 70, 255]),
         BanditTier::Sergeant => (b's', [220, 150, 70, 255]),
         BanditTier::Knight => (b'K', [220, 220, 240, 255]),
     };
     let skills = match tier {
+        BanditTier::Rabble => CombatSkills::starting_rabble(),
         BanditTier::Yeoman => CombatSkills::starting_bandit(),
         BanditTier::Sergeant => CombatSkills::starting_sergeant(),
         BanditTier::Knight => CombatSkills::starting_knight(),
     };
     let attrs = match tier {
+        // Rabble = peasants in revolt: average human attributes (the
+        // tier's weakness is in CombatSkills, not raw STR/AGI/CON).
+        BanditTier::Rabble => Attributes::starting_player(),
         BanditTier::Yeoman => Attributes::starting_bandit(),
         BanditTier::Sergeant => Attributes::starting_sergeant(),
         BanditTier::Knight => Attributes::starting_knight(),
@@ -1324,6 +1457,7 @@ pub struct HostileSnapshot {
     pub off_hand: Option<crate::items::ItemKind>,
     pub worn_kinds: Vec<crate::items::ItemKind>,
     pub flavor: &'static str,
+    pub stamina: Option<Stamina>,
 }
 
 /// Combat skill block carried on every combatant. Slice-1 hardcodes
@@ -1360,6 +1494,17 @@ impl CombatSkills {
             melee: 7,
             dodge: 5,
             weapon_prof: 1,
+            encumbrance: 0,
+        }
+    }
+
+    /// Rabble-tier — broken men, vagrants, peasants in revolt. Worse
+    /// than the Yeoman common bandit at melee + dodge; no real training.
+    pub fn starting_rabble() -> Self {
+        Self {
+            melee: 3,
+            dodge: 3,
+            weapon_prof: 0,
             encumbrance: 0,
         }
     }
@@ -1537,6 +1682,11 @@ pub struct World {
     /// old cell to the new cell as the player walks. The drag breaks
     /// silently if the log is gone (e.g. the player chopped it up).
     pub player_dragging: bool,
+    /// PR A card 4: whether the player's crossbow currently has a bolt
+    /// chambered. The Aim verb refuses to fire an unloaded crossbow;
+    /// the Reload verb sets this true at heavy move/stamina cost.
+    /// Irrelevant when not wielding a crossbow. Save-persisted.
+    pub crossbow_loaded: bool,
 }
 
 /// Outcome of one `tick_fast_travel` call. The main loop matches on
@@ -1689,6 +1839,7 @@ impl World {
             player_killed_by_combat: false,
             player_stride: StrideMode::default(),
             player_dragging: false,
+            crossbow_loaded: false,
         };
         // First-frame FOV so the renderer doesn't draw a black screen on
         // the very first paint.
@@ -2321,6 +2472,7 @@ impl World {
             } else {
                 "unknown"
             };
+            let stamina = self.ecs.get::<&Stamina>(e).ok().map(|s| *s);
             out.push(HostileSnapshot {
                 pos: *pos,
                 body,
@@ -2328,6 +2480,7 @@ impl World {
                 off_hand,
                 worn_kinds,
                 flavor,
+                stamina,
             });
         }
         out
@@ -2372,6 +2525,14 @@ impl World {
             if !snap.worn_kinds.is_empty() {
                 let worn = worn_from_items(&snap.worn_kinds);
                 let _ = self.ecs.insert_one(entity, worn);
+            }
+            // Stamina pool round-trips so save during a fight resumes
+            // with the same exhaustion level. Older saves with no
+            // stamina field keep the spawn-default full pool.
+            if let Some(stam) = snap.stamina {
+                if let Ok(mut s) = self.ecs.get::<&mut Stamina>(entity) {
+                    *s = stam;
+                }
             }
         }
     }
@@ -3282,6 +3443,69 @@ impl World {
         }
     }
 
+    /// Card 4 — player reload verb. Chambers a single bolt at heavy
+    /// move + stamina cost. The Aim verb refuses to commit a shot
+    /// while `crossbow_loaded` is false. Returns true if a bolt was
+    /// consumed (i.e. the reload took effect).
+    pub fn perform_crossbow_reload(&mut self) -> bool {
+        if self.player_main_hand_kind() != Some(crate::items::ItemKind::Crossbow) {
+            self.push_message("No crossbow wielded.".to_string());
+            return false;
+        }
+        if self.crossbow_loaded {
+            self.push_message("Already loaded.".to_string());
+            return false;
+        }
+        let took = self
+            .ecs
+            .get::<&mut crate::items::Pack>(self.player)
+            .ok()
+            .map(|mut p| p.take_one_from_stack(crate::items::ItemKind::CrossbowBolt))
+            .unwrap_or(false);
+        if !took {
+            self.push_message("No crossbow bolts in your pack.".to_string());
+            return false;
+        }
+        self.crossbow_loaded = true;
+        self.spend_stamina(self.player, Stamina::REACH_EXTENSION_COST);
+        self.spend_moves(300);
+        self.push_message("You chamber a bolt.".to_string());
+        true
+    }
+
+    /// Card 3 — per-weapon proficiency XP. Always called on the player
+    /// (the only `Skills` carrier) and gated by the caller to hit-only
+    /// per the card. Uses the same URW chassis as `award_combat_xp`.
+    fn award_proficiency_xp(&mut self, prof: crate::skill::Proficiency, success: bool) {
+        let mut skills = self
+            .ecs
+            .get::<&mut crate::skill::Skills>(self.player)
+            .map(|s| *s)
+            .unwrap_or_default();
+        crate::skill::award_xp(skills.proficiencies.get_mut(prof), success);
+        self.set_player_skills(skills);
+    }
+
+    /// Card 3 — for each piece whose layer caught the swing, award the
+    /// matching armor-class skill +5 XP (URW "success" grant). Daily
+    /// cap chassis from `skill::award_xp` keeps grinding bounded.
+    fn award_armor_xp_for_catches(&mut self, caught: &[crate::items::ItemKind]) {
+        if caught.is_empty() {
+            return;
+        }
+        let mut skills = self
+            .ecs
+            .get::<&mut crate::skill::Skills>(self.player)
+            .map(|s| *s)
+            .unwrap_or_default();
+        for &kind in caught {
+            if let Some(skill_kind) = crate::combat::armor_skill_for(kind) {
+                crate::skill::award_xp(skills.get_mut(skill_kind), true);
+            }
+        }
+        self.set_player_skills(skills);
+    }
+
     /// Sync the player's `CombatSkills` (the in-fight stat block read by
     /// the resolver) from the URW `Skills` (the long-run training
     /// ledger). +1 to the matching CombatSkills entry per Skills level.
@@ -3349,7 +3573,7 @@ impl World {
             crate::combat::HitOutcome::Hit { .. } | crate::combat::HitOutcome::Crit { .. } => {
                 let crit = outcome.is_crit();
                 let part = crate::combat::roll_body_part(&mut self.rng);
-                let armor = self.layered_dr_for(target, part);
+                let (armor, caught_pieces) = self.layered_dr_with_catches(target, part);
                 let situational_pct = if weapon.reach >= 2 && range == 1 {
                     crate::combat::NO_REACH_DAMAGE_PCT
                 } else {
@@ -3373,10 +3597,39 @@ impl World {
                     crit,
                 ));
                 self.apply_damage_to_part(target, part, dmg);
+                // Card 3: per-armor-class XP grant. Every piece whose
+                // coverage roll caught the swing teaches the matching
+                // armor skill — daily cap chassis stops grind.
+                if target_is_player {
+                    self.award_armor_xp_for_catches(&caught_pieces);
+                }
+                // Card 3: per-weapon proficiency XP — hit-only. Melee
+                // top-level already trains on the swing earlier.
+                if attacker_is_player {
+                    if let Some(prof) = crate::combat::proficiency_for(weapon_kind) {
+                        self.award_proficiency_xp(prof, true);
+                    }
+                }
             }
         }
+        // Reach-2 from full extension is a heavy action per the
+        // Stamina card; adjacent reach-2 swings stay free.
+        if weapon.reach >= 2 && range == 2 {
+            self.spend_stamina(attacker, Stamina::REACH_EXTENSION_COST);
+        }
+        // Mark both sides as "in combat" so passive regen drops to
+        // the slower branch for a few ticks.
+        self.mark_combat(attacker);
+        self.mark_combat(target);
         if attacker_is_player {
-            self.spend_moves(weapon.move_cost);
+            // Out-of-stamina = slower swings. 50% move-cost bump when
+            // the attacker is below the heavy floor.
+            let mc = if self.entity_low_stamina(attacker) {
+                weapon.move_cost + weapon.move_cost / 2
+            } else {
+                weapon.move_cost
+            };
+            self.spend_moves(mc);
         }
         // Skill XP. Attacker always trains Melee; defender trains Dodge
         // only on a near-miss (margin in [-4, -1]) — pure miss + crit
@@ -3421,6 +3674,14 @@ impl World {
             }
             return;
         }
+        // Crossbow: refuse to fire unless a bolt is currently chambered
+        // (player only — bandit crossbow load-state lives on its own
+        // entity once that loadout rolls; phase-7 stub: assume bandit
+        // crossbows are always loaded).
+        if weapon_kind == crate::items::ItemKind::Crossbow && attacker_is_player && !self.crossbow_loaded {
+            self.push_message("Crossbow is unloaded — reload first.".to_string());
+            return;
+        }
         // Ammo: consume one from the attacker's pack. No pack → no shot.
         let ammo_kind = crate::items::ItemKind::from_save_key(ranged.ammo_kind);
         if let Some(kind) = ammo_kind {
@@ -3436,6 +3697,10 @@ impl World {
                 }
                 return;
             }
+        }
+        // Spent the load on this shot.
+        if weapon_kind == crate::items::ItemKind::Crossbow && attacker_is_player {
+            self.crossbow_loaded = false;
         }
         // Range penalty: -1 to_hit per tile past half max_range.
         let range_penalty = {
@@ -3465,7 +3730,7 @@ impl World {
             crate::combat::HitOutcome::Hit { .. } | crate::combat::HitOutcome::Crit { .. } => {
                 let crit = outcome.is_crit();
                 let part = crate::combat::roll_body_part(&mut self.rng);
-                let armor = self.layered_dr_for(target, part);
+                let (armor, caught_pieces) = self.layered_dr_with_catches(target, part);
                 let dmg = crate::combat::roll_damage(weapon, atk_stats, armor, crit, &mut self.rng);
                 let total = dmg.total();
                 self.push_message(self.ranged_hit_line(
@@ -3477,6 +3742,14 @@ impl World {
                     crit,
                 ));
                 self.apply_damage_to_part(target, part, dmg);
+                if target_is_player {
+                    self.award_armor_xp_for_catches(&caught_pieces);
+                }
+                if attacker_is_player {
+                    if let Some(prof) = crate::combat::proficiency_for(weapon_kind) {
+                        self.award_proficiency_xp(prof, true);
+                    }
+                }
                 if let Some(kind) = ammo_kind {
                     // 70% of arrows survive embedded in the target —
                     // pickup gives them back. Crits break the arrow
@@ -3490,8 +3763,18 @@ impl World {
                 }
             }
         }
+        // Mark both sides as in-combat for the regen ladder. Normal
+        // ranged shots don't spend stamina per the card; only aimed
+        // shots (future submenu) and crossbow reloads will.
+        self.mark_combat(attacker);
+        self.mark_combat(target);
         if attacker_is_player {
-            self.spend_moves(ranged.move_cost);
+            let mc = if self.entity_low_stamina(attacker) {
+                ranged.move_cost + ranged.move_cost / 2
+            } else {
+                ranged.move_cost
+            };
+            self.spend_moves(mc);
         }
         // Skill XP. Bow + arrow swing always trains Ranged; defender
         // trains nothing on a ranged miss — Dodge is a melee construct
@@ -3657,31 +3940,38 @@ impl World {
     /// Sum the DR contribution of every Worn piece that covers `part`
     /// and rolls under its coverage %. The roll happens per-piece, not
     /// per-type — a single piece either catches the swing or it doesn't.
-    fn layered_dr_for(&mut self, target: Entity, part: crate::combat::BodyPart) -> crate::combat::ArmorDr {
+    /// Roll every piece covering `part` for whether it catches the
+    /// swing; sum the DR triplet of the catching pieces and surface
+    /// their `ItemKind`s so card 3 can route per-armor-class XP grants.
+    fn layered_dr_with_catches(
+        &mut self,
+        target: Entity,
+        part: crate::combat::BodyPart,
+    ) -> (crate::combat::ArmorDr, Vec<crate::items::ItemKind>) {
         let Ok(worn) = self.ecs.get::<&Worn>(target) else {
-            return crate::combat::ArmorDr::default();
+            return (crate::combat::ArmorDr::default(), Vec::new());
         };
-        // Collect into a local Vec so we can drop the ECS borrow before
-        // touching the Rng (rng.d100 doesn't borrow the ECS but the
-        // Worn ref is &; keeping it open across a self.rng call is fine
-        // but the small alloc keeps the surface simple).
-        let pieces: Vec<(u8, crate::combat::ArmorDr)> = worn
+        let pieces: Vec<(u8, crate::combat::ArmorDr, Option<crate::items::ItemKind>)> = worn
             .pieces
             .iter()
             .filter(|p| p.regions.contains(part))
-            .map(|p| (p.coverage_pct, p.dr))
+            .map(|p| (p.coverage_pct, p.dr, p.item_kind))
             .collect();
         drop(worn);
         let mut total = crate::combat::ArmorDr::default();
-        for (coverage_pct, dr) in pieces {
+        let mut caught: Vec<crate::items::ItemKind> = Vec::new();
+        for (coverage_pct, dr, kind) in pieces {
             let roll = self.rng.d100();
             if roll <= coverage_pct {
                 total.bash = total.bash.saturating_add(dr.bash);
                 total.cut = total.cut.saturating_add(dr.cut);
                 total.stab = total.stab.saturating_add(dr.stab);
+                if let Some(k) = kind {
+                    caught.push(k);
+                }
             }
         }
-        total
+        (total, caught)
     }
 
     fn attacker_loadout(&self, e: Entity) -> Option<(crate::combat::AttackerStats, crate::items::ItemKind)> {
@@ -3736,25 +4026,73 @@ impl World {
     }
 
     /// Spend `cost` stamina on an entity. No-op if no Stamina component.
-    /// Used by heavy actions (Grapple/Throw/Disarm and later brace,
-    /// reload, aimed shots).
+    /// Used by heavy actions (Grapple/Throw/Disarm, reach-2 extension,
+    /// and later brace / reload / aimed shots).
     pub fn spend_stamina(&mut self, e: Entity, cost: i16) {
         if let Ok(mut s) = self.ecs.get::<&mut Stamina>(e) {
             s.cur = (s.cur - cost).max(0);
         }
     }
 
-    /// Tick every Stamina component by `secs` of regen (passive +2/sec
-    /// while not in a heavy action). Also decays Grappled / Prone
-    /// timers and removes the components when they expire.
+    /// Refill the player's stamina to full and clear the in-combat
+    /// cooldown. Called by the Sleep verb's completion handler.
+    pub fn restore_player_stamina_full(&mut self) {
+        if let Ok(mut s) = self.ecs.get::<&mut Stamina>(self.player) {
+            s.cur = s.max;
+            s.recent_combat_secs = 0;
+        }
+    }
+
+    /// Mark an entity as having just attacked or been attacked. Pins
+    /// stamina regen to the slower "in combat" branch for the next
+    /// `Stamina::COMBAT_COOLDOWN_SECS` seconds.
+    pub fn mark_combat(&mut self, e: Entity) {
+        if let Ok(mut s) = self.ecs.get::<&mut Stamina>(e) {
+            s.recent_combat_secs = Stamina::COMBAT_COOLDOWN_SECS;
+        }
+    }
+
+    /// True iff the entity has Stamina and its current pool sits below
+    /// the heavy floor. Used to bump move-cost on swings.
+    fn entity_low_stamina(&self, e: Entity) -> bool {
+        self.ecs
+            .get::<&Stamina>(e)
+            .map(|s| s.cur < Stamina::HEAVY_FLOOR)
+            .unwrap_or(false)
+    }
+
+    /// Tick every Stamina component by `secs` of regen per the card's
+    /// ladder: +2/sec when resting, +1/sec while in combat (recent
+    /// swing), further reduced by upper-body encumbrance (-1/sec per
+    /// 8 enc, clamped at zero). Decrements `recent_combat_secs`.
+    /// Also decays Grappled / Prone timers and removes the components
+    /// when they expire.
     pub fn tick_combat_states(&mut self, secs: u32) {
         if secs == 0 {
             return;
         }
-        // Regen first.
-        for (_, s) in self.ecs.query::<&mut Stamina>().iter() {
-            let regen = 2 * secs as i16;
+        // Per-entity encumbrance for regen modulation. Snapshot first
+        // because the regen query borrows Stamina mutably and the
+        // encumbrance lookup would re-borrow the ECS.
+        let enc_by_entity: Vec<(Entity, i16)> = self
+            .ecs
+            .query::<&Worn>()
+            .iter()
+            .map(|(e, w)| (e, w.upper_body_encumbrance()))
+            .collect();
+        for (e, s) in self.ecs.query::<&mut Stamina>().iter() {
+            let in_combat = s.recent_combat_secs > 0;
+            let base = if in_combat { 1 } else { 2 };
+            let enc = enc_by_entity
+                .iter()
+                .find(|(eid, _)| *eid == e)
+                .map(|(_, v)| *v)
+                .unwrap_or(0);
+            let enc_penalty = enc / 8;
+            let per_sec = (base - enc_penalty).max(0);
+            let regen = per_sec * secs as i16;
             s.cur = (s.cur + regen).min(s.max);
+            s.recent_combat_secs = s.recent_combat_secs.saturating_sub(secs as u16);
         }
         // Grappled timers.
         let expired_grapples: Vec<Entity> = self
@@ -3790,6 +4128,19 @@ impl World {
             .get::<&Stamina>(self.player)
             .map(|s| (s.cur, s.max))
             .unwrap_or((0, 0))
+    }
+
+    /// Full Stamina snapshot for the save round-trip.
+    pub fn player_stamina_full(&self) -> Option<Stamina> {
+        self.ecs.get::<&Stamina>(self.player).ok().map(|s| *s)
+    }
+
+    /// Replace the player's Stamina component wholesale. Used by save
+    /// load to restore the in-combat cooldown alongside cur/max.
+    pub fn set_player_stamina(&mut self, stam: Stamina) {
+        if let Ok(mut s) = self.ecs.get::<&mut Stamina>(self.player) {
+            *s = stam;
+        }
     }
 
     /// True if the player has enough stamina to attempt a heavy action.
@@ -4510,6 +4861,118 @@ mod tests {
         assert_eq!(world.tile_at(CHUNK_W as i64, 5), TerrainKind::Wall);
         assert_eq!(world.tile_at(5, -1), TerrainKind::Wall);
         assert_eq!(world.tile_at(5, CHUNK_H as i64), TerrainKind::Wall);
+    }
+
+    /// Clear a `(2*radius+1)`-square of cells around (cx, cy) to
+    /// `BareDirt` so neighbor-aware tests don't pick up procgen
+    /// content (the origin chunk is Exeter — walls everywhere).
+    fn clear_test_patch(world: &mut World, cx: i64, cy: i64, radius: i64) {
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                world.set_terrain_at(cx + dx, cy + dy, TerrainKind::BareDirt);
+            }
+        }
+    }
+
+    #[test]
+    fn wall_connector_glyph_thick_plus_shape() {
+        // Stamp a +-shape of StoneWall centered at (10, 10) inside the
+        // loaded origin chunk. The center cell has wall neighbors on
+        // all four sides → cross. The four arm-ends have exactly one
+        // wall neighbor (back toward center) → stubs.
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        clear_test_patch(&mut world, 10, 10, 3);
+        for (x, y) in [(10, 10), (10, 9), (10, 11), (9, 10), (11, 10)] {
+            world.set_terrain_at(x, y, TerrainKind::StoneWall);
+        }
+        // Center: all four neighbors are walls → ╬
+        assert_eq!(
+            wall_connector_glyph(&world, 10, 10, TerrainKind::StoneWall),
+            0xCE
+        );
+        // North arm-end (10, 9): only south neighbor (10, 10) is wall → vertical stub ║
+        assert_eq!(
+            wall_connector_glyph(&world, 10, 9, TerrainKind::StoneWall),
+            0xBA
+        );
+        // East arm-end (11, 10): only west neighbor is wall → horizontal stub ═
+        assert_eq!(
+            wall_connector_glyph(&world, 11, 10, TerrainKind::StoneWall),
+            0xCD
+        );
+    }
+
+    #[test]
+    fn wall_connector_glyph_thick_corners() {
+        // L-shape: vertical run + horizontal run meet at (10, 10).
+        // The meeting cell has neighbors south + east → ╔.
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        clear_test_patch(&mut world, 11, 11, 4);
+        for (x, y) in [(10, 10), (10, 11), (10, 12), (11, 10), (12, 10)] {
+            world.set_terrain_at(x, y, TerrainKind::StoneWall);
+        }
+        assert_eq!(
+            wall_connector_glyph(&world, 10, 10, TerrainKind::StoneWall),
+            0xC9
+        );
+        // (12, 10): only west neighbor → horizontal stub.
+        assert_eq!(
+            wall_connector_glyph(&world, 12, 10, TerrainKind::StoneWall),
+            0xCD
+        );
+    }
+
+    #[test]
+    fn wall_connector_glyph_thick_isolated_pillar() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        clear_test_patch(&mut world, 15, 15, 2);
+        world.set_terrain_at(15, 15, TerrainKind::StoneWall);
+        // No wall neighbors → vertical pillar.
+        assert_eq!(
+            wall_connector_glyph(&world, 15, 15, TerrainKind::StoneWall),
+            0xBA
+        );
+    }
+
+    #[test]
+    fn wall_connector_glyph_thin_plus_shape() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        clear_test_patch(&mut world, 10, 10, 3);
+        for (x, y) in [(10, 10), (10, 9), (10, 11), (9, 10), (11, 10)] {
+            world.set_terrain_at(x, y, TerrainKind::WoodWall);
+        }
+        // Center: cross ┼
+        assert_eq!(
+            wall_connector_glyph(&world, 10, 10, TerrainKind::WoodWall),
+            0xC5
+        );
+        // West arm-end (9, 10): only east neighbor → horizontal stub ─.
+        assert_eq!(
+            wall_connector_glyph(&world, 9, 10, TerrainKind::WoodWall),
+            0xC4
+        );
+    }
+
+    #[test]
+    fn wall_connector_glyph_mixed_tier_connects() {
+        // A StoneWall cell with a single WoodWall neighbor to its east
+        // still picks from the thick table — but treats the thin
+        // neighbor as a connection, so it stubs east as ═, not as the
+        // isolated ║.
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        clear_test_patch(&mut world, 10, 10, 2);
+        world.set_terrain_at(10, 10, TerrainKind::StoneWall);
+        world.set_terrain_at(11, 10, TerrainKind::WoodWall);
+        assert_eq!(
+            wall_connector_glyph(&world, 10, 10, TerrainKind::StoneWall),
+            0xCD
+        );
+        // The thin cell sees its west neighbor as wall-like and stubs
+        // ─ (using its own thin table).
+        assert_eq!(
+            wall_connector_glyph(&world, 11, 10, TerrainKind::WoodWall),
+            0xC4
+        );
     }
 
     #[test]
@@ -5447,6 +5910,28 @@ mod tests {
     }
 
     #[test]
+    fn rabble_loadout_always_carries_knife_and_no_real_armor() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        for _ in 0..200 {
+            let loadout = roll_rabble_loadout(&mut world.rng);
+            let mh = loadout.main_hand.expect("rabble always carries something");
+            // Knife is universal per the Statute — either main_hand or
+            // off_hand must be the knife.
+            let knife_present = mh == ItemKind::Knife
+                || loadout.off_hand == Some(ItemKind::Knife);
+            assert!(knife_present, "rabble must carry a knife somewhere");
+            // No real armor: head + legs always empty, torso = None or
+            // leather jerkin only (no padded doublet, no mail).
+            assert!(loadout.head.is_none(), "rabble has no head armor");
+            assert!(loadout.legs.is_none(), "rabble has no leg armor");
+            assert!(loadout.torso_outer.is_none(), "rabble has no outer torso");
+            if let Some(t) = loadout.torso {
+                assert_eq!(t, ItemKind::LeatherJerkin, "rabble torso = scrap only");
+            }
+        }
+    }
+
+    #[test]
     fn yeoman_roll_main_hand_always_a_weapon() {
         let mut world = World::new(CHUNK_W, CHUNK_H);
         for _ in 0..200 {
@@ -6111,6 +6596,103 @@ mod tests {
         let beefy = BodyParts::starting_human_with_con(20);
         assert_eq!(beefy.torso.max, BodyParts::TORSO_MAX * 2);
         assert_eq!(beefy.head.max, BodyParts::HEAD_MAX * 2);
+    }
+
+    #[test]
+    fn crossbow_must_be_loaded_to_fire_and_reload_chambers_a_bolt() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Equip crossbow + give bolts.
+        {
+            let mut pack = world.ecs.get::<&mut Pack>(world.player).unwrap();
+            pack.contents.clear();
+            pack.try_add(ItemKind::Crossbow.make_default_instance(1))
+                .unwrap();
+            pack.try_add(ItemKind::CrossbowBolt.make_default_instance(3))
+                .unwrap();
+        }
+        world.equip_from_pack(ItemKind::Crossbow);
+        // Clear LoS lane and spawn a bandit two tiles east.
+        let p = world.player_pos();
+        for dx in 1..=4 {
+            if let Some(c) = world.cell_at_mut((p.x + dx) as i64, p.y as i64) {
+                c.terrain = TerrainKind::Grass;
+                c.decoration = Decoration::None;
+            }
+        }
+        let bandit = spawn_cornish_bandit(
+            &mut world.ecs,
+            Position { x: p.x + 3, y: p.y },
+            YeomanLoadout::default(),
+        );
+        // Fresh-equip → unloaded, shot should bounce.
+        assert!(!world.crossbow_loaded);
+        let bolts_before = world
+            .player_pack()
+            .contents
+            .iter()
+            .find(|i| i.kind == ItemKind::CrossbowBolt)
+            .map(|i| i.count)
+            .unwrap_or(0);
+        world.perform_ranged_attack(world.player, bandit);
+        let bolts_after_blocked = world
+            .player_pack()
+            .contents
+            .iter()
+            .find(|i| i.kind == ItemKind::CrossbowBolt)
+            .map(|i| i.count)
+            .unwrap_or(0);
+        assert_eq!(
+            bolts_after_blocked, bolts_before,
+            "unloaded crossbow must not consume a bolt"
+        );
+        // Reload + verify loaded; a shot then fires + drops the load.
+        assert!(world.perform_crossbow_reload());
+        assert!(world.crossbow_loaded);
+        world.perform_ranged_attack(world.player, bandit);
+        assert!(!world.crossbow_loaded, "shot should spend the load");
+    }
+
+    #[test]
+    fn knife_swing_grants_knife_proficiency_xp_on_hit() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let bandit = drop_test_bandit(&mut world, 1, 0);
+        let before = world.player_skills().proficiencies.knife;
+        // Run several swings; some will miss the hit-roll so check
+        // that at least one of them lifted the knife pool.
+        for _ in 0..20 {
+            world.perform_melee_attack(world.player, bandit, 1);
+        }
+        let after = world.player_skills().proficiencies.knife;
+        let advanced = after.value > before.value || after.daily_xp > before.daily_xp;
+        assert!(advanced, "knife hit should grant Knife proficiency XP");
+    }
+
+    #[test]
+    fn padded_doublet_catch_grants_light_armor_xp() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Dress the player in a padded doublet so a hostile swing
+        // routes damage through the LightArmor layer.
+        let doublet = ArmorPiece {
+            regions: BodyRegionMask::empty()
+                .with(crate::combat::BodyPart::Torso)
+                .with(crate::combat::BodyPart::LArm)
+                .with(crate::combat::BodyPart::RArm),
+            coverage_pct: 100,
+            dr: crate::combat::ArmorDr { bash: 4, cut: 2, stab: 1 },
+            encumbrance: 2,
+            item_kind: Some(crate::items::ItemKind::PaddedDoublet),
+        };
+        let _ = world
+            .ecs
+            .insert_one(world.player, Worn::new(vec![doublet]));
+        let bandit = drop_test_bandit(&mut world, 1, 0);
+        let before = world.player_skills().light_armor;
+        for _ in 0..20 {
+            world.perform_melee_attack(bandit, world.player, 1);
+        }
+        let after = world.player_skills().light_armor;
+        let advanced = after.value > before.value || after.daily_xp > before.daily_xp;
+        assert!(advanced, "doublet catching a hit should grant LightArmor XP");
     }
 
     #[test]

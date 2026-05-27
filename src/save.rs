@@ -71,6 +71,12 @@ pub struct MetaSave {
     pub xp: u64,
     #[serde(default)]
     pub unlocks: Vec<String>,
+    /// Player-chosen tileset + per-terrain glyph overrides. Additive
+    /// (rides schema v2 via `#[serde(default)]` on the field and on
+    /// every inner field) so older meta saves load with an empty
+    /// `RenderSettings` and fall back to the default atlas + glyphs.
+    #[serde(default)]
+    pub render: RenderSettings,
 }
 
 impl MetaSave {
@@ -79,8 +85,29 @@ impl MetaSave {
             header,
             xp: 0,
             unlocks: Vec::new(),
+            render: RenderSettings::default(),
         }
     }
+}
+
+/// In-game-customizable render settings. Empty `atlas_key` means
+/// "fall back to the default atlas" (`atlases::DEFAULT_KEY`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RenderSettings {
+    #[serde(default)]
+    pub atlas_key: String,
+    #[serde(default)]
+    pub terrain_overrides: Vec<TerrainOverride>,
+}
+
+/// One terrain → glyph override. `kind_key` is `TerrainKind::save_key`;
+/// unknown keys are dropped on load (forward-compat).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TerrainOverride {
+    #[serde(default)]
+    pub kind_key: String,
+    #[serde(default)]
+    pub glyph: u8,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -185,6 +212,16 @@ pub struct RunSave {
     // flag clear (no drag in progress).
     #[serde(default)]
     pub player_dragging: bool,
+    // PR A / Stamina card: persisted stamina pool + in-combat
+    // cooldown. Additive — saves without this field load with the
+    // fresh-spawn full pool (100/100, cooldown 0).
+    #[serde(default)]
+    pub player_stamina: Option<StaminaSave>,
+    /// PR A card 4 — whether the player's crossbow currently has a
+    /// bolt chambered. Additive; defaults to false on saves written
+    /// before the field existed (matches a fresh boot).
+    #[serde(default)]
+    pub crossbow_loaded: bool,
 }
 
 /// PR B Attributes save block. Five attribute scores + per-attribute
@@ -203,6 +240,19 @@ pub struct AttributesSave {
     pub spirit: u8,
     #[serde(default)]
     pub attribute_xp: [u32; 5],
+}
+
+/// Stamina pool round-trip per the Stamina card. Carried on the
+/// player save and on each `HostileSave`. Additive — `#[serde(default)]`
+/// means older saves load with a fresh-spawn pool.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct StaminaSave {
+    #[serde(default)]
+    pub cur: i16,
+    #[serde(default)]
+    pub max: i16,
+    #[serde(default)]
+    pub recent_combat_secs: u16,
 }
 
 /// Per-slot equipment round-trip. Each field is a save_key string; an
@@ -305,6 +355,10 @@ pub struct HostileSave {
     /// (forward-compat).
     #[serde(default)]
     pub worn_kinds: Vec<String>,
+    /// PR A / Stamina card: persisted stamina pool. Additive — older
+    /// saves load a fresh-spawn pool.
+    #[serde(default)]
+    pub stamina: Option<StaminaSave>,
 }
 
 /// Backwards-compat seed value matching `world::DEFAULT_SEED`. Used by
@@ -384,6 +438,49 @@ pub struct SkillsSave {
     pub ranged: SkillSave,
     #[serde(default)]
     pub dodge: SkillSave,
+    // PR A card 2 — defensive skills + per-weapon proficiencies. All
+    // additive with serde defaults; older saves load with the pools at
+    // zero (matches a fresh Rabble player).
+    #[serde(default)]
+    pub block: SkillSave,
+    #[serde(default)]
+    pub light_armor: SkillSave,
+    #[serde(default)]
+    pub medium_armor: SkillSave,
+    #[serde(default)]
+    pub heavy_armor: SkillSave,
+    #[serde(default)]
+    pub proficiencies: ProficienciesSave,
+}
+
+/// PR A card 2 — round-trip shape for the 11 per-weapon proficiency
+/// pools. Each field is a `SkillSave` (value + daily_xp); all fields
+/// are `#[serde(default)]` so saves written before this struct existed
+/// load with every pool at zero.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct ProficienciesSave {
+    #[serde(default)]
+    pub knife: SkillSave,
+    #[serde(default)]
+    pub sword: SkillSave,
+    #[serde(default)]
+    pub falchion: SkillSave,
+    #[serde(default)]
+    pub axe: SkillSave,
+    #[serde(default)]
+    pub mace_cudgel: SkillSave,
+    #[serde(default)]
+    pub quarterstaff: SkillSave,
+    #[serde(default)]
+    pub spear_lance: SkillSave,
+    #[serde(default)]
+    pub gisarme_bill: SkillSave,
+    #[serde(default)]
+    pub unarmed: SkillSave,
+    #[serde(default)]
+    pub bow: SkillSave,
+    #[serde(default)]
+    pub crossbow: SkillSave,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -462,6 +559,8 @@ impl RunSave {
             player_attributes: None,
             player_stride: String::new(),
             player_dragging: false,
+            player_stamina: None,
+            crossbow_loaded: false,
         }
     }
 }
@@ -712,6 +811,60 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_meta_render_settings() {
+        let dir = std::env::temp_dir().join(format!("survival-render-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("meta.cbor");
+
+        let mut meta = MetaSave::empty(SaveHeader::fresh(None));
+        meta.render.atlas_key = "aesomatica".to_string();
+        meta.render.terrain_overrides.push(TerrainOverride {
+            kind_key: "cobble_road".to_string(),
+            glyph: 0xCD,
+        });
+        save_atomic(&path, &meta).unwrap();
+
+        let loaded = load_meta(&path).unwrap();
+        assert_eq!(loaded.render.atlas_key, "aesomatica");
+        assert_eq!(loaded.render.terrain_overrides.len(), 1);
+        assert_eq!(loaded.render.terrain_overrides[0].kind_key, "cobble_road");
+        assert_eq!(loaded.render.terrain_overrides[0].glyph, 0xCD);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn legacy_meta_loads_with_default_render_settings() {
+        // Simulate a pre-render-settings meta by serializing only the
+        // fields that existed before. The #[serde(default)] on
+        // `render` must fill in an empty RenderSettings.
+        #[derive(Serialize)]
+        struct LegacyMeta {
+            header: SaveHeader,
+            xp: u64,
+            unlocks: Vec<String>,
+        }
+        let dir =
+            std::env::temp_dir().join(format!("survival-meta-legacy-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy_meta.cbor");
+
+        let legacy = LegacyMeta {
+            header: SaveHeader::fresh(None),
+            xp: 7,
+            unlocks: vec!["a".to_string()],
+        };
+        save_atomic(&path, &legacy).unwrap();
+
+        let loaded = load_meta(&path).unwrap();
+        assert_eq!(loaded.xp, 7);
+        assert!(loaded.render.atlas_key.is_empty());
+        assert!(loaded.render.terrain_overrides.is_empty());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn round_trip_run_with_combat_state() {
         let dir = std::env::temp_dir().join(format!("survival-combat-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
@@ -730,6 +883,7 @@ mod tests {
             body_parts: None,
             off_hand_kind: String::new(),
             worn_kinds: Vec::new(),
+            stamina: None,
         }];
         save_atomic(&path, &run).unwrap();
 
@@ -785,6 +939,8 @@ mod tests {
             player_attributes: None,
             player_stride: String::new(),
             player_dragging: false,
+            player_stamina: None,
+            crossbow_loaded: false,
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
@@ -872,6 +1028,11 @@ mod tests {
                 melee: SkillSave::default(),
                 ranged: SkillSave::default(),
                 dodge: SkillSave::default(),
+                block: SkillSave::default(),
+                light_armor: SkillSave::default(),
+                medium_armor: SkillSave::default(),
+                heavy_armor: SkillSave::default(),
+                proficiencies: ProficienciesSave::default(),
             },
             rng_state: 0xC0FFEE,
             terrain_mutations: vec![TerrainMutationSave {
@@ -891,6 +1052,8 @@ mod tests {
             player_attributes: None,
             player_stride: String::new(),
             player_dragging: false,
+            player_stamina: None,
+            crossbow_loaded: false,
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
@@ -1022,6 +1185,7 @@ mod tests {
             header,
             xp: 0,
             unlocks: Vec::new(),
+            render: RenderSettings::default(),
         };
         save_atomic(&path, &meta).unwrap();
 

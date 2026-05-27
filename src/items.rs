@@ -107,6 +107,25 @@ pub enum ItemKind {
     /// destination converts one log into 3-6 firewood. 200 kg per the
     /// card spec (`Felled tree weight: ~200 kg`).
     Log,
+    // ---- PR A card 5: Rabble melee ----
+    /// One-handed bash weapon — commoner blunt per the Statute of
+    /// Winchester rabble class. Trains Mace/Cudgel proficiency.
+    Cudgel,
+    /// Two-handed wooden pole; pure bash. Commoner training weapon.
+    Quarterstaff,
+    // ---- PR A card 4: ranged + final polearm ----
+    /// Sickle-bladed two-handed polearm — reach-2 cut+stab. The period
+    /// polearm proper per the Weapon-skills card; replaces the older
+    /// halberd/bardiche niche. No tier currently rolls it; available
+    /// via debug `give` and future authored loadouts.
+    Gisarme,
+    /// Mechanical-trigger ranged weapon. Slow draw + a separate Reload
+    /// verb; holds one bolt loaded at a time. Higher damage per shot
+    /// than the bow, with a stab + bash damage profile.
+    Crossbow,
+    /// Stackable crossbow ammo. Consumed per shot; same 70/30 recovery
+    /// shape as `Arrow`.
+    CrossbowBolt,
 }
 
 /// All per-kind metadata in one place. Adding a new `ItemKind` variant is
@@ -207,6 +226,11 @@ const ALL_KINDS: &[ItemKind] = &[
     ItemKind::CoatOfPlates,
     ItemKind::LargeShield,
     ItemKind::Log,
+    ItemKind::Gisarme,
+    ItemKind::Crossbow,
+    ItemKind::CrossbowBolt,
+    ItemKind::Cudgel,
+    ItemKind::Quarterstaff,
 ];
 
 impl ItemKind {
@@ -895,6 +919,97 @@ impl ItemKind {
                 default_weight_g: 200_000,
                 blends_with_terrain: false,
                 weapon: None,
+                armor: None,
+                ranged: None,
+            },
+            // ---- PR A card 4 items ----
+            ItemKind::Gisarme => ItemDef {
+                save_key: "gisarme",
+                name: "gisarme",
+                is_fungible: false,
+                glyph: b'/',
+                color: [180, 165, 130],
+                default_weight_g: 2_600,
+                blends_with_terrain: false,
+                weapon: Some(WeaponProfile {
+                    to_hit: 1,
+                    // Sickle-bladed cut + stab, slow swing.
+                    damage_die: DamageTriplet { bash: 1, cut: 6, stab: 7 },
+                    move_cost: 140,
+                    reach: 2,
+                }),
+                armor: None,
+                ranged: None,
+            },
+            ItemKind::Crossbow => ItemDef {
+                save_key: "crossbow",
+                name: "crossbow",
+                is_fungible: false,
+                glyph: b'}',
+                color: [140, 110, 80],
+                default_weight_g: 3_500,
+                blends_with_terrain: false,
+                weapon: None,
+                armor: None,
+                ranged: Some(RangedProfile {
+                    to_hit: 4,
+                    // Stab + bash — the bolt's impact has heft. Higher
+                    // damage per shot than the bow per the card; firing
+                    // itself is fast (move_cost 90), the slow part is
+                    // the Reload verb the player runs between shots.
+                    damage_die: DamageTriplet { bash: 4, cut: 0, stab: 14 },
+                    move_cost: 90,
+                    max_range: 12,
+                    ammo_kind: "crossbow_bolt",
+                }),
+            },
+            ItemKind::CrossbowBolt => ItemDef {
+                save_key: "crossbow_bolt",
+                name: "crossbow bolt",
+                is_fungible: true,
+                glyph: b'-',
+                color: [170, 140, 100],
+                default_weight_g: 70,
+                blends_with_terrain: false,
+                weapon: None,
+                armor: None,
+                ranged: None,
+            },
+            ItemKind::Cudgel => ItemDef {
+                save_key: "cudgel",
+                name: "cudgel",
+                is_fungible: false,
+                glyph: b'!',
+                color: [140, 100, 60],
+                default_weight_g: 1_400,
+                blends_with_terrain: false,
+                weapon: Some(WeaponProfile {
+                    to_hit: 0,
+                    // Pure bash; a worked stick with a knob on the end.
+                    damage_die: DamageTriplet { bash: 8, cut: 0, stab: 0 },
+                    move_cost: 90,
+                    reach: 1,
+                }),
+                armor: None,
+                ranged: None,
+            },
+            ItemKind::Quarterstaff => ItemDef {
+                save_key: "quarterstaff",
+                name: "quarterstaff",
+                is_fungible: false,
+                glyph: b'|',
+                color: [150, 120, 80],
+                default_weight_g: 2_000,
+                blends_with_terrain: false,
+                weapon: Some(WeaponProfile {
+                    to_hit: 1,
+                    // Two-handed bash; modest reach but still adjacent
+                    // for v1 — the card notes "modest reach (still
+                    // adjacent though)."
+                    damage_die: DamageTriplet { bash: 9, cut: 0, stab: 0 },
+                    move_cost: 110,
+                    reach: 1,
+                }),
                 armor: None,
                 ranged: None,
             },
