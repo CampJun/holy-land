@@ -198,6 +198,29 @@ pub struct RunSave {
     // tier starting equipment (knife in main hand).
     #[serde(default)]
     pub player_equipment: Option<EquipmentSave>,
+    // PR A / Stamina card: persisted stamina pool + in-combat
+    // cooldown. Additive — saves without this field load with the
+    // fresh-spawn full pool (100/100, cooldown 0).
+    #[serde(default)]
+    pub player_stamina: Option<StaminaSave>,
+    /// PR A card 4 — whether the player's crossbow currently has a
+    /// bolt chambered. Additive; defaults to false on saves written
+    /// before the field existed (matches a fresh boot).
+    #[serde(default)]
+    pub crossbow_loaded: bool,
+}
+
+/// Stamina pool round-trip per the Stamina card. Carried on the
+/// player save and on each `HostileSave`. Additive — `#[serde(default)]`
+/// means older saves load with a fresh-spawn pool.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct StaminaSave {
+    #[serde(default)]
+    pub cur: i16,
+    #[serde(default)]
+    pub max: i16,
+    #[serde(default)]
+    pub recent_combat_secs: u16,
 }
 
 /// Per-slot equipment round-trip. Each field is a save_key string; an
@@ -300,6 +323,10 @@ pub struct HostileSave {
     /// (forward-compat).
     #[serde(default)]
     pub worn_kinds: Vec<String>,
+    /// PR A / Stamina card: persisted stamina pool. Additive — older
+    /// saves load a fresh-spawn pool.
+    #[serde(default)]
+    pub stamina: Option<StaminaSave>,
 }
 
 /// Backwards-compat seed value matching `world::DEFAULT_SEED`. Used by
@@ -379,6 +406,49 @@ pub struct SkillsSave {
     pub ranged: SkillSave,
     #[serde(default)]
     pub dodge: SkillSave,
+    // PR A card 2 — defensive skills + per-weapon proficiencies. All
+    // additive with serde defaults; older saves load with the pools at
+    // zero (matches a fresh Rabble player).
+    #[serde(default)]
+    pub block: SkillSave,
+    #[serde(default)]
+    pub light_armor: SkillSave,
+    #[serde(default)]
+    pub medium_armor: SkillSave,
+    #[serde(default)]
+    pub heavy_armor: SkillSave,
+    #[serde(default)]
+    pub proficiencies: ProficienciesSave,
+}
+
+/// PR A card 2 — round-trip shape for the 11 per-weapon proficiency
+/// pools. Each field is a `SkillSave` (value + daily_xp); all fields
+/// are `#[serde(default)]` so saves written before this struct existed
+/// load with every pool at zero.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct ProficienciesSave {
+    #[serde(default)]
+    pub knife: SkillSave,
+    #[serde(default)]
+    pub sword: SkillSave,
+    #[serde(default)]
+    pub falchion: SkillSave,
+    #[serde(default)]
+    pub axe: SkillSave,
+    #[serde(default)]
+    pub mace_cudgel: SkillSave,
+    #[serde(default)]
+    pub quarterstaff: SkillSave,
+    #[serde(default)]
+    pub spear_lance: SkillSave,
+    #[serde(default)]
+    pub gisarme_bill: SkillSave,
+    #[serde(default)]
+    pub unarmed: SkillSave,
+    #[serde(default)]
+    pub bow: SkillSave,
+    #[serde(default)]
+    pub crossbow: SkillSave,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -454,6 +524,8 @@ impl RunSave {
             hostiles: Vec::new(),
             player_body_parts: None,
             player_equipment: None,
+            player_stamina: None,
+            crossbow_loaded: false,
         }
     }
 }
@@ -776,6 +848,7 @@ mod tests {
             body_parts: None,
             off_hand_kind: String::new(),
             worn_kinds: Vec::new(),
+            stamina: None,
         }];
         save_atomic(&path, &run).unwrap();
 
@@ -828,6 +901,8 @@ mod tests {
             hostiles: Vec::new(),
             player_body_parts: None,
             player_equipment: None,
+            player_stamina: None,
+            crossbow_loaded: false,
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
@@ -915,6 +990,11 @@ mod tests {
                 melee: SkillSave::default(),
                 ranged: SkillSave::default(),
                 dodge: SkillSave::default(),
+                block: SkillSave::default(),
+                light_armor: SkillSave::default(),
+                medium_armor: SkillSave::default(),
+                heavy_armor: SkillSave::default(),
+                proficiencies: ProficienciesSave::default(),
             },
             rng_state: 0xC0FFEE,
             terrain_mutations: vec![TerrainMutationSave {
@@ -931,6 +1011,8 @@ mod tests {
             hostiles: Vec::new(),
             player_body_parts: None,
             player_equipment: None,
+            player_stamina: None,
+            crossbow_loaded: false,
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();

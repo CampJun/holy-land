@@ -327,6 +327,47 @@ pub fn weapon_profile_for(kind: ItemKind) -> Option<WeaponProfile> {
     kind.def().weapon
 }
 
+/// PR A card 2 — which weapon-proficiency pool a wielded `ItemKind`
+/// trains. Returns `None` for items the card calls "improvised" (no
+/// proficiency XP from those swings). Used by card 3 to route the
+/// per-prof XP grant; unarmed (no `Wielded` component) maps separately
+/// at the call site since there's no `ItemKind` to dispatch on.
+pub fn proficiency_for(kind: ItemKind) -> Option<crate::skill::Proficiency> {
+    use crate::skill::Proficiency;
+    Some(match kind {
+        ItemKind::Knife => Proficiency::Knife,
+        ItemKind::ShortSword | ItemKind::ArmingSword => Proficiency::Sword,
+        ItemKind::Falchion => Proficiency::Falchion,
+        ItemKind::Axe => Proficiency::Axe,
+        ItemKind::Spear | ItemKind::Lance => Proficiency::SpearLance,
+        ItemKind::Gisarme => Proficiency::GisarmeBill,
+        ItemKind::Bow => Proficiency::Bow,
+        ItemKind::Crossbow => Proficiency::Crossbow,
+        ItemKind::Cudgel => Proficiency::MaceCudgel,
+        ItemKind::Quarterstaff => Proficiency::Quarterstaff,
+        _ => return None,
+    })
+}
+
+/// PR A card 3 — which top-level armor-class skill a worn armor
+/// `ItemKind` trains when its layer catches a hit. Padded/leather =
+/// LightArmor; iron mail and helms = MediumArmor; coat-of-plates +
+/// great helm = HeavyArmor. Returns `None` for shields and any worn
+/// item that doesn't sort into a class.
+pub fn armor_skill_for(kind: ItemKind) -> Option<crate::skill::SkillKind> {
+    use crate::skill::SkillKind;
+    Some(match kind {
+        ItemKind::PaddedDoublet | ItemKind::LeatherJerkin => SkillKind::LightArmor,
+        ItemKind::Hauberk
+        | ItemKind::MailChausses
+        | ItemKind::MailCoif
+        | ItemKind::IronSkullcap
+        | ItemKind::KettleHat => SkillKind::MediumArmor,
+        ItemKind::CoatOfPlates | ItemKind::GreatHelm => SkillKind::HeavyArmor,
+        _ => return None,
+    })
+}
+
 fn roll_die(max: u16, rng: &mut Rng) -> u16 {
     if max == 0 {
         return 0;

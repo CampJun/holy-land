@@ -37,7 +37,7 @@ use needs::Needs;
 use render::{draw_glyph, CELL_SIZE};
 use save::{
     ActionStepSave, ActiveActionSave, CellItemsSave, DecorationMutationSave, MetaSave, NeedsSave,
-    RenderSettings, RunSave, SaveHeader, SkillSave, SkillsSave, TerrainMutationSave,
+    RenderSettings, RunSave, SaveHeader, SkillSave, SkillsSave, StaminaSave, TerrainMutationSave,
     TerrainOverride, TreeSpeciesMutationSave,
 };
 use skill::{Rng, Skill, SkillKind, Skills};
@@ -411,6 +411,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Skills::starting().foraging
             };
             let conv = |s: save::SkillSave| Skill { value: s.value, daily_xp: s.daily_xp };
+            let prof = run.skills.proficiencies;
+            let proficiencies = skill::Proficiencies {
+                knife: conv(prof.knife),
+                sword: conv(prof.sword),
+                falchion: conv(prof.falchion),
+                axe: conv(prof.axe),
+                mace_cudgel: conv(prof.mace_cudgel),
+                quarterstaff: conv(prof.quarterstaff),
+                spear_lance: conv(prof.spear_lance),
+                gisarme_bill: conv(prof.gisarme_bill),
+                unarmed: conv(prof.unarmed),
+                bow: conv(prof.bow),
+                crossbow: conv(prof.crossbow),
+            };
             world.set_player_skills(Skills {
                 fire_making: Skill {
                     value: saved_fm.value,
@@ -420,6 +434,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 melee: conv(run.skills.melee),
                 ranged: conv(run.skills.ranged),
                 dodge: conv(run.skills.dodge),
+                block: conv(run.skills.block),
+                light_armor: conv(run.skills.light_armor),
+                medium_armor: conv(run.skills.medium_armor),
+                heavy_armor: conv(run.skills.heavy_armor),
+                proficiencies,
             });
             // Re-sync combat stats from the loaded URW skill values so
             // the player's in-fight bonuses reflect their long-run
@@ -443,6 +462,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(eq) = run.player_equipment.as_ref() {
             world.set_player_equipment(save_equipment_to_world(eq));
         }
+        if let Some(stam) = run.player_stamina.as_ref() {
+            world.set_player_stamina(world::Stamina {
+                cur: stam.cur,
+                max: stam.max,
+                recent_combat_secs: stam.recent_combat_secs,
+            });
+        }
+        world.crossbow_loaded = run.crossbow_loaded;
         if !run.hostiles.is_empty() {
             // Cornish-bandit literal is the only flavor we restore as
             // of phase 3. Unknown flavors fall through the default in
@@ -476,6 +503,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Some(bp) => save_bp_to_world(bp),
                         None => world::BodyParts::starting_human(),
                     };
+                    let stamina = h.stamina.as_ref().map(|s| world::Stamina {
+                        cur: s.cur,
+                        max: s.max,
+                        recent_combat_secs: s.recent_combat_secs,
+                    });
                     world::HostileSnapshot {
                         pos: world::Position { x: h.x, y: h.y },
                         body,
@@ -483,6 +515,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         off_hand,
                         worn_kinds,
                         flavor: static_flavor(&h.flavor),
+                        stamina,
                     }
                 })
                 .collect();
@@ -1904,26 +1937,30 @@ fn save_game(
     };
     run.explored_cells = world.snapshot_explored();
     let player_skills = world.player_skills();
+    let to_save = |s: Skill| SkillSave { value: s.value, daily_xp: s.daily_xp };
+    let prof = &player_skills.proficiencies;
     run.skills = SkillsSave {
-        fire_making: SkillSave {
-            value: player_skills.fire_making.value,
-            daily_xp: player_skills.fire_making.daily_xp,
-        },
-        foraging: SkillSave {
-            value: player_skills.foraging.value,
-            daily_xp: player_skills.foraging.daily_xp,
-        },
-        melee: SkillSave {
-            value: player_skills.melee.value,
-            daily_xp: player_skills.melee.daily_xp,
-        },
-        ranged: SkillSave {
-            value: player_skills.ranged.value,
-            daily_xp: player_skills.ranged.daily_xp,
-        },
-        dodge: SkillSave {
-            value: player_skills.dodge.value,
-            daily_xp: player_skills.dodge.daily_xp,
+        fire_making: to_save(player_skills.fire_making),
+        foraging: to_save(player_skills.foraging),
+        melee: to_save(player_skills.melee),
+        ranged: to_save(player_skills.ranged),
+        dodge: to_save(player_skills.dodge),
+        block: to_save(player_skills.block),
+        light_armor: to_save(player_skills.light_armor),
+        medium_armor: to_save(player_skills.medium_armor),
+        heavy_armor: to_save(player_skills.heavy_armor),
+        proficiencies: save::ProficienciesSave {
+            knife: to_save(prof.knife),
+            sword: to_save(prof.sword),
+            falchion: to_save(prof.falchion),
+            axe: to_save(prof.axe),
+            mace_cudgel: to_save(prof.mace_cudgel),
+            quarterstaff: to_save(prof.quarterstaff),
+            spear_lance: to_save(prof.spear_lance),
+            gisarme_bill: to_save(prof.gisarme_bill),
+            unarmed: to_save(prof.unarmed),
+            bow: to_save(prof.bow),
+            crossbow: to_save(prof.crossbow),
         },
     };
     run.rng_state = world.rng.state;
@@ -1960,6 +1997,12 @@ fn save_game(
     run.player_body_parts = Some(world_bp_to_save(&player_body));
     let player_eq = world.player_equipment();
     run.player_equipment = Some(world_equipment_to_save(&player_eq));
+    run.player_stamina = world.player_stamina_full().map(|s| StaminaSave {
+        cur: s.cur,
+        max: s.max,
+        recent_combat_secs: s.recent_combat_secs,
+    });
+    run.crossbow_loaded = world.crossbow_loaded;
     // Leave the legacy single-pool field empty; phase 2 + later writes
     // route through body_parts. A v3 player_health field still loads
     // cleanly via serde but is never written.
@@ -1980,6 +2023,11 @@ fn save_game(
             body_parts: Some(world_bp_to_save(&snap.body)),
             off_hand_kind: snap.off_hand.map(|k| k.save_key().to_string()).unwrap_or_default(),
             worn_kinds: snap.worn_kinds.iter().map(|k| k.save_key().to_string()).collect(),
+            stamina: snap.stamina.map(|s| StaminaSave {
+                cur: s.cur,
+                max: s.max,
+                recent_combat_secs: s.recent_combat_secs,
+            }),
         })
         .collect();
     run.active_action = world.active_action.as_ref().map(|active| ActiveActionSave {
@@ -2131,10 +2179,17 @@ fn build_ui_cells(
     let (stam_cur, stam_max) = stamina;
     if stam_max > 0 {
         let stam_pct = stam_cur.max(0) as i32 * 100 / stam_max as i32;
-        let stam_fg = if stam_pct <= 15 {
+        // Green → off-white → yellow → red as the pool depletes, per
+        // the Stamina card. Zero gets the critical-need color so the
+        // depleted state reads at a glance.
+        let stam_fg = if stam_cur <= 0 {
             palette.need_critical_fg
+        } else if stam_pct <= 15 {
+            Color::RGB(220, 80, 80)
         } else if stam_pct <= 35 {
             Color::RGB(230, 200, 90)
+        } else if stam_pct >= 85 {
+            Color::RGB(120, 200, 110)
         } else {
             palette.hud_fg
         };
@@ -3030,32 +3085,79 @@ fn draw_info_skills(
     palette: &Palette,
 ) {
     let skills = world.player_skills();
-    let rows: [(SkillKind, &skill::Skill); 5] = [
-        (SkillKind::FireMaking, skills.get(SkillKind::FireMaking)),
-        (SkillKind::Foraging, skills.get(SkillKind::Foraging)),
-        (SkillKind::Melee, skills.get(SkillKind::Melee)),
-        (SkillKind::Ranged, skills.get(SkillKind::Ranged)),
-        (SkillKind::Dodge, skills.get(SkillKind::Dodge)),
+    // Always-visible top-level rows: survival + combat + defensive.
+    // Proficiency rows are appended below when they've earned any XP
+    // (value > 0 or daily_xp > 0), so a fresh player sees a clean
+    // panel and trained proficiencies surface as you actually use them.
+    let top: &[SkillKind] = &[
+        SkillKind::FireMaking,
+        SkillKind::Foraging,
+        SkillKind::Melee,
+        SkillKind::Ranged,
+        SkillKind::Dodge,
+        SkillKind::Block,
+        SkillKind::LightArmor,
+        SkillKind::MediumArmor,
+        SkillKind::HeavyArmor,
     ];
-
-    for (i, (kind, s)) in rows.into_iter().enumerate() {
-        let row_y = layout.first_row_y() + i as i32;
-        let is_selected = i == selected;
-        let label = kind.display_name();
-        // Single row per skill: value % + daily XP banked toward next
-        // level. Drops the multi-line sub-row pattern so all five fit
-        // in the 22-cell panel without scrolling.
+    let max_rows = (layout.footer_y() - layout.first_row_y()).max(1) as usize;
+    let mut row_idx: usize = 0;
+    for &kind in top {
+        if row_idx >= max_rows {
+            break;
+        }
+        let s = skills.get(kind);
+        let row_y = layout.first_row_y() + row_idx as i32;
+        let is_selected = row_idx == selected;
         let value = format!("{}% (+{}xp)", s.value, s.daily_xp);
         draw_menu_row(
             cells,
             layout,
             row_y,
             is_selected,
-            label,
+            kind.display_name(),
             palette.panel_fg,
             Some((&value, palette.panel_dim_fg)),
             palette,
         );
+        row_idx += 1;
+    }
+    // Per-weapon proficiencies: only render rows the player has trained.
+    let profs: &[skill::Proficiency] = &[
+        skill::Proficiency::Knife,
+        skill::Proficiency::Sword,
+        skill::Proficiency::Falchion,
+        skill::Proficiency::Axe,
+        skill::Proficiency::MaceCudgel,
+        skill::Proficiency::Quarterstaff,
+        skill::Proficiency::SpearLance,
+        skill::Proficiency::GisarmeBill,
+        skill::Proficiency::Unarmed,
+        skill::Proficiency::Bow,
+        skill::Proficiency::Crossbow,
+    ];
+    for &prof in profs {
+        if row_idx >= max_rows {
+            break;
+        }
+        let s = skills.proficiencies.get(prof);
+        if s.value == 0 && s.daily_xp == 0 {
+            continue;
+        }
+        let row_y = layout.first_row_y() + row_idx as i32;
+        let is_selected = row_idx == selected;
+        let value = format!("{}% (+{}xp)", s.value, s.daily_xp);
+        draw_menu_row(
+            cells,
+            layout,
+            row_y,
+            is_selected,
+            prof.display_name(),
+            palette.panel_dim_fg,
+            Some((&value, palette.panel_dim_fg)),
+            palette,
+        );
+        row_idx += 1;
     }
 }
 
