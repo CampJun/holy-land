@@ -435,6 +435,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Skills::starting().foraging
             };
             let conv = |s: save::SkillSave| Skill { value: s.value, daily_xp: s.daily_xp };
+            let prof = run.skills.proficiencies;
+            let proficiencies = skill::Proficiencies {
+                knife: conv(prof.knife),
+                sword: conv(prof.sword),
+                falchion: conv(prof.falchion),
+                axe: conv(prof.axe),
+                mace_cudgel: conv(prof.mace_cudgel),
+                quarterstaff: conv(prof.quarterstaff),
+                spear_lance: conv(prof.spear_lance),
+                gisarme_bill: conv(prof.gisarme_bill),
+                unarmed: conv(prof.unarmed),
+                bow: conv(prof.bow),
+                crossbow: conv(prof.crossbow),
+            };
             world.set_player_skills(Skills {
                 fire_making: Skill {
                     value: saved_fm.value,
@@ -444,6 +458,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 melee: conv(run.skills.melee),
                 ranged: conv(run.skills.ranged),
                 dodge: conv(run.skills.dodge),
+                block: conv(run.skills.block),
+                light_armor: conv(run.skills.light_armor),
+                medium_armor: conv(run.skills.medium_armor),
+                heavy_armor: conv(run.skills.heavy_armor),
+                proficiencies,
             });
             // Re-sync combat stats from the loaded URW skill values so
             // the player's in-fight bonuses reflect their long-run
@@ -1762,26 +1781,30 @@ fn save_game(
     };
     run.explored_cells = world.snapshot_explored();
     let player_skills = world.player_skills();
+    let to_save = |s: Skill| SkillSave { value: s.value, daily_xp: s.daily_xp };
+    let prof = &player_skills.proficiencies;
     run.skills = SkillsSave {
-        fire_making: SkillSave {
-            value: player_skills.fire_making.value,
-            daily_xp: player_skills.fire_making.daily_xp,
-        },
-        foraging: SkillSave {
-            value: player_skills.foraging.value,
-            daily_xp: player_skills.foraging.daily_xp,
-        },
-        melee: SkillSave {
-            value: player_skills.melee.value,
-            daily_xp: player_skills.melee.daily_xp,
-        },
-        ranged: SkillSave {
-            value: player_skills.ranged.value,
-            daily_xp: player_skills.ranged.daily_xp,
-        },
-        dodge: SkillSave {
-            value: player_skills.dodge.value,
-            daily_xp: player_skills.dodge.daily_xp,
+        fire_making: to_save(player_skills.fire_making),
+        foraging: to_save(player_skills.foraging),
+        melee: to_save(player_skills.melee),
+        ranged: to_save(player_skills.ranged),
+        dodge: to_save(player_skills.dodge),
+        block: to_save(player_skills.block),
+        light_armor: to_save(player_skills.light_armor),
+        medium_armor: to_save(player_skills.medium_armor),
+        heavy_armor: to_save(player_skills.heavy_armor),
+        proficiencies: save::ProficienciesSave {
+            knife: to_save(prof.knife),
+            sword: to_save(prof.sword),
+            falchion: to_save(prof.falchion),
+            axe: to_save(prof.axe),
+            mace_cudgel: to_save(prof.mace_cudgel),
+            quarterstaff: to_save(prof.quarterstaff),
+            spear_lance: to_save(prof.spear_lance),
+            gisarme_bill: to_save(prof.gisarme_bill),
+            unarmed: to_save(prof.unarmed),
+            bow: to_save(prof.bow),
+            crossbow: to_save(prof.crossbow),
         },
     };
     run.rng_state = world.rng.state;

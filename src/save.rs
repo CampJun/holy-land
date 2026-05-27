@@ -374,6 +374,49 @@ pub struct SkillsSave {
     pub ranged: SkillSave,
     #[serde(default)]
     pub dodge: SkillSave,
+    // PR A card 2 — defensive skills + per-weapon proficiencies. All
+    // additive with serde defaults; older saves load with the pools at
+    // zero (matches a fresh Rabble player).
+    #[serde(default)]
+    pub block: SkillSave,
+    #[serde(default)]
+    pub light_armor: SkillSave,
+    #[serde(default)]
+    pub medium_armor: SkillSave,
+    #[serde(default)]
+    pub heavy_armor: SkillSave,
+    #[serde(default)]
+    pub proficiencies: ProficienciesSave,
+}
+
+/// PR A card 2 — round-trip shape for the 11 per-weapon proficiency
+/// pools. Each field is a `SkillSave` (value + daily_xp); all fields
+/// are `#[serde(default)]` so saves written before this struct existed
+/// load with every pool at zero.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct ProficienciesSave {
+    #[serde(default)]
+    pub knife: SkillSave,
+    #[serde(default)]
+    pub sword: SkillSave,
+    #[serde(default)]
+    pub falchion: SkillSave,
+    #[serde(default)]
+    pub axe: SkillSave,
+    #[serde(default)]
+    pub mace_cudgel: SkillSave,
+    #[serde(default)]
+    pub quarterstaff: SkillSave,
+    #[serde(default)]
+    pub spear_lance: SkillSave,
+    #[serde(default)]
+    pub gisarme_bill: SkillSave,
+    #[serde(default)]
+    pub unarmed: SkillSave,
+    #[serde(default)]
+    pub bow: SkillSave,
+    #[serde(default)]
+    pub crossbow: SkillSave,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -859,6 +902,11 @@ mod tests {
                 melee: SkillSave::default(),
                 ranged: SkillSave::default(),
                 dodge: SkillSave::default(),
+                block: SkillSave::default(),
+                light_armor: SkillSave::default(),
+                medium_armor: SkillSave::default(),
+                heavy_armor: SkillSave::default(),
+                proficiencies: ProficienciesSave::default(),
             },
             rng_state: 0xC0FFEE,
             terrain_mutations: vec![TerrainMutationSave {
