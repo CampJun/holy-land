@@ -673,24 +673,36 @@ pub struct Wielded(pub crate::items::ItemKind);
 pub struct CornishBandit;
 
 /// Stamina pool per the Stamina card. Drained by heavy actions
-/// (grapple verbs, running, future brace / crossbow reload / aimed
-/// swings); normal melee swings are FREE. Regens passively while not
-/// in a heavy action. Out-of-stamina = slower swings + lower hit.
+/// (grapple verbs, reach-2 polearm from full extension, future brace /
+/// crossbow reload / aimed swings); normal melee swings are FREE.
+/// Regens passively, slowed by recent combat and by upper-body
+/// encumbrance. Out-of-stamina = slower swings + lower hit.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Stamina {
     pub cur: i16,
     pub max: i16,
+    /// Seconds since the entity last attacked or was attacked. While
+    /// > 0 the passive regen is halved per the card's "in combat =
+    /// slower" rule. Decremented inside `tick_combat_states`.
+    #[serde(default)]
+    pub recent_combat_secs: u16,
 }
 
 impl Stamina {
     pub fn starting_human() -> Self {
-        Self { cur: 100, max: 100 }
+        Self { cur: 100, max: 100, recent_combat_secs: 0 }
     }
     /// Stamina threshold below which heavy actions are blocked.
     pub const HEAVY_FLOOR: i16 = 15;
     /// Penalty to attacker `to_hit` when current stamina is below the
     /// heavy floor. Modest; full out-of-stamina state lands here.
     pub const LOW_HIT_PENALTY: i16 = 4;
+    /// How long an entity is considered "in combat" after a swing,
+    /// for regen-modulation purposes.
+    pub const COMBAT_COOLDOWN_SECS: u16 = 6;
+    /// Stamina spent by a reach-2 attack at full extension. Adjacent
+    /// reach-2 swings are still free.
+    pub const REACH_EXTENSION_COST: i16 = 10;
 }
 
 /// Target is in a grapple — can't move or attack until the hold
@@ -1235,6 +1247,7 @@ pub struct HostileSnapshot {
     pub off_hand: Option<crate::items::ItemKind>,
     pub worn_kinds: Vec<crate::items::ItemKind>,
     pub flavor: &'static str,
+    pub stamina: Option<Stamina>,
 }
 
 /// Combat skill block carried on every combatant. Slice-1 hardcodes
@@ -2028,6 +2041,7 @@ impl World {
             } else {
                 "unknown"
             };
+            let stamina = self.ecs.get::<&Stamina>(e).ok().map(|s| *s);
             out.push(HostileSnapshot {
                 pos: *pos,
                 body,
@@ -2035,6 +2049,7 @@ impl World {
                 off_hand,
                 worn_kinds,
                 flavor,
+                stamina,
             });
         }
         out
@@ -2079,6 +2094,14 @@ impl World {
             if !snap.worn_kinds.is_empty() {
                 let worn = worn_from_items(&snap.worn_kinds);
                 let _ = self.ecs.insert_one(entity, worn);
+            }
+            // Stamina pool round-trips so save during a fight resumes
+            // with the same exhaustion level. Older saves with no
+            // stamina field keep the spawn-default full pool.
+            if let Some(stam) = snap.stamina {
+                if let Ok(mut s) = self.ecs.get::<&mut Stamina>(entity) {
+                    *s = stam;
+                }
             }
         }
     }
@@ -3043,8 +3066,24 @@ impl World {
                 self.apply_damage_to_part(target, part, dmg);
             }
         }
+        // Reach-2 from full extension is a heavy action per the
+        // Stamina card; adjacent reach-2 swings stay free.
+        if weapon.reach >= 2 && range == 2 {
+            self.spend_stamina(attacker, Stamina::REACH_EXTENSION_COST);
+        }
+        // Mark both sides as "in combat" so passive regen drops to
+        // the slower branch for a few ticks.
+        self.mark_combat(attacker);
+        self.mark_combat(target);
         if attacker_is_player {
-            self.spend_moves(weapon.move_cost);
+            // Out-of-stamina = slower swings. 50% move-cost bump when
+            // the attacker is below the heavy floor.
+            let mc = if self.entity_low_stamina(attacker) {
+                weapon.move_cost + weapon.move_cost / 2
+            } else {
+                weapon.move_cost
+            };
+            self.spend_moves(mc);
         }
         // Skill XP. Attacker always trains Melee; defender trains Dodge
         // only on a near-miss (margin in [-4, -1]) — pure miss + crit
@@ -3158,8 +3197,18 @@ impl World {
                 }
             }
         }
+        // Mark both sides as in-combat for the regen ladder. Normal
+        // ranged shots don't spend stamina per the card; only aimed
+        // shots (future submenu) and crossbow reloads will.
+        self.mark_combat(attacker);
+        self.mark_combat(target);
         if attacker_is_player {
-            self.spend_moves(ranged.move_cost);
+            let mc = if self.entity_low_stamina(attacker) {
+                ranged.move_cost + ranged.move_cost / 2
+            } else {
+                ranged.move_cost
+            };
+            self.spend_moves(mc);
         }
         // Skill XP. Bow + arrow swing always trains Ranged; defender
         // trains nothing on a ranged miss — Dodge is a melee construct
@@ -3401,25 +3450,73 @@ impl World {
     }
 
     /// Spend `cost` stamina on an entity. No-op if no Stamina component.
-    /// Used by heavy actions (Grapple/Throw/Disarm and later brace,
-    /// reload, aimed shots).
+    /// Used by heavy actions (Grapple/Throw/Disarm, reach-2 extension,
+    /// and later brace / reload / aimed shots).
     pub fn spend_stamina(&mut self, e: Entity, cost: i16) {
         if let Ok(mut s) = self.ecs.get::<&mut Stamina>(e) {
             s.cur = (s.cur - cost).max(0);
         }
     }
 
-    /// Tick every Stamina component by `secs` of regen (passive +2/sec
-    /// while not in a heavy action). Also decays Grappled / Prone
-    /// timers and removes the components when they expire.
+    /// Refill the player's stamina to full and clear the in-combat
+    /// cooldown. Called by the Sleep verb's completion handler.
+    pub fn restore_player_stamina_full(&mut self) {
+        if let Ok(mut s) = self.ecs.get::<&mut Stamina>(self.player) {
+            s.cur = s.max;
+            s.recent_combat_secs = 0;
+        }
+    }
+
+    /// Mark an entity as having just attacked or been attacked. Pins
+    /// stamina regen to the slower "in combat" branch for the next
+    /// `Stamina::COMBAT_COOLDOWN_SECS` seconds.
+    pub fn mark_combat(&mut self, e: Entity) {
+        if let Ok(mut s) = self.ecs.get::<&mut Stamina>(e) {
+            s.recent_combat_secs = Stamina::COMBAT_COOLDOWN_SECS;
+        }
+    }
+
+    /// True iff the entity has Stamina and its current pool sits below
+    /// the heavy floor. Used to bump move-cost on swings.
+    fn entity_low_stamina(&self, e: Entity) -> bool {
+        self.ecs
+            .get::<&Stamina>(e)
+            .map(|s| s.cur < Stamina::HEAVY_FLOOR)
+            .unwrap_or(false)
+    }
+
+    /// Tick every Stamina component by `secs` of regen per the card's
+    /// ladder: +2/sec when resting, +1/sec while in combat (recent
+    /// swing), further reduced by upper-body encumbrance (-1/sec per
+    /// 8 enc, clamped at zero). Decrements `recent_combat_secs`.
+    /// Also decays Grappled / Prone timers and removes the components
+    /// when they expire.
     pub fn tick_combat_states(&mut self, secs: u32) {
         if secs == 0 {
             return;
         }
-        // Regen first.
-        for (_, s) in self.ecs.query::<&mut Stamina>().iter() {
-            let regen = 2 * secs as i16;
+        // Per-entity encumbrance for regen modulation. Snapshot first
+        // because the regen query borrows Stamina mutably and the
+        // encumbrance lookup would re-borrow the ECS.
+        let enc_by_entity: Vec<(Entity, i16)> = self
+            .ecs
+            .query::<&Worn>()
+            .iter()
+            .map(|(e, w)| (e, w.upper_body_encumbrance()))
+            .collect();
+        for (e, s) in self.ecs.query::<&mut Stamina>().iter() {
+            let in_combat = s.recent_combat_secs > 0;
+            let base = if in_combat { 1 } else { 2 };
+            let enc = enc_by_entity
+                .iter()
+                .find(|(eid, _)| *eid == e)
+                .map(|(_, v)| *v)
+                .unwrap_or(0);
+            let enc_penalty = enc / 8;
+            let per_sec = (base - enc_penalty).max(0);
+            let regen = per_sec * secs as i16;
             s.cur = (s.cur + regen).min(s.max);
+            s.recent_combat_secs = s.recent_combat_secs.saturating_sub(secs as u16);
         }
         // Grappled timers.
         let expired_grapples: Vec<Entity> = self
@@ -3455,6 +3552,19 @@ impl World {
             .get::<&Stamina>(self.player)
             .map(|s| (s.cur, s.max))
             .unwrap_or((0, 0))
+    }
+
+    /// Full Stamina snapshot for the save round-trip.
+    pub fn player_stamina_full(&self) -> Option<Stamina> {
+        self.ecs.get::<&Stamina>(self.player).ok().map(|s| *s)
+    }
+
+    /// Replace the player's Stamina component wholesale. Used by save
+    /// load to restore the in-combat cooldown alongside cur/max.
+    pub fn set_player_stamina(&mut self, stam: Stamina) {
+        if let Ok(mut s) = self.ecs.get::<&mut Stamina>(self.player) {
+            *s = stam;
+        }
     }
 
     /// True if the player has enough stamina to attempt a heavy action.

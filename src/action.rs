@@ -1041,12 +1041,14 @@ pub fn complete_step(world: &mut World, id: ActionId) -> Option<String> {
             place_pitched_from_pack(world, ItemKind::Bedroll, 2_000, "bedroll unrolled")
         }
         ActionId::Sleep => {
-            // Sleeping through to dawn (or 8h) restores Sleep to max.
-            // Other needs ticked normally during the queue's
-            // advance_time_raw — those drops are real.
+            // Sleeping through to dawn (or 8h) restores Sleep to max
+            // and refills stamina (per the Stamina card). Other needs
+            // ticked normally during the queue's advance_time_raw —
+            // those drops are real.
             let mut needs = world.player_needs();
             needs.restore(NeedKind::Sleep, crate::needs::NEED_MAX);
             world.set_player_needs(needs);
+            world.restore_player_stamina_full();
             Some("woke rested".to_string())
         }
         ActionId::PlacePan => complete_place_pan(world),

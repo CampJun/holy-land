@@ -34,7 +34,8 @@ use needs::Needs;
 use render::{draw_glyph, load_atlas, CELL_SIZE};
 use save::{
     ActionStepSave, ActiveActionSave, CellItemsSave, DecorationMutationSave, MetaSave, NeedsSave,
-    RunSave, SaveHeader, SkillSave, SkillsSave, TerrainMutationSave, TreeSpeciesMutationSave,
+    RunSave, SaveHeader, SkillSave, SkillsSave, StaminaSave, TerrainMutationSave,
+    TreeSpeciesMutationSave,
 };
 use skill::{Rng, Skill, SkillKind, Skills};
 use world::{
@@ -466,6 +467,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(eq) = run.player_equipment.as_ref() {
             world.set_player_equipment(save_equipment_to_world(eq));
         }
+        if let Some(stam) = run.player_stamina.as_ref() {
+            world.set_player_stamina(world::Stamina {
+                cur: stam.cur,
+                max: stam.max,
+                recent_combat_secs: stam.recent_combat_secs,
+            });
+        }
         if !run.hostiles.is_empty() {
             // Cornish-bandit literal is the only flavor we restore as
             // of phase 3. Unknown flavors fall through the default in
@@ -499,6 +507,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Some(bp) => save_bp_to_world(bp),
                         None => world::BodyParts::starting_human(),
                     };
+                    let stamina = h.stamina.as_ref().map(|s| world::Stamina {
+                        cur: s.cur,
+                        max: s.max,
+                        recent_combat_secs: s.recent_combat_secs,
+                    });
                     world::HostileSnapshot {
                         pos: world::Position { x: h.x, y: h.y },
                         body,
@@ -506,6 +519,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         off_hand,
                         worn_kinds,
                         flavor: static_flavor(&h.flavor),
+                        stamina,
                     }
                 })
                 .collect();
@@ -1804,6 +1818,11 @@ fn save_game(
     run.player_body_parts = Some(world_bp_to_save(&player_body));
     let player_eq = world.player_equipment();
     run.player_equipment = Some(world_equipment_to_save(&player_eq));
+    run.player_stamina = world.player_stamina_full().map(|s| StaminaSave {
+        cur: s.cur,
+        max: s.max,
+        recent_combat_secs: s.recent_combat_secs,
+    });
     // Leave the legacy single-pool field empty; phase 2 + later writes
     // route through body_parts. A v3 player_health field still loads
     // cleanly via serde but is never written.
@@ -1824,6 +1843,11 @@ fn save_game(
             body_parts: Some(world_bp_to_save(&snap.body)),
             off_hand_kind: snap.off_hand.map(|k| k.save_key().to_string()).unwrap_or_default(),
             worn_kinds: snap.worn_kinds.iter().map(|k| k.save_key().to_string()).collect(),
+            stamina: snap.stamina.map(|s| StaminaSave {
+                cur: s.cur,
+                max: s.max,
+                recent_combat_secs: s.recent_combat_secs,
+            }),
         })
         .collect();
     run.active_action = world.active_action.as_ref().map(|active| ActiveActionSave {
@@ -1975,10 +1999,17 @@ fn build_ui_cells(
     let (stam_cur, stam_max) = stamina;
     if stam_max > 0 {
         let stam_pct = stam_cur.max(0) as i32 * 100 / stam_max as i32;
-        let stam_fg = if stam_pct <= 15 {
+        // Green → off-white → yellow → red as the pool depletes, per
+        // the Stamina card. Zero gets the critical-need color so the
+        // depleted state reads at a glance.
+        let stam_fg = if stam_cur <= 0 {
             palette.need_critical_fg
+        } else if stam_pct <= 15 {
+            Color::RGB(220, 80, 80)
         } else if stam_pct <= 35 {
             Color::RGB(230, 200, 90)
+        } else if stam_pct >= 85 {
+            Color::RGB(120, 200, 110)
         } else {
             palette.hud_fg
         };
