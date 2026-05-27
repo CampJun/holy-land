@@ -102,6 +102,12 @@ pub enum ItemKind {
     CoatOfPlates,
     /// Large kite/round shield — Knight off-hand.
     LargeShield,
+    // ---- PR A card 5: Rabble melee ----
+    /// One-handed bash weapon — commoner blunt per the Statute of
+    /// Winchester rabble class. Trains Mace/Cudgel proficiency.
+    Cudgel,
+    /// Two-handed wooden pole; pure bash. Commoner training weapon.
+    Quarterstaff,
     // ---- PR A card 4: ranged + final polearm ----
     /// Sickle-bladed two-handed polearm — reach-2 cut+stab. The period
     /// polearm proper per the Weapon-skills card; replaces the older
@@ -217,6 +223,8 @@ const ALL_KINDS: &[ItemKind] = &[
     ItemKind::Gisarme,
     ItemKind::Crossbow,
     ItemKind::CrossbowBolt,
+    ItemKind::Cudgel,
+    ItemKind::Quarterstaff,
 ];
 
 impl ItemKind {
@@ -943,6 +951,44 @@ impl ItemKind {
                 default_weight_g: 70,
                 blends_with_terrain: false,
                 weapon: None,
+                armor: None,
+                ranged: None,
+            },
+            ItemKind::Cudgel => ItemDef {
+                save_key: "cudgel",
+                name: "cudgel",
+                is_fungible: false,
+                glyph: b'!',
+                color: [140, 100, 60],
+                default_weight_g: 1_400,
+                blends_with_terrain: false,
+                weapon: Some(WeaponProfile {
+                    to_hit: 0,
+                    // Pure bash; a worked stick with a knob on the end.
+                    damage_die: DamageTriplet { bash: 8, cut: 0, stab: 0 },
+                    move_cost: 90,
+                    reach: 1,
+                }),
+                armor: None,
+                ranged: None,
+            },
+            ItemKind::Quarterstaff => ItemDef {
+                save_key: "quarterstaff",
+                name: "quarterstaff",
+                is_fungible: false,
+                glyph: b'|',
+                color: [150, 120, 80],
+                default_weight_g: 2_000,
+                blends_with_terrain: false,
+                weapon: Some(WeaponProfile {
+                    to_hit: 1,
+                    // Two-handed bash; modest reach but still adjacent
+                    // for v1 — the card notes "modest reach (still
+                    // adjacent though)."
+                    damage_die: DamageTriplet { bash: 9, cut: 0, stab: 0 },
+                    move_cost: 110,
+                    reach: 1,
+                }),
                 armor: None,
                 ranged: None,
             },

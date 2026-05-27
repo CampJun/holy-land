@@ -876,6 +876,7 @@ impl YeomanLoadout {
 /// Loadout tier per `Status armament tiers.md`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BanditTier {
+    Rabble,
     Yeoman,
     Sergeant,
     Knight,
@@ -884,6 +885,7 @@ pub enum BanditTier {
 impl BanditTier {
     pub fn save_key(self) -> &'static str {
         match self {
+            BanditTier::Rabble => "rabble",
             BanditTier::Yeoman => "yeoman",
             BanditTier::Sergeant => "sergeant",
             BanditTier::Knight => "knight",
@@ -932,6 +934,41 @@ pub fn roll_yeoman_loadout(rng: &mut Rng) -> YeomanLoadout {
         main_hand,
         off_hand,
         head,
+        torso,
+        torso_outer: None,
+        legs: None,
+    }
+}
+
+/// Rabble tier — bandits, vagrants, broken men. Per the Status
+/// armament tiers card: knife always; plus one of cudgel / quarterstaff
+/// / gisarme / stone / nothing-improvised. No real armor — sometimes a
+/// leather jerkin scrap; shield uncommon.
+pub fn roll_rabble_loadout(rng: &mut Rng) -> YeomanLoadout {
+    use crate::items::ItemKind;
+    // Main hand draws from the rabble pool.
+    let main_hand = match rng.d100() {
+        1..=30 => Some(ItemKind::Cudgel),
+        31..=55 => Some(ItemKind::Quarterstaff),
+        56..=70 => Some(ItemKind::Gisarme),
+        71..=85 => Some(ItemKind::Stone),
+        _ => Some(ItemKind::Knife),
+    };
+    // Knife is universal per the Statute, in the off-hand if the main
+    // hand is something else; "nothing" otherwise (card: "shield typically").
+    let off_hand = match main_hand {
+        Some(ItemKind::Knife) => None,
+        _ => Some(ItemKind::Knife),
+    };
+    // No real armor — maybe a leather jerkin scrap.
+    let torso = match rng.d100() {
+        1..=25 => Some(ItemKind::LeatherJerkin),
+        _ => None,
+    };
+    YeomanLoadout {
+        main_hand,
+        off_hand,
+        head: None,
         torso,
         torso_outer: None,
         legs: None,
@@ -1029,11 +1066,13 @@ pub fn spawn_humanoid_bandit(
         .unwrap_or(crate::items::ItemKind::Spear);
     let worn_kinds: Vec<_> = loadout.worn_kinds().collect();
     let (glyph, fg) = match tier {
+        BanditTier::Rabble => (b'r', [170, 110, 90, 255]),
         BanditTier::Yeoman => (b'b', [210, 80, 70, 255]),
         BanditTier::Sergeant => (b's', [220, 150, 70, 255]),
         BanditTier::Knight => (b'K', [220, 220, 240, 255]),
     };
     let skills = match tier {
+        BanditTier::Rabble => CombatSkills::starting_rabble(),
         BanditTier::Yeoman => CombatSkills::starting_bandit(),
         BanditTier::Sergeant => CombatSkills::starting_sergeant(),
         BanditTier::Knight => CombatSkills::starting_knight(),
@@ -1289,6 +1328,19 @@ impl CombatSkills {
             dodge: 5,
             weapon_prof: 1,
             str_bonus: 1,
+            agi_mod: 0,
+            encumbrance: 0,
+        }
+    }
+
+    /// Rabble-tier — broken men, vagrants, peasants in revolt. Worse
+    /// than the Yeoman common bandit at melee + dodge; no real training.
+    pub fn starting_rabble() -> Self {
+        Self {
+            melee: 3,
+            dodge: 3,
+            weapon_prof: 0,
+            str_bonus: 0,
             agi_mod: 0,
             encumbrance: 0,
         }
@@ -5326,6 +5378,28 @@ mod tests {
         ]);
         assert_eq!(worn.upper_body_encumbrance(), 3);
         assert_eq!(worn.leg_encumbrance(), 0);
+    }
+
+    #[test]
+    fn rabble_loadout_always_carries_knife_and_no_real_armor() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        for _ in 0..200 {
+            let loadout = roll_rabble_loadout(&mut world.rng);
+            let mh = loadout.main_hand.expect("rabble always carries something");
+            // Knife is universal per the Statute — either main_hand or
+            // off_hand must be the knife.
+            let knife_present = mh == ItemKind::Knife
+                || loadout.off_hand == Some(ItemKind::Knife);
+            assert!(knife_present, "rabble must carry a knife somewhere");
+            // No real armor: head + legs always empty, torso = None or
+            // leather jerkin only (no padded doublet, no mail).
+            assert!(loadout.head.is_none(), "rabble has no head armor");
+            assert!(loadout.legs.is_none(), "rabble has no leg armor");
+            assert!(loadout.torso_outer.is_none(), "rabble has no outer torso");
+            if let Some(t) = loadout.torso {
+                assert_eq!(t, ItemKind::LeatherJerkin, "rabble torso = scrap only");
+            }
+        }
     }
 
     #[test]

@@ -145,6 +145,7 @@ fn parse_command(raw: &str) -> DebugCommand {
 
         ["spawn", tier] => {
             let t = match *tier {
+                "rabble" | "r" => crate::world::BanditTier::Rabble,
                 "yeoman" | "y" => crate::world::BanditTier::Yeoman,
                 "sergeant" | "s" => crate::world::BanditTier::Sergeant,
                 "knight" | "k" => crate::world::BanditTier::Knight,
@@ -297,6 +298,9 @@ pub fn apply_debug_command(world: &mut World, cmd: DebugCommand) -> Option<Debug
             // Roll the tier's loadout and drop a bandit 3 tiles east of
             // the player so the encounter is immediate.
             let loadout = match tier {
+                crate::world::BanditTier::Rabble => {
+                    crate::world::roll_rabble_loadout(&mut world.rng)
+                }
                 crate::world::BanditTier::Yeoman => {
                     crate::world::roll_yeoman_loadout(&mut world.rng)
                 }
