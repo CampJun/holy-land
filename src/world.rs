@@ -47,13 +47,85 @@ pub const DUSK_HOUR: u64 = 20;
 /// compose by changing the speed input — not by special-casing verbs.
 pub const MOVES_PER_SECOND: u32 = 100;
 
-/// World-primitive action cost for a single tile step. Each verb's costs
-/// live in `action.rs` next to its eval/execute code per STYLE.md §2 —
-/// but movement is not a menu verb (it's a direct dpad mapping), so its
-/// cost lives where `try_move_player` consumes it. 500 moves at the
-/// baseline speed of 100 = 5 game-seconds per tile (preserves slice-1
-/// pacing pre-combat-foundation).
+/// World-primitive action cost for a single tile step at `StrideMode::Creep`.
+/// Each verb's costs live in `action.rs` next to its eval/execute code per
+/// STYLE.md §2 — but movement is not a menu verb (it's a direct dpad
+/// mapping), so its cost lives where `try_move_player` consumes it. 500
+/// moves at the baseline speed of 100 = 5 game-seconds per tile (canonical
+/// 1 cell = 5 ft, ≈0.68 mph creep). `StrideMode::Walk` and `Jog` scale
+/// this through `World::tile_step_cost`.
 pub const MOVE_COST_TILE: u32 = 500;
+
+/// PR B stride card: tile-step pace selector. Cycled via the command menu.
+/// Default = `Creep` (the card's "cautious-roguelike default" preserving
+/// the canonical 5 sec/tile pacing); Walk and Jog are opt-in faster
+/// modes selected via the command menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum StrideMode {
+    #[default]
+    Creep,
+    Walk,
+    Jog,
+}
+
+impl StrideMode {
+    /// Tile-step cost in moves at this stride. Per the
+    /// `Real world scale carry overload and stride modes` card.
+    pub fn tile_cost(self) -> u32 {
+        match self {
+            StrideMode::Creep => MOVE_COST_TILE,
+            StrideMode::Walk => 110,
+            StrideMode::Jog => 50,
+        }
+    }
+
+    /// Stamina drain per tile at this stride. Only Jog burns stamina in
+    /// v1 — Walk's over-free-carry drain is queued for a follow-up.
+    pub fn stamina_per_tile(self) -> i16 {
+        match self {
+            StrideMode::Jog => 2,
+            _ => 0,
+        }
+    }
+
+    /// Cycle order matches the command-menu prompt (Creep → Walk → Jog → Creep).
+    pub fn cycle_next(self) -> Self {
+        match self {
+            StrideMode::Creep => StrideMode::Walk,
+            StrideMode::Walk => StrideMode::Jog,
+            StrideMode::Jog => StrideMode::Creep,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            StrideMode::Creep => "Creep",
+            StrideMode::Walk => "Walk",
+            StrideMode::Jog => "Jog",
+        }
+    }
+
+    pub fn save_key(self) -> &'static str {
+        match self {
+            StrideMode::Creep => "creep",
+            StrideMode::Walk => "walk",
+            StrideMode::Jog => "jog",
+        }
+    }
+
+    pub fn from_save_key(s: &str) -> Option<Self> {
+        match s {
+            "creep" => Some(StrideMode::Creep),
+            "walk" => Some(StrideMode::Walk),
+            "jog" => Some(StrideMode::Jog),
+            _ => None,
+        }
+    }
+}
+
+/// Below this stamina threshold the player can't initiate Jog and an
+/// active Jog auto-falls back to Walk. Per the carry/stride card.
+pub const STRIDE_JOG_STAMINA_FLOOR: i16 = 20;
 
 /// Phase-9 multi-turn interrupt threshold. When any need drops below this
 /// during a multi-turn tick, the active action queue cancels and control
@@ -1446,6 +1518,12 @@ pub struct World {
     /// at 0 HP. main.rs reads this each frame for the death overlay
     /// alongside the existing needs-based gate. Cleared on new-run.
     pub player_killed_by_combat: bool,
+    /// Player's tile-step pace selector. Default = `Walk`. Cycled via
+    /// the command-menu `CycleStride` verb. Persists across save load
+    /// through the additive `RunSave.player_stride` field. Hostiles
+    /// don't have a stride — bandit speed is the `Speed` ECS component
+    /// for now.
+    pub player_stride: StrideMode,
 }
 
 /// Outcome of one `tick_fast_travel` call. The main loop matches on
@@ -1596,6 +1674,7 @@ impl World {
             godmode: false,
             message_log: VecDeque::new(),
             player_killed_by_combat: false,
+            player_stride: StrideMode::default(),
         };
         // First-frame FOV so the renderer doesn't draw a black screen on
         // the very first paint.
@@ -1955,7 +2034,7 @@ impl World {
         // target ring, so any in-world cell is now reachable.
         if self.godmode || self.cell_walkable_at(nx as i64, ny as i64) {
             self.set_player_pos(Position { x: nx, y: ny });
-            self.spend_moves(MOVE_COST_TILE);
+            self.spend_player_tile_step();
             self.recompute_fov();
             // After the player moves, any hostile in the chunk gets a
             // turn. Phase 1 wakes hostiles via player-action ticks (no
@@ -1963,6 +2042,49 @@ impl World {
             // proper CDDA speed-based interleaving.
             self.tick_hostiles();
         }
+    }
+
+    /// Pay the player's stride-adjusted tile-step cost: charges
+    /// `stride.tile_cost()` moves, then drains Jog stamina (if any).
+    /// An active Jog auto-falls to Walk once stamina sinks below
+    /// `STRIDE_JOG_STAMINA_FLOOR`. The cycle entrypoint mirrors the
+    /// same gate so the player can't initiate Jog while exhausted.
+    pub fn spend_player_tile_step(&mut self) {
+        if matches!(self.player_stride, StrideMode::Jog) {
+            let stam = self
+                .ecs
+                .get::<&Stamina>(self.player)
+                .map(|s| s.cur)
+                .unwrap_or(i16::MAX);
+            if stam < STRIDE_JOG_STAMINA_FLOOR {
+                self.player_stride = StrideMode::Walk;
+            }
+        }
+        let stride = self.player_stride;
+        self.spend_moves(stride.tile_cost());
+        let drain = stride.stamina_per_tile();
+        if drain > 0 {
+            self.spend_stamina(self.player, drain);
+        }
+    }
+
+    /// Cycle player stride Creep → Walk → Jog → Creep. Skips Jog when
+    /// stamina is below the gate, falling through to Creep on the next
+    /// call. Returns the new stride so callers can log a message.
+    pub fn cycle_player_stride(&mut self) -> StrideMode {
+        let mut next = self.player_stride.cycle_next();
+        if matches!(next, StrideMode::Jog) {
+            let stam = self
+                .ecs
+                .get::<&Stamina>(self.player)
+                .map(|s| s.cur)
+                .unwrap_or(i16::MAX);
+            if stam < STRIDE_JOG_STAMINA_FLOOR {
+                next = StrideMode::Creep;
+            }
+        }
+        self.player_stride = next;
+        next
     }
 
     /// Player's currently-wielded weapon profile, if any. Used by the
@@ -2045,6 +2167,13 @@ impl World {
             }
         } else {
             let _ = self.ecs.insert_one(self.player, attrs);
+        }
+        // STR drives the pack carry ceiling — sync it now so attribute
+        // changes (load, future train-ups) propagate without waiting
+        // for the next pickup. Bandits don't carry packs, so this only
+        // applies to the player.
+        if let Ok(mut pack) = self.ecs.get::<&mut crate::items::Pack>(self.player) {
+            pack.capacity_g = crate::items::derived_pack_cap_g(attrs.str_);
         }
     }
 
@@ -4341,13 +4470,15 @@ mod tests {
         let pos = world.player_pos();
         let east_x = pos.x + 1;
         let east_y = pos.y;
-        // Replace the existing debris with a single 10 kg boulder.
+        // STR-10 momentary-lift cap is ≈113 kg, so a single 200 kg
+        // monolith won't fit in the starting kit's slack regardless of
+        // what else is in the pack.
         if let Some(c) = world.cell_at_mut(east_x as i64, east_y as i64) {
             c.items.clear();
             c.items.push(ItemInstance::stack(
                 ItemKind::Stone,
                 1,
-                10_000,
+                200_000,
                 None,
                 ItemMetadata::None,
             ));
@@ -4355,7 +4486,7 @@ mod tests {
         world.try_move_player(1, 0);
         let before_count = world.player_pack().contents.len();
         let picked = world.try_pickup_all_at_player();
-        assert_eq!(picked, 0, "10kg boulder must not fit in 1.8kg of slack");
+        assert_eq!(picked, 0, "200kg monolith must not fit in the carry ceiling");
         assert_eq!(world.player_pack().contents.len(), before_count);
         let cell = world.cell_at(east_x as i64, east_y as i64).expect("cell");
         assert_eq!(cell.items.len(), 1);
@@ -5583,6 +5714,78 @@ mod tests {
         assert_eq!(got.agi, 12);
         assert_eq!(got.con, 11);
         assert_eq!(got.attribute_xp, [10, 20, 30, 40, 50]);
+    }
+
+    #[test]
+    fn stride_default_is_creep() {
+        let world = World::new(CHUNK_W, CHUNK_H);
+        assert_eq!(world.player_stride, StrideMode::Creep);
+    }
+
+    #[test]
+    fn stride_cycle_walks_creep_walk_jog_back_to_creep() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Top up stamina so the Jog branch isn't gated.
+        if let Ok(mut s) = world.ecs.get::<&mut Stamina>(world.player) {
+            s.cur = s.max;
+        }
+        world.player_stride = StrideMode::Creep;
+        assert_eq!(world.cycle_player_stride(), StrideMode::Walk);
+        assert_eq!(world.cycle_player_stride(), StrideMode::Jog);
+        assert_eq!(world.cycle_player_stride(), StrideMode::Creep);
+    }
+
+    #[test]
+    fn stride_cycle_skips_jog_when_stamina_below_floor() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        if let Ok(mut s) = world.ecs.get::<&mut Stamina>(world.player) {
+            s.cur = STRIDE_JOG_STAMINA_FLOOR - 1;
+        }
+        world.player_stride = StrideMode::Walk;
+        // Walk -> next would be Jog, but stamina gate falls through to Creep.
+        assert_eq!(world.cycle_player_stride(), StrideMode::Creep);
+    }
+
+    #[test]
+    fn spend_player_tile_step_drains_stamina_under_jog() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        if let Ok(mut s) = world.ecs.get::<&mut Stamina>(world.player) {
+            s.cur = s.max;
+        }
+        let before = world
+            .ecs
+            .get::<&Stamina>(world.player)
+            .map(|s| s.cur)
+            .unwrap();
+        world.player_stride = StrideMode::Jog;
+        world.spend_player_tile_step();
+        let after = world
+            .ecs
+            .get::<&Stamina>(world.player)
+            .map(|s| s.cur)
+            .unwrap();
+        assert_eq!(after, before - 2);
+    }
+
+    #[test]
+    fn derived_pack_cap_scales_quadratically_with_str() {
+        // STR 10 → 113 kg (momentary lift); STR 20 → 453.2 kg.
+        assert_eq!(crate::items::derived_pack_cap_g(10), 100 * 1133);
+        assert_eq!(crate::items::derived_pack_cap_g(20), 400 * 1133);
+    }
+
+    #[test]
+    fn set_player_attributes_resyncs_pack_capacity_from_str() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let strong = Attributes {
+            str_: 20,
+            ..Attributes::starting_player()
+        };
+        world.set_player_attributes(strong);
+        assert_eq!(
+            world.player_pack().capacity_g,
+            crate::items::derived_pack_cap_g(20)
+        );
     }
 
     #[test]

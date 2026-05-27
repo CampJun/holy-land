@@ -486,6 +486,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 attribute_xp: a.attribute_xp,
             });
         }
+        if let Some(stride) = world::StrideMode::from_save_key(&run.player_stride) {
+            world.player_stride = stride;
+        }
         if !run.hostiles.is_empty() {
             // Cornish-bandit literal is the only flavor we restore as
             // of phase 3. Unknown flavors fall through the default in
@@ -1833,6 +1836,7 @@ fn save_game(
         spirit: attrs.spirit,
         attribute_xp: attrs.attribute_xp,
     });
+    run.player_stride = world.player_stride.save_key().to_string();
     // Leave the legacy single-pool field empty; phase 2 + later writes
     // route through body_parts. A v3 player_health field still loads
     // cleanly via serde but is never written.
@@ -2265,6 +2269,15 @@ fn draw_here_line(cells: &mut [Option<Cell>], world: &World, palette: &Palette) 
             palette.need_critical_fg,
             palette.hud_bg,
         );
+    }
+    // Stride indicator — flush-right under the godmode badge (or in its
+    // place when godmode is off). Per the carry/stride card: "shows
+    // current mode in the HUD here-line".
+    {
+        let stride_tag = format!("[{}]", world.player_stride.label());
+        let stride_x =
+            WORLD_W as i32 - stride_tag.len() as i32 - 1 - if world.godmode { 6 } else { 0 };
+        put_text(cells, stride_x, row, &stride_tag, palette.hud_fg, palette.hud_bg);
     }
     let pos = world.player_pos();
     let Some(cell) = world.cell_at(pos.x as i64, pos.y as i64) else {

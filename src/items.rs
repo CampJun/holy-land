@@ -1325,9 +1325,26 @@ impl Pack {
     }
 }
 
-/// Slice-1 starting inventory. Total 13.2 kg in a 15 kg pack.
+/// PR B carry-overload card: pack capacity derived from STR.
+///
+/// The card lays out three thresholds per `STR² × Klbs`:
+///   - **free carry** (no stamina cost): `STR² × 0.25 lbs`
+///   - **max walking** (4× free, stamina drain peaks): `STR² × 1.0 lbs`
+///   - **momentary lift** (hard reject): `STR² × 2.5 lbs`
+///
+/// This helper returns the hard-reject ceiling (`STR² × 2.5 lbs ≈ STR²
+/// × 1133 g`) — the only one that participates in `Pack::try_add`. The
+/// soft tiers (free-carry stamina-cost, max-walking exhaustion-per-
+/// tile) are a follow-up after PR A merges its Stamina pool work; they
+/// land in `World::tick_carry_overload`. STR 10 → 113 kg lift cap (the
+/// starting kit's 13.2 kg fits with room).
+pub fn derived_pack_cap_g(str_: u8) -> u32 {
+    (str_ as u32).pow(2) * 1133
+}
+
+/// Slice-1 starting inventory. Total 13.2 kg in a STR-derived pack.
 pub fn starting_pack() -> Pack {
-    let mut p = Pack::empty(15_000);
+    let mut p = Pack::empty(derived_pack_cap_g(10));
     p.contents
         .push(ItemInstance::unique(ItemKind::Axe, 1_000, None, ItemMetadata::None));
     p.contents

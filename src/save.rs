@@ -176,6 +176,10 @@ pub struct RunSave {
     // Older saves load with `Attributes::starting_player()` defaults.
     #[serde(default)]
     pub player_attributes: Option<AttributesSave>,
+    // PR B stride card (additive, no schema bump): `StrideMode` save_key
+    // string ("creep"/"walk"/"jog"). Empty / unknown → `Walk` default.
+    #[serde(default)]
+    pub player_stride: String,
 }
 
 /// PR B Attributes save block. Five attribute scores + per-attribute
@@ -451,6 +455,7 @@ impl RunSave {
             player_body_parts: None,
             player_equipment: None,
             player_attributes: None,
+            player_stride: String::new(),
         }
     }
 }
@@ -772,6 +777,7 @@ mod tests {
             player_body_parts: None,
             player_equipment: None,
             player_attributes: None,
+            player_stride: String::new(),
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
@@ -876,6 +882,7 @@ mod tests {
             player_body_parts: None,
             player_equipment: None,
             player_attributes: None,
+            player_stride: String::new(),
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();

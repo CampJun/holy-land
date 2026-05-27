@@ -97,6 +97,10 @@ pub enum ActionId {
     /// Knock the wielded weapon out of an adjacent hostile's hand.
     /// Str contest; success drops their Wielded onto their cell.
     Disarm,
+    /// PR B stride card: cycle player stride Creep → Walk → Jog → Creep.
+    /// Free (0 moves, doesn't advance the clock). Jog is gated by
+    /// stamina and the cycle falls through to Creep when blocked.
+    CycleStride,
 }
 
 impl ActionId {
@@ -157,6 +161,7 @@ impl ActionId {
             ActionId::Grapple => 200,
             ActionId::Throw => 150,
             ActionId::Disarm => 150,
+            ActionId::CycleStride => 0,
         }
     }
 
@@ -194,6 +199,7 @@ impl ActionId {
             ActionId::Grapple => "grapple",
             ActionId::Throw => "throw",
             ActionId::Disarm => "disarm",
+            ActionId::CycleStride => "cycle_stride",
         }
     }
 
@@ -228,6 +234,7 @@ impl ActionId {
             "grapple" => ActionId::Grapple,
             "throw" => ActionId::Throw,
             "disarm" => ActionId::Disarm,
+            "cycle_stride" => ActionId::CycleStride,
             _ => return None,
         })
     }
@@ -363,6 +370,11 @@ pub const ALL_ACTIONS: &[ContextAction] = &[
         name: "Disarm",
         description: "Strike an adjacent foe's weapon free.",
     },
+    ContextAction {
+        id: ActionId::CycleStride,
+        name: "Stride",
+        description: "Cycle pace: Creep → Walk → Jog. Jog drains stamina.",
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -469,6 +481,7 @@ pub fn evaluate(world: &World, id: ActionId) -> Availability {
         ActionId::Grapple => eval_grapple_or_disarm(world, false),
         ActionId::Disarm => eval_grapple_or_disarm(world, true),
         ActionId::Throw => eval_throw(world),
+        ActionId::CycleStride => Availability::Available { cost_game_seconds: 0 },
     }
 }
 
@@ -753,6 +766,10 @@ pub fn execute(world: &mut World, id: ActionId) -> ExecuteOutcome {
         ActionId::Grapple => execute_grapple(world),
         ActionId::Throw => execute_throw(world),
         ActionId::Disarm => execute_disarm(world),
+        ActionId::CycleStride => {
+            let next = world.cycle_player_stride();
+            ExecuteOutcome::Done(format!("Stride: {}", next.label()))
+        }
     }
 }
 
@@ -2072,14 +2089,15 @@ mod tests {
     #[test]
     fn pickup_unavailable_when_pack_full() {
         let mut world = World::new(CHUNK_W, CHUNK_H);
-        // Replace the east cell with a single 10kg boulder, no room.
+        // STR-10 momentary-lift cap is ≈113 kg, so use a 200 kg monolith
+        // to guarantee the pack rejects it regardless of current slack.
         let pos = world.player_pos();
         if let Some(c) = world.cell_at_mut((pos.x + 1) as i64, pos.y as i64) {
             c.items.clear();
             c.items.push(ItemInstance::stack(
                 ItemKind::Stone,
                 1,
-                10_000,
+                200_000,
                 None,
                 ItemMetadata::None,
             ));
