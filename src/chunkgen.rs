@@ -190,7 +190,22 @@ pub fn generate_chunk(coord: ChunkCoord, world_seed: u64, info: OvermapInfo) -> 
         }
     }
 
-    // Step 8: playability fixup. Strip blocking tiles from the
+    // Step 8: authored-city stamping. Bbox-driven (NOT named_site-
+    // driven), because real cities extend far beyond their tight
+    // biome-override radius — Exeter's wall + Rougemont + Exe Bridge
+    // bbox is ~14×31 chunks while `named_site` reaches only 9×9.
+    // Stamping runs on top of forest procgen so walls read cleanly
+    // through whatever trees the noise placed; spawn-disc enforcement
+    // then guarantees a walkable pocket at the spawn cell — if a city
+    // wall ever passed through the spawn cell it would be reopened,
+    // which is exactly the playability guarantee we want.
+    for loaded in crate::city::cities().values() {
+        if loaded.intersects_chunk(coord) {
+            loaded.stamp_into_chunk(coord, &mut cells, world_seed);
+        }
+    }
+
+    // Step 9: playability fixup. Strip blocking tiles from the
     // central spawn disc so the player always lands on walkable
     // ground regardless of how dense the noise produced this chunk.
     enforce_spawn_disc(&mut cells);
@@ -754,15 +769,25 @@ mod tests {
     }
 
     #[test]
-    fn chunk_zero_zero_has_grass_spawn() {
+    fn chunk_zero_zero_has_walkable_spawn() {
         let chunk = gen(ChunkCoord { cx: 0, cy: 0 }, 0xC0FFEE);
-        // Player spawn cell is (20, 15); must be walkable Grass for
-        // every seed (skeleton skipping that cell).
+        // Player spawn cell is (20, 15). Pre-Exeter the chunkgen
+        // authored skeleton kept this cell as Grass; with Exeter
+        // stamping it now resolves to Cathedral Close (CobbleRoad).
+        // The invariant we still need: walkable.
         let t = chunk.cells[cell_idx(20, 15)].terrain;
-        assert_eq!(t, TerrainKind::Grass, "spawn cell must be walkable");
+        assert!(t.def().walkable, "spawn terrain {t:?} must be walkable");
     }
 
+    /// The legacy chunk-(0,0) authored skeleton (apply_stream /
+    /// apply_pond_and_shore / apply_skeleton_trees) predates Exeter
+    /// stamping it as a city. Most of those features are now
+    /// overwritten by Cathedral + Cathedral Close + walls. The
+    /// skeleton code still runs but its visible impact is residual.
+    /// This test is ignored rather than deleted: the legacy code is
+    /// arguably dead and worth removing in a focused cleanup card.
     #[test]
+    #[ignore = "superseded by Exeter city stamping; legacy skeleton features mostly overwritten"]
     fn chunk_has_stream_and_pond() {
         let chunk = gen(ChunkCoord { cx: 0, cy: 0 }, 0xC0FFEE);
         let stream_count = chunk
@@ -781,13 +806,16 @@ mod tests {
 
     #[test]
     fn chunk_has_trees() {
-        let chunk = gen(ChunkCoord { cx: 0, cy: 0 }, 0xC0FFEE);
+        // Probe a chunk inside Exeter's TownEdge biome footprint
+        // (Chebyshev radius 4) but EAST of the wall polygon
+        // (max x = 118 ⇒ chunks beyond cx=2 are outside the wall).
+        // Chunk (4, 4) sits in TownEdge forest with no city stamping.
+        let chunk = gen(ChunkCoord { cx: 4, cy: 4 }, 0xC0FFEE);
         let tree_count = chunk
             .cells
             .iter()
             .filter(|c| c.terrain == TerrainKind::TreeTrunk)
             .count();
-        // Skeleton 6 + 10..=20 extra = at least 12 trees on any seed.
         assert!(tree_count >= 12, "expected >= 12 trees, got {}", tree_count);
     }
 
@@ -1013,10 +1041,15 @@ mod tests {
         // grass-eligible cells) should fall inside the relaxed
         // [0.20, 0.75] band. The procgen card explicitly allows
         // degenerate seeds to undershoot/overshoot the target.
+        //
+        // Probe chunk (4, 4) — still TownEdge biome (Exeter radius 4)
+        // but outside the wall polygon, so forest gen runs cleanly
+        // without city stamping pulling cells out of the
+        // tree-eligible count.
         let mut total_trees = 0_u32;
         let mut total_eligible = 0_u32;
         for seed_offset in 0..100_u64 {
-            let chunk = gen(ChunkCoord { cx: 0, cy: 0 }, 0xC0FFEE ^ seed_offset);
+            let chunk = gen(ChunkCoord { cx: 4, cy: 4 }, 0xC0FFEE ^ seed_offset);
             for c in chunk.cells.iter() {
                 // Skeleton features (water/sand) shouldn't count as
                 // tree-eligible; only count grass + tree cells.
@@ -1044,11 +1077,13 @@ mod tests {
         // from each major-biome anchor and confirm the union of species
         // covers every TreeSpecies variant. Per-biome species palettes
         // are intentionally narrower than the old global picker.
-        //   - chunk (0, 0) → TownEdge (Oak/Hazel/Ash/Holly)
+        //   - chunk (4, 4) → TownEdge (Oak/Hazel/Ash/Holly).
+        //     Inside Exeter's radius-4 biome but outside the wall
+        //     polygon, so forest gen runs without city stamping.
         //   - Dartmoor centroid chunk → DartmoorGranite (Rowan/Holly)
         //   - BeechCombe anchor chunk → BeechCombe (Beech/Hazel/Holly)
         let probes: &[ChunkCoord] = &[
-            ChunkCoord { cx: 0, cy: 0 },        // TownEdge (Exeter)
+            ChunkCoord { cx: 4, cy: 4 },        // TownEdge (Exeter edge)
             ChunkCoord { cx: -524, cy: 353 },   // DartmoorGranite
             ChunkCoord { cx: 100, cy: 100 },    // BeechCombe (east Devon)
         ];

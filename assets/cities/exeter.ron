@@ -1,0 +1,207 @@
+// Exeter c.1300 — rounded skeleton from deep-research pass keyed off
+// Hooker's 1587 map + NHLE scheduled-monument metadata + Roman gate
+// archaeology. Origin = Exeter Cathedral centroid (NGR SX 92115 92550).
+//
+// COORDINATE CONVENTION
+// 1 cell = 5 ft = 1.524 m. Coordinates are *anchor-relative* world
+// cells; the anchor lives in `cornwall.rs::NAMED_SITES` (Exeter at
+// world (0, 0)). x is east-positive. y is **south-positive** (our
+// screen convention) — the research was authored north-positive so
+// every y here is sign-flipped from the source JSON. North gate has
+// negative y, south gate positive y, etc.
+//
+// FOOTPRINT
+// Wall bbox spans x ∈ [-305, 118], y ∈ [-255, 250]. Rougemont sits
+// ~470 cells north of the cathedral (off the wall's NE corner) and
+// Exe Bridge crosses ~310 cells SW. The city's overall bbox reaches
+// roughly 14×31 chunks — much larger than the 9×9 biome-override
+// radius. City stamping is bbox-driven (see `city.rs::LoadedCity`)
+// so the wall stamps correctly across all those chunks regardless of
+// `named_site` radius.
+//
+// CAVEATS (from research's open-questions section)
+// The wall circuit, Cathedral Close wall-line, castle earthwork,
+// East Gate opening, and Smythen Street line are the least tightly
+// constrained elements. Rougemont's distance from the wall in this
+// data feels ~2x the real ~280 m offset; revisit after playtest.
+//
+// STAMPING STATUS
+// v1: wall polygon + gates stamp into terrain. Streets, cathedral
+// close, cathedral footprint, Rougemont, Guildhall, and the
+// extramural features (bridge / quay / mill leat) are parsed but not
+// yet stamped — they land in the streets+landmarks card.
+
+City(
+    name: "Exeter",
+    wall: Wall(
+        // Irregular ~21-vertex circuit (closed; last vertex omitted —
+        // the stamper closes the loop). Clockwise in our coords
+        // (north is up = negative y).
+        polygon: [
+            (-305,  155),
+            (-270,   70),
+            (-235,   10),
+            (-188,  -70),
+            (-140, -150),
+            ( -70, -220),
+            ( -10, -250),
+            (  35, -245),
+            ( 105, -170),
+            ( 112, -126),
+            ( 118,  -20),
+            (  98,   85),
+            (  62,  150),
+            (  38,  182),
+            (  18,  210),
+            ( -55,  245),
+            (-120,  255),
+            (-200,  235),
+            (-236,  199),
+            (-270,  195),
+        ],
+        gates: [
+            // Widths from recorded gate-passage archaeology
+            // (3.35–3.96 m N gate; ~17 m S gatehouse with foot-passage;
+            // W single-arch). E gate kept at 4 by parity with Hooker.
+            Gate(name: "North Gate", cell: (-188,  -70), width: 3),
+            Gate(name: "East Gate",  cell: ( 112, -126), width: 4),
+            Gate(name: "South Gate", cell: (  38,  182), width: 4),
+            Gate(name: "West Gate",  cell: (-236,  199), width: 3),
+        ],
+    ),
+
+    // Parsed but not yet stamped (task: streets+landmarks card).
+    streets: [
+        Street(name: "High Street",    width: 2, polyline: [
+            (-120,  -25),
+            ( -95,  -66),
+            ( -40,  -78),
+            (  20,  -90),
+            (  70, -108),
+            ( 112, -126),
+        ]),
+        Street(name: "Fore Street",    width: 2, polyline: [
+            (-236,  199),
+            (-210,  160),
+            (-182,  118),
+            (-154,   74),
+            (-135,   35),
+            (-120,  -25),
+        ]),
+        Street(name: "North Street",   width: 2, polyline: [
+            (-120,  -25),
+            (-140,  -45),
+            (-160,  -60),
+            (-176,  -68),
+            (-188,  -70),
+        ]),
+        Street(name: "South Street",   width: 2, polyline: [
+            (-120,  -25),
+            ( -95,   15),
+            ( -60,   70),
+            ( -10,  135),
+            (  38,  182),
+        ]),
+        Street(name: "Smythen Street", width: 1, polyline: [
+            ( -55,  -55),
+            ( -32,  -10),
+            (  -5,   45),
+            (  22,  100),
+            (  50,  160),
+        ]),
+    ],
+
+    landmarks: [
+        // PavedArea: walkable CobbleRoad fill. Cathedral Close sits
+        // BENEATH the Cathedral footprint, which then overwrites it
+        // with StoneWall in the stone-mass pass.
+        Landmark(
+            name: "Cathedral Close",
+            kind: PavedArea,
+            footprint: Polygon([
+                ( -72,  -48),
+                ( -20,  -56),
+                (  32,  -54),
+                (  52,  -36),
+                (  58,   -8),
+                (  46,   34),
+                (  28,   66),
+                (   1,   80),
+                ( -24,   80),
+                ( -50,   55),
+                ( -66,   18),
+            ]),
+        ),
+        // StoneMass: solid StoneWall fill (v1 silhouette — interiors
+        // come with the doors+rooms card).
+        Landmark(
+            name: "Cathedral",
+            kind: StoneMass,
+            footprint: Rect((-42, -12), (42, 12)),
+        ),
+        Landmark(
+            name: "Rougemont Motte",
+            kind: StoneMass,
+            footprint: Polygon([
+                (-145, -470),
+                (-130, -525),
+                ( -88, -548),
+                ( -40, -532),
+                ( -20, -490),
+                ( -38, -448),
+                ( -85, -435),
+                (-130, -448),
+            ]),
+        ),
+        Landmark(
+            name: "Rougemont Keep",
+            kind: StoneMass,
+            footprint: Rect((-95, -506), (-62, -480)),
+        ),
+        Landmark(
+            name: "Guildhall",
+            kind: StoneMass,
+            footprint: Rect((-96, 65), (-94, 67)),
+        ),
+        // Bridge / WaterChannel: parsed for bbox but NOT stamped in v1
+        // — they need river context (cells the bridge sits over should
+        // be deleted water, and the leat should become an actual water
+        // polyline). Landed when the cornwall river pipeline gets
+        // touched.
+        Landmark(
+            name: "Exe Bridge",
+            kind: Bridge,
+            footprint: Polygon([
+                (-245,  205),
+                (-282,  232),
+                (-320,  258),
+                (-360,  285),
+                (-398,  310),
+            ]),
+        ),
+        Landmark(
+            name: "Riverside Quay",
+            kind: PavedArea,
+            footprint: Polygon([
+                (-182,  244),
+                ( -88,  248),
+                ( -60,  268),
+                ( -86,  286),
+                (-158,  290),
+                (-202,  276),
+            ]),
+        ),
+        Landmark(
+            name: "Mill Leat",
+            kind: WaterChannel,
+            footprint: Polygon([
+                (-214,  238),
+                (-150,  228),
+                ( -84,  227),
+                ( -22,  223),
+                (  40,  216),
+                (  72,  210),
+            ]),
+        ),
+    ],
+)

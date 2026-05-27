@@ -1,6 +1,7 @@
 mod action;
 mod calendar;
 mod chunkgen;
+mod city;
 mod combat;
 mod cornwall;
 mod crafting;

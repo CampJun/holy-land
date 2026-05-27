@@ -59,10 +59,14 @@ description, then update `items.rs::ItemDef::def()` or
 | Grass | `0x9C` | Custom grass-tuft sprite (atlas-colored). Sparse-dot logic in main.rs renders blank for ~75% of cells. |
 | BareDirt | `0x2E` | `.` |
 | SandShore | `0x2E` | `.` |
-| TreeTrunk | `0x05` / `0x06` / `0x17` / `0x18` | Four canopy variants picked per cell via `tree_variant_index` hash. `TREE_VARIANT_GLYPHS` in world.rs. |
-| StreamWater | `0x7E` | `~` |
-| PondWater | `0x7E` | `~` |
-| Wall | `0x23` | `#` |
+| TreeTrunk | `0x05` / `0x06` / `0x17` / `0x18` | Four canopy variants picked per cell via `tree_variant_index` hash. `TREE_VARIANT_GLYPHS` in world.rs. DF aligns: 0x05/0x06/0x18/0xE2 are all DF tree glyphs. |
+| StreamWater | `0x7E` | `~` (DF: flowing water) |
+| PondWater | `0x7E` | `~` (DF would use 0xF7 ≈ for standing water — pre-existing divergence). |
+| Wall | `0x23` | `#` — out-of-chunk sentinel only; not the "city wall" tile. DF reserves `#` for floor grates. |
+| StoneWall | `0xB2` | `▓` — DF "partially-dug rock" / unsmoothed stone. City walls, cathedral / castle silhouettes. |
+| WoodWall | `0xB1` | `▒` — denser shade than Floor. No strong DF analog for a single non-directional wood wall. |
+| Floor | `0x2E` | `.` — DF rough floor. Interior placeholder until material variants land. |
+| CobbleRoad | `0xF7` | `≈` — DF "rough-stone road/bridge". Cobbled city streets (High St, Fore St, ...). |
 
 **Unused tree sprites (reserved):** `0xB5`, `0xC6` are dead trees.
 Future `TerrainKind::DeadTree` (chopped stumps / burnt-out groves)
@@ -103,6 +107,93 @@ would use these.
 | HUD: Hunger | `0xE0` | Custom chicken-leg sprite (matches Ration item). |
 | HUD: Sleep | `0xE9` | Custom bed sprite (atlas-colored). |
 | HUD: Warmth | `0x0F` | `☼` |
+
+## Dwarf Fortress reference
+
+DF is the convention other CP437 roguelikes inherit from — picking a
+sprite that matches DF's slot makes the glyph self-explanatory to
+anyone who's played a roguelike before. Use this table when assigning
+a new tile/item/feature; deviate only when our atlas's custom art
+makes the DF pick worse.
+
+Source: [dwarffortresswiki.org/index.php/Tilesets](https://dwarffortresswiki.org/index.php/Tilesets).
+Subset relevant to a Cornwall / 1300-AD setting; full mapping on the
+wiki.
+
+### Terrain / structures
+
+| Byte | Glyph | DF meaning |
+|------|-------|------------|
+| `0x05` `0x06` `0x18` `0xE2` | `♣` `♠` `↑` `Γ` | Trees (broadleaf / conifer / generic) |
+| `0x07` | `•` | Mined-out / rough floor; river source |
+| `0x0A` | `◙` | Tree trunk interior |
+| `0x23` | `#` | Floor grates; smoothed stone variants |
+| `0x2B` | `+` | Smooth / constructed floor; block bridge / road |
+| `0x2E` / `0x2C` / `0x27` | `.` `,` `'` | Rough floor; grasses |
+| `0x3C` / `0x3E` / `0x58` | `<` `>` `X` | Stairs up / down / up-down |
+| `0x5E` | `^` | Trap; volcano |
+| `0x5F` | `_` | Channel designation |
+| `0x7E` | `~` | Flowing water; sand; dirt road; furrowed soil |
+| `0xB0` `0xB1` `0xB2` | `░` `▒` `▓` | Partially-dug rock (rough stone) |
+| `0xBA` | `║` | Smooth/constructed wall (vertical); wooden door |
+| `0xC5` | `┼` | **Door** (primary glyph) |
+| `0xCD` | `═` | Smooth wall (horizontal); planted crops |
+| `0xCE` | `╬` | Smooth wall + **fortifications** (battlements) |
+| `0xDB` | `█` | Ice wall; dig-designated; trade depot |
+| `0xF0` | `≡` | Bars; metal doors; activity zones |
+| `0xF7` | `≈` | Water / magma / snow / sand / farm plot / **rough-stone road** |
+| `0xF8` | `°` | Sea foam; eggs; bowl; mortar |
+| `0xFA` | `·` | Seeds; open space; terrain at lower elevation |
+| `0xFE` | `■` | Blocks; minecarts; map vault |
+
+### Vegetation
+
+| Byte | Glyph | DF meaning |
+|------|-------|------------|
+| `0x05` | `♣` | Quarry bush leaves; blossoms; flowers-on-grass |
+| `0x06` | `♠` | **Plump helmet mushroom**; leaf items |
+| `0xA9` | `⌐` | Withered plants |
+| `0xCD` | `═` | Planted crops (farm tile, growing) |
+| `0xE7` | `τ` | **Sapling**; pig tail; cave wheat; rat weed |
+| `0xE8` | `Φ` | Sweet pod; bloated tuber; kobold bulb (root crops) |
+
+### Furniture / interiors (for later)
+
+| Byte | Glyph | DF meaning |
+|------|-------|------------|
+| `0xD1` | `╤` | Table |
+| `0xD2` | `╥` | Chair; throne |
+| `0xE3` | `π` | Cabinet; display case |
+| `0xE5` | `σ` | Anvil; metalsmith's workshop |
+| `0xE9` | `Θ` | **Bed** |
+| `0xEA` | `Ω` | **Statue** |
+| `0xF6` | `÷` | Barrel; still; ashery |
+
+### Items / loot (selected)
+
+| Byte | Glyph | DF meaning |
+|------|-------|------------|
+| `0x03` | `♥` | Berries; dimple cups |
+| `0x04` | `♦` | Cut gems |
+| `0x0F` | `☼` | Unmined gem cluster; raw glass; masterpiece tag |
+| `0x16` | `▬` | Logs |
+| `0x24` | `$` | Coins |
+| `0x25` | `%` | Prepared meals; fruits; buds |
+| `0x2F` | `/` | Weapons; bolts; pestle |
+| `0xAD` | `¡` | Flask; waterskin; pouch |
+| `0xFE` | `■` | Stone blocks |
+
+### Known conflicts vs. our atlas
+
+- **0x06 ♠** is our `TreeTrunk` variant AND DF's plump-helmet mushroom.
+  If we ever add a mushroom *terrain* tile we'll have to either drop
+  0x06 from `TREE_VARIANT_GLYPHS` or accept the divergence (palette /
+  context disambiguates in practice).
+- **0x9C** is our custom grass-tuft sprite, not the DF £ glyph.
+- **0xE7 τ** is currently our `Herb` item (custom sprite). DF uses
+  0xE7 for saplings — when `Decoration::Sapling` lands a final glyph
+  we should either reuse 0xE7 (and refresh the herb sprite elsewhere)
+  or pick a different sapling byte.
 
 ## Notes from inspection
 

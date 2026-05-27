@@ -182,6 +182,21 @@ pub enum TerrainKind {
     PondWater,
     /// Out-of-chunk default. NOT walkable; blocks sight.
     Wall,
+    /// City wall, cathedral, castle mass. NOT walkable; blocks sight.
+    /// Stamped by `city.rs::stamp_into_chunk` along authored wall
+    /// polygons and landmark footprints.
+    StoneWall,
+    /// House exterior (procgen blocks inside cities). NOT walkable;
+    /// blocks sight. Door state is deferred to v2 — for now these blocks
+    /// are sealed.
+    WoodWall,
+    /// Interior placeholder behind WoodWall/StoneWall. Walkable; no
+    /// sight blocking. Material variants (plank, flagstone, earth) come
+    /// when interiors get fleshed out.
+    Floor,
+    /// Cobbled city street (High St / Fore St / etc.). Walkable; no
+    /// sight blocking. Distinct from BareDirt cart tracks.
+    CobbleRoad,
 }
 
 pub struct TerrainDef {
@@ -243,6 +258,10 @@ const ALL_TERRAINS: &[TerrainKind] = &[
     TerrainKind::StreamWater,
     TerrainKind::PondWater,
     TerrainKind::Wall,
+    TerrainKind::StoneWall,
+    TerrainKind::WoodWall,
+    TerrainKind::Floor,
+    TerrainKind::CobbleRoad,
 ];
 
 impl TerrainKind {
@@ -268,6 +287,7 @@ impl TerrainKind {
                 | TerrainKind::SandShore
                 | TerrainKind::StreamWater
                 | TerrainKind::PondWater
+                | TerrainKind::CobbleRoad
         )
     }
 
@@ -381,6 +401,60 @@ impl TerrainKind {
                 ],
                 walkable: false,
                 blocks_sight: true,
+            },
+            // City wall / cathedral / castle mass. Seasonal-invariant.
+            TerrainKind::StoneWall => TerrainDef {
+                save_key: "stone_wall",
+                name: "stone wall",
+                glyph: 0xB2,
+                palette: [
+                    ([170, 165, 155], [80, 78, 72]),
+                    ([170, 165, 155], [80, 78, 72]),
+                    ([165, 160, 150], [78, 75, 70]),
+                    ([200, 205, 210], [110, 115, 120]),
+                ],
+                walkable: false,
+                blocks_sight: true,
+            },
+            TerrainKind::WoodWall => TerrainDef {
+                save_key: "wood_wall",
+                name: "wood wall",
+                glyph: 0xB1,
+                palette: [
+                    ([135, 95, 55], [55, 38, 22]),
+                    ([135, 95, 55], [55, 38, 22]),
+                    ([125, 85, 48], [50, 34, 20]),
+                    ([180, 170, 165], [90, 80, 75]),
+                ],
+                walkable: false,
+                blocks_sight: true,
+            },
+            TerrainKind::Floor => TerrainDef {
+                save_key: "floor",
+                name: "floor",
+                glyph: b'.',
+                palette: [
+                    ([150, 130, 95], [70, 58, 40]),
+                    ([150, 130, 95], [70, 58, 40]),
+                    ([145, 125, 90], [68, 56, 38]),
+                    ([160, 145, 115], [78, 68, 52]),
+                ],
+                walkable: true,
+                blocks_sight: false,
+            },
+            TerrainKind::CobbleRoad => TerrainDef {
+                save_key: "cobble_road",
+                name: "cobbled street",
+                // 0xF7 ≈ — DF's "rough-stone road/bridge" convention.
+                glyph: 0xF7,
+                palette: [
+                    ([155, 150, 140], [70, 68, 62]),
+                    ([155, 150, 140], [70, 68, 62]),
+                    ([145, 140, 130], [65, 62, 58]),
+                    ([200, 205, 215], [120, 125, 135]),
+                ],
+                walkable: true,
+                blocks_sight: false,
             },
         }
     }
@@ -4127,12 +4201,16 @@ mod tests {
     #[test]
     fn chunk_zero_zero_has_walkable_grass_at_spawn() {
         let world = World::new(CHUNK_W, CHUNK_H);
-        // Spawn cell must be walkable Grass (chunkgen carves around the
-        // skeleton features so the player never starts inside water or
-        // a tree).
+        // Spawn cell must be walkable. Pre-Exeter this was guaranteed
+        // to be `Grass` (chunkgen carved around the authored skeleton
+        // features). With Exeter stamping, the spawn cell now lands on
+        // Cathedral Close (CobbleRoad). The invariant we actually care
+        // about is walkability.
         let spawn = world.tile_at(20, 15);
-        assert_eq!(spawn, TerrainKind::Grass);
-        assert!(spawn.def().walkable);
+        assert!(
+            spawn.def().walkable,
+            "spawn terrain {spawn:?} must be walkable"
+        );
     }
 
     #[test]
