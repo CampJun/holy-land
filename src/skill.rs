@@ -27,6 +27,14 @@ pub const XP_FAILURE: u8 = 1;
 pub enum SkillKind {
     FireMaking,
     Foraging,
+    /// Phase 9 — top-level melee combat skill. Awarded on every player
+    /// swing (hit or miss); level-ups bump `CombatSkills.melee`.
+    Melee,
+    /// Phase 9 — top-level ranged combat skill. Awarded on every shot.
+    Ranged,
+    /// Phase 9 — top-level dodge skill. Awarded on near-misses against
+    /// the player (defender margin in the close-call band).
+    Dodge,
 }
 
 impl SkillKind {
@@ -39,6 +47,9 @@ impl SkillKind {
         match self {
             SkillKind::FireMaking => "fire_making",
             SkillKind::Foraging => "foraging",
+            SkillKind::Melee => "melee",
+            SkillKind::Ranged => "ranged",
+            SkillKind::Dodge => "dodge",
         }
     }
 
@@ -47,6 +58,9 @@ impl SkillKind {
         Some(match s {
             "fire_making" => SkillKind::FireMaking,
             "foraging" => SkillKind::Foraging,
+            "melee" => SkillKind::Melee,
+            "ranged" => SkillKind::Ranged,
+            "dodge" => SkillKind::Dodge,
             _ => return None,
         })
     }
@@ -56,6 +70,9 @@ impl SkillKind {
         match self {
             SkillKind::FireMaking => "Fire Making",
             SkillKind::Foraging => "Foraging",
+            SkillKind::Melee => "Melee",
+            SkillKind::Ranged => "Ranged",
+            SkillKind::Dodge => "Dodge",
         }
     }
 }
@@ -71,6 +88,12 @@ pub struct Skills {
     pub fire_making: Skill,
     #[serde(default)]
     pub foraging: Skill,
+    #[serde(default)]
+    pub melee: Skill,
+    #[serde(default)]
+    pub ranged: Skill,
+    #[serde(default)]
+    pub dodge: Skill,
 }
 
 impl Default for Skills {
@@ -80,9 +103,8 @@ impl Default for Skills {
 }
 
 impl Skills {
-    /// Slice-1 starting values: Fire Making 15 (per master plan).
-    /// Foraging starts at 10 — slightly below Fire Making since the
-    /// player has fewer pre-game opportunities to practice.
+    /// Starting values. Combat skills start at 0 — every kill teaches
+    /// you something, but a Rabble player isn't pre-trained.
     pub fn starting() -> Self {
         Self {
             fire_making: Skill {
@@ -93,6 +115,9 @@ impl Skills {
                 value: 10,
                 daily_xp: 0,
             },
+            melee: Skill::default(),
+            ranged: Skill::default(),
+            dodge: Skill::default(),
         }
     }
 
@@ -100,6 +125,9 @@ impl Skills {
         match kind {
             SkillKind::FireMaking => &self.fire_making,
             SkillKind::Foraging => &self.foraging,
+            SkillKind::Melee => &self.melee,
+            SkillKind::Ranged => &self.ranged,
+            SkillKind::Dodge => &self.dodge,
         }
     }
 
@@ -107,6 +135,9 @@ impl Skills {
         match kind {
             SkillKind::FireMaking => &mut self.fire_making,
             SkillKind::Foraging => &mut self.foraging,
+            SkillKind::Melee => &mut self.melee,
+            SkillKind::Ranged => &mut self.ranged,
+            SkillKind::Dodge => &mut self.dodge,
         }
     }
 
@@ -115,6 +146,9 @@ impl Skills {
     pub fn reset_daily_caps(&mut self) {
         self.fire_making.daily_xp = 0;
         self.foraging.daily_xp = 0;
+        self.melee.daily_xp = 0;
+        self.ranged.daily_xp = 0;
+        self.dodge.daily_xp = 0;
     }
 }
 

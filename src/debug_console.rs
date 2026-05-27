@@ -36,6 +36,10 @@ pub enum DebugCommand {
     /// Toggle godmode: walk through blocked cells (trees, water,
     /// gorse) and freeze needs decay. Transient.
     Godmode,
+    /// Spawn one bandit of the given tier a few tiles east of the
+    /// player. Phase 8 exposes Yeoman / Sergeant / Knight tiers from
+    /// `Status armament tiers.md`.
+    SpawnBandit(crate::world::BanditTier),
     Unknown(String),
 }
 
@@ -138,6 +142,16 @@ fn parse_command(raw: &str) -> DebugCommand {
         },
 
         ["god"] | ["godmode"] => DebugCommand::Godmode,
+
+        ["spawn", tier] => {
+            let t = match *tier {
+                "yeoman" | "y" => crate::world::BanditTier::Yeoman,
+                "sergeant" | "s" => crate::world::BanditTier::Sergeant,
+                "knight" | "k" => crate::world::BanditTier::Knight,
+                _ => return DebugCommand::Unknown(raw.to_string()),
+            };
+            DebugCommand::SpawnBandit(t)
+        }
 
         _ => DebugCommand::Unknown(raw.to_string()),
     }
@@ -278,6 +292,39 @@ pub fn apply_debug_command(world: &mut World, cmd: DebugCommand) -> Option<Debug
             );
             None
         }
+
+        DebugCommand::SpawnBandit(tier) => {
+            // Roll the tier's loadout and drop a bandit 3 tiles east of
+            // the player so the encounter is immediate.
+            let loadout = match tier {
+                crate::world::BanditTier::Yeoman => {
+                    crate::world::roll_yeoman_loadout(&mut world.rng)
+                }
+                crate::world::BanditTier::Sergeant => {
+                    crate::world::roll_sergeant_loadout(&mut world.rng)
+                }
+                crate::world::BanditTier::Knight => {
+                    crate::world::roll_knight_loadout(&mut world.rng)
+                }
+            };
+            let p = world.player_pos();
+            let mut pos = Position { x: p.x + 3, y: p.y };
+            for dx in 3..15 {
+                let c = Position { x: p.x + dx, y: p.y };
+                if world.cell_walkable_at(c.x as i64, c.y as i64) {
+                    pos = c;
+                    break;
+                }
+            }
+            let _ = crate::world::spawn_humanoid_bandit(&mut world.ecs, pos, tier, loadout);
+            crate::log_info!(
+                "[debug] spawned {} bandit at ({}, {})",
+                tier.save_key(),
+                pos.x,
+                pos.y
+            );
+            None
+        }
     }
 }
 
@@ -290,6 +337,7 @@ fn print_help() {
     crate::log_info!("  give KIND N       drop N of KIND into the pack (uses save_key, e.g. firewood, twig)");
     crate::log_info!("  newworld [SEED]   rebuild the world with a fresh seed (decimal or 0xHEX); preserves meta");
     crate::log_info!("  god | godmode     toggle godmode (walk through blockers + needs frozen)");
+    crate::log_info!("  spawn TIER        spawn a yeoman|sergeant|knight bandit east of player");
     crate::log_info!("  help | ? | h      show this");
 }
 
