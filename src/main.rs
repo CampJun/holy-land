@@ -186,9 +186,9 @@ impl InfoTab {
 
 struct InfoMenuState {
     tab: InfoTab,
-    /// Cursor row within the currently-active tab. Reset to 0 when the
+    /// Cursor + scroll within the currently-active tab. Reset when the
     /// tab changes.
-    selected: usize,
+    cursor: MenuCursor,
 }
 
 /// Ranged targeting cursor — modal input state opened by the `Aim`
@@ -604,14 +604,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // loaded) clock so a loaded save mid-day doesn't immediately re-save.
     let mut last_dawn_idx = dawns_elapsed(world.clock_seconds);
 
-    // Tap-Y command menu state. None = closed; Some(i) = open, with row i
-    // selected. Phase 15 adds the hold-Y radial overlay alongside this.
-    let mut command_menu: Option<usize> = None;
+    // Tap-Y command menu state. None = closed; Some(cursor) = open.
+    // Phase 15 adds the hold-Y radial overlay alongside this.
+    let mut command_menu: Option<MenuCursor> = None;
 
     // Start-button pause menu (Save / Quit / Delete-save-and-reset). When
     // open, every other input mode is suspended and multi-turn actions
     // stop ticking. Replaces the previous "Start quits immediately".
-    let mut pause_menu: Option<usize> = None;
+    let mut pause_menu: Option<MenuCursor> = None;
 
     // Select-button info hub: tabbed read-only overlay. L/R cycle
     // between tabs (Inventory, Skills, ... extensible). View-only for
@@ -656,8 +656,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // REMAPPABLE_TERRAINS; `tile_remap_pick` is `Some((terrain_idx, glyph))`
     // while the user is choosing a new glyph for that terrain. All
     // three persist their choices into `meta.render` and back to disk.
-    let mut tileset_picker: Option<usize> = None;
-    let mut tile_remap_list: Option<usize> = None;
+    let mut tileset_picker: Option<MenuCursor> = None;
+    let mut tile_remap_list: Option<MenuCursor> = None;
     let mut tile_remap_pick: Option<(usize, u8)> = None;
 
     // Ranged-targeting cursor. Opened by the `Aim` verb (via
@@ -735,7 +735,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Quick tap with no direction chosen -> open vertical
                 // menu (preserves the existing tap-Y behavior).
                 if command_menu.is_none() && pause_menu.is_none() && dead.is_none() {
-                    command_menu = Some(0);
+                    command_menu = Some(MenuCursor::default());
                 }
             }
             y_press_at = None;
@@ -767,10 +767,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(state) = info_menu.as_ref() {
                 if matches!(state.tab, InfoTab::Inventory) {
                     if let Some(InventoryRow::PackItem(_)) =
-                        inventory_row_at(&world, state.selected)
+                        inventory_row_at(&world, state.cursor.selected)
                     {
                         let slot_count = world::EquipSlot::ALL.len();
-                        let pack_idx = state.selected - slot_count;
+                        let pack_idx = state.cursor.selected - slot_count;
                         x_press_at = Some((frame_start, pack_idx));
                     }
                 }
@@ -879,17 +879,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // command_menu, world) is frozen. Multi-turn actions also
             // stop ticking — see the "if pause_menu.is_none()" guard
             // further down.
-            if let Some(selected) = pause_menu {
+            if let Some(ref mut cursor) = pause_menu {
                 let count = PAUSE_OPTIONS.len();
+                let visible = count;
                 match input_action {
-                    Action::Up => {
-                        pause_menu = Some(wrap_index(selected, -1, count));
-                    }
-                    Action::Down => {
-                        pause_menu = Some(wrap_index(selected, 1, count));
-                    }
+                    Action::Up => cursor.move_by(-1, count, visible),
+                    Action::Down => cursor.move_by(1, count, visible),
                     Action::A => {
-                        let (chosen, _) = PAUSE_OPTIONS[selected];
+                        let (chosen, _) = PAUSE_OPTIONS[cursor.selected];
                         match chosen {
                             PauseAction::Save => {
                                 save_game(
@@ -921,11 +918,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             PauseAction::TilesetPicker => {
                                 pause_menu = None;
-                                tileset_picker = Some(current_atlas_idx);
+                                tileset_picker = Some(MenuCursor {
+                                    selected: current_atlas_idx,
+                                    scroll: 0,
+                                });
                             }
                             PauseAction::TileRemap => {
                                 pause_menu = None;
-                                tile_remap_list = Some(0);
+                                tile_remap_list = Some(MenuCursor::default());
                             }
                         }
                     }
@@ -1066,7 +1066,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Action::Start => {
                         tile_remap_pick = None;
                         tile_remap_list = None;
-                        pause_menu = Some(0);
+                        pause_menu = Some(MenuCursor::default());
                     }
                     _ => {}
                 }
@@ -1076,25 +1076,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Tile-remap terrain list: pick which TerrainKind to edit.
             // A enters the glyph picker; X resets the highlighted
             // terrain back to its default glyph; B closes.
-            if let Some(selected) = tile_remap_list {
+            if let Some(ref mut cursor) = tile_remap_list {
                 let count = REMAPPABLE_TERRAINS.len();
+                let visible = menu_visible_rows(
+                    &PanelLayout::centered(
+                        36,
+                        (REMAPPABLE_TERRAINS.len() as i32 + 6).clamp(8, WORLD_H as i32 - 2),
+                    ),
+                    0,
+                );
                 match input_action {
-                    Action::Up => {
-                        tile_remap_list = Some(selected.saturating_sub(1));
-                    }
-                    Action::Down => {
-                        tile_remap_list = Some((selected + 1).min(count - 1));
-                    }
+                    Action::Up => cursor.move_by(-1, count, visible),
+                    Action::Down => cursor.move_by(1, count, visible),
                     Action::A => {
-                        let kind = REMAPPABLE_TERRAINS[selected];
+                        let kind = REMAPPABLE_TERRAINS[cursor.selected];
                         let start = terrain_overrides
                             .get(&kind)
                             .copied()
                             .unwrap_or(kind.def().glyph);
-                        tile_remap_pick = Some((selected, start));
+                        tile_remap_pick = Some((cursor.selected, start));
                     }
                     Action::X => {
-                        let kind = REMAPPABLE_TERRAINS[selected];
+                        let kind = REMAPPABLE_TERRAINS[cursor.selected];
                         set_terrain_override(&mut meta.render, kind, None);
                         terrain_overrides = build_terrain_overrides(&meta.render);
                         save_meta_only(&save_dir, &mut meta, &mut prev_meta_header);
@@ -1103,7 +1106,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Action::B => tile_remap_list = None,
                     Action::Start => {
                         tile_remap_list = None;
-                        pause_menu = Some(0);
+                        pause_menu = Some(MenuCursor::default());
                     }
                     _ => {}
                 }
@@ -1113,16 +1116,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Tileset picker: pick an atlas from the discovered list.
             // A confirms (hot-swaps the atlas surface and persists);
             // B cancels.
-            if let Some(selected) = tileset_picker {
+            if let Some(ref mut cursor) = tileset_picker {
                 let count = atlas_registry.len();
+                let visible = menu_visible_rows(
+                    &PanelLayout::centered(
+                        32,
+                        (count as i32 + 6).clamp(8, WORLD_H as i32 - 2),
+                    ),
+                    0,
+                );
                 match input_action {
-                    Action::Up => {
-                        tileset_picker = Some(selected.saturating_sub(1));
-                    }
-                    Action::Down => {
-                        tileset_picker = Some((selected + 1).min(count - 1));
-                    }
+                    Action::Up => cursor.move_by(-1, count, visible),
+                    Action::Down => cursor.move_by(1, count, visible),
                     Action::A => {
+                        let selected = cursor.selected;
                         if selected != current_atlas_idx {
                             match atlases::load(&atlas_registry[selected]) {
                                 Ok(surf) => {
@@ -1155,7 +1162,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Action::B => tileset_picker = None,
                     Action::Start => {
                         tileset_picker = None;
-                        pause_menu = Some(0);
+                        pause_menu = Some(MenuCursor::default());
                     }
                     _ => {}
                 }
@@ -1171,7 +1178,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Action::Left => glyph_palette = Some(cursor.wrapping_sub(1)),
                     Action::Right => glyph_palette = Some(cursor.wrapping_add(1)),
                     Action::B => glyph_palette = None,
-                    Action::Start => pause_menu = Some(0),
+                    Action::Start => pause_menu = Some(MenuCursor::default()),
                     _ => {}
                 }
                 continue;
@@ -1183,25 +1190,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // menu in priority.
             if let Some(ref mut state) = info_menu {
                 let row_count = info_tab_row_count(&world, state.tab);
+                let visible = info_tab_visible_rows(state.tab);
                 match input_action {
                     Action::L => {
                         state.tab = state.tab.prev();
-                        state.selected = 0;
+                        state.cursor = MenuCursor::default();
                     }
                     Action::R => {
                         state.tab = state.tab.next();
-                        state.selected = 0;
+                        state.cursor = MenuCursor::default();
                     }
                     Action::Up => {
-                        state.selected = wrap_index(state.selected, -1, row_count);
+                        state.cursor.move_by(-1, row_count, visible);
                     }
                     Action::Down => {
-                        state.selected = wrap_index(state.selected, 1, row_count);
+                        state.cursor.move_by(1, row_count, visible);
                     }
                     Action::A => {
                         match state.tab {
                             InfoTab::Crafting => {
-                                if let Some(recipe) = crafting::RECIPES.get(state.selected) {
+                                if let Some(recipe) = crafting::RECIPES.get(state.cursor.selected) {
                                     match action::evaluate(&world, recipe.action) {
                                         action::Availability::Available { .. } => {
                                             match action::execute(&mut world, recipe.action) {
@@ -1232,7 +1240,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 // category. The world helpers handle
                                 // pack ↔ slot bouncing and the derived
                                 // Wielded / Worn / OffHand sync.
-                                match inventory_row_at(&world, state.selected) {
+                                match inventory_row_at(&world, state.cursor.selected) {
                                     Some(InventoryRow::EquipSlot(slot)) => {
                                         let msg = world.unequip_to_pack(slot);
                                         world.push_message(msg);
@@ -1251,7 +1259,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         info_menu = None;
                     }
                     Action::Start => {
-                        pause_menu = Some(0);
+                        pause_menu = Some(MenuCursor::default());
                     }
                     _ => {}
                 }
@@ -1279,7 +1287,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         log_info!("[action] view mode = {:?}", mode);
                     }
                     Action::Start => {
-                        pause_menu = Some(0);
+                        pause_menu = Some(MenuCursor::default());
                     }
                     _ => {}
                 }
@@ -1289,17 +1297,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Menu mode: dpad navigates, A confirms (if available), B/Y
             // closes. Everything else is dropped so the world doesn't tick
             // while the player is browsing the catalog.
-            if let Some(selected) = command_menu {
+            if let Some(ref mut cursor) = command_menu {
                 let count = action::ALL_ACTIONS.len();
+                let visible = menu_visible_rows(&PanelLayout::anchored(2, 4, 36, 21), 1);
                 match input_action {
-                    Action::Up => {
-                        command_menu = Some(wrap_index(selected, -1, count));
-                    }
-                    Action::Down => {
-                        command_menu = Some(wrap_index(selected, 1, count));
-                    }
+                    Action::Up => cursor.move_by(-1, count, visible),
+                    Action::Down => cursor.move_by(1, count, visible),
                     Action::A => {
-                        let id = action::ALL_ACTIONS[selected].id;
+                        let id = action::ALL_ACTIONS[cursor.selected].id;
                         match action::evaluate(&world, id) {
                             action::Availability::Available { .. } => {
                                 match action::execute(&mut world, id) {
@@ -1317,7 +1322,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 // Stay open so the player can pick another.
                                 log_info!(
                                     "[menu] can't '{}': {}",
-                                    action::ALL_ACTIONS[selected].name,
+                                    action::ALL_ACTIONS[cursor.selected].name,
                                     reason
                                 );
                             }
@@ -1327,7 +1332,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         command_menu = None;
                     }
                     Action::Start => {
-                        pause_menu = Some(0);
+                        pause_menu = Some(MenuCursor::default());
                     }
                     _ => {}
                 }
@@ -1350,12 +1355,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Action::Start => {
-                    pause_menu = Some(0);
+                    pause_menu = Some(MenuCursor::default());
                 }
                 Action::Select => {
                     info_menu = Some(InfoMenuState {
                         tab: InfoTab::Inventory,
-                        selected: 0,
+                        cursor: MenuCursor::default(),
                     });
                 }
                 // PR B Wait card: desktop `.` and the Miyoo B button
@@ -1577,8 +1582,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(active) = world.active_action.as_ref() {
             draw_multi_turn_banner(&mut ui_cells, active, &palette);
         }
-        if let Some(selected) = command_menu {
-            draw_command_menu(&mut ui_cells, &world, selected, &palette);
+        if let Some(ref cursor) = command_menu {
+            draw_command_menu(&mut ui_cells, &world, cursor, &palette);
         }
         if let Some(state) = info_menu.as_ref() {
             draw_info_menu(&mut ui_cells, &world, state, &palette);
@@ -1586,17 +1591,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(cursor) = glyph_palette {
             draw_glyph_palette(&mut ui_cells, cursor, &palette);
         }
-        if let Some(selected) = tileset_picker {
+        if let Some(ref cursor) = tileset_picker {
             draw_tileset_picker(
                 &mut ui_cells,
                 &atlas_registry,
-                selected,
+                cursor,
                 current_atlas_idx,
                 &palette,
             );
         }
-        if let Some(selected) = tile_remap_list {
-            draw_tile_remap_list(&mut ui_cells, &terrain_overrides, selected, &palette);
+        if let Some(ref cursor) = tile_remap_list {
+            draw_tile_remap_list(&mut ui_cells, &terrain_overrides, cursor, &palette);
         }
         if let Some((terrain_idx, cursor)) = tile_remap_pick {
             draw_tile_remap_glyph_picker(
@@ -1615,8 +1620,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(ref mode) = overmap_mode {
             draw_overmap(&mut ui_cells, &world, mode, &palette, overmap_frame_count);
         }
-        if let Some(selected) = pause_menu {
-            draw_pause_menu(&mut ui_cells, selected, &palette);
+        if let Some(ref cursor) = pause_menu {
+            draw_pause_menu(&mut ui_cells, cursor, &palette);
         }
         if let Some(cause) = dead {
             draw_death_screen(&mut ui_cells, cause, &palette);
@@ -2698,6 +2703,171 @@ fn draw_menu_row(
     }
 }
 
+/// Cursor + scroll state shared by every list-style overlay (action
+/// menu, info tabs, pause menu, tileset picker, tile-remap list). The
+/// scroll field keeps the selected row inside the panel body when the
+/// list is taller than what the panel can show; small menus that fit
+/// entirely leave `scroll` at 0.
+#[derive(Default, Clone, Copy)]
+struct MenuCursor {
+    selected: usize,
+    scroll: usize,
+}
+
+impl MenuCursor {
+    /// Move the cursor by `delta` (typically ±1 for Up/Down) with
+    /// wrap-around, then adjust `scroll` so `selected` stays inside the
+    /// viewport `[scroll, scroll + visible)`.
+    fn move_by(&mut self, delta: i32, total: usize, visible: usize) {
+        self.selected = wrap_index(self.selected, delta, total);
+        if total <= visible {
+            self.scroll = 0;
+            return;
+        }
+        let max_scroll = total - visible;
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll + visible {
+            self.scroll = self.selected + 1 - visible;
+        }
+        self.scroll = self.scroll.min(max_scroll);
+    }
+}
+
+/// One row in a scrollable menu. `right` is the optional right-aligned
+/// status (truncated to fit). `prefix_glyph` slots a one-cell preview
+/// between the cursor column and the label — used by the tile-remap
+/// list; `None` for every other menu.
+struct MenuRow<'a> {
+    label: &'a str,
+    label_fg: Color,
+    right: Option<(&'a str, Color)>,
+    prefix_glyph: Option<(u8, Color)>,
+}
+
+impl<'a> MenuRow<'a> {
+    fn new(label: &'a str, label_fg: Color) -> Self {
+        Self {
+            label,
+            label_fg,
+            right: None,
+            prefix_glyph: None,
+        }
+    }
+    fn with_right(mut self, right: &'a str, fg: Color) -> Self {
+        self.right = Some((right, fg));
+        self
+    }
+    fn with_prefix_glyph(mut self, glyph: u8, fg: Color) -> Self {
+        self.prefix_glyph = Some((glyph, fg));
+        self
+    }
+}
+
+/// Visible body rows inside a panel, after reserving `reserved_bottom`
+/// rows above the footer (selected-row descriptions, pack totals, etc).
+/// Floors at 1 so a tiny panel still tries to show the selected row.
+fn menu_visible_rows(layout: &PanelLayout, reserved_bottom: i32) -> usize {
+    (layout.footer_y() - layout.first_row_y() - reserved_bottom).max(1) as usize
+}
+
+/// Draw a scrollable vertical menu. Renders `rows[cursor.scroll ..
+/// cursor.scroll + visible]` and adds `^` / `v` markers on the right
+/// edge when there are rows hidden above / below the viewport. Callers
+/// build `rows` from their domain data; this helper is the only place
+/// that knows about scrolling.
+fn draw_menu_list(
+    cells: &mut [Option<Cell>],
+    layout: &PanelLayout,
+    palette: &Palette,
+    rows: &[MenuRow<'_>],
+    cursor: &MenuCursor,
+    reserved_bottom: i32,
+) {
+    let visible = menu_visible_rows(layout, reserved_bottom);
+    let total = rows.len();
+    for view_idx in 0..visible {
+        let abs_idx = cursor.scroll + view_idx;
+        if abs_idx >= total {
+            break;
+        }
+        let row = &rows[abs_idx];
+        let row_y = layout.first_row_y() + view_idx as i32;
+        let is_selected = abs_idx == cursor.selected;
+
+        // Cursor column.
+        let cur_glyph = if is_selected { b'>' } else { b' ' };
+        put_cell(
+            cells,
+            layout.inner_x(),
+            row_y,
+            Cell {
+                glyph: cur_glyph,
+                fg: palette.panel_title_fg,
+                bg: palette.panel_bg,
+            },
+        );
+
+        // Optional one-cell glyph preview between cursor and label.
+        let label_x = if let Some((glyph, fg)) = row.prefix_glyph {
+            put_cell(
+                cells,
+                layout.inner_x() + 2,
+                row_y,
+                Cell {
+                    glyph,
+                    fg,
+                    bg: palette.panel_bg,
+                },
+            );
+            layout.inner_x() + 4
+        } else {
+            layout.inner_x() + 2
+        };
+
+        put_text(cells, label_x, row_y, row.label, row.label_fg, palette.panel_bg);
+
+        if let Some((status, status_fg)) = row.right {
+            // Inner width minus consumed left side (label_x - x) minus
+            // label minus a 2-char gap. Floor at 4 so very long labels
+            // still leave a status stub.
+            let consumed = (label_x - layout.x) + row.label.len() as i32 + 2;
+            let max_status_len = (layout.w - consumed).max(4) as usize;
+            let truncated: String = status.chars().take(max_status_len).collect();
+            let status_x = layout.inner_right() - truncated.len() as i32;
+            put_text(cells, status_x, row_y, &truncated, status_fg, palette.panel_bg);
+        }
+    }
+
+    // Scroll indicators on the right edge inside the panel body. The
+    // top marker sits on the first row, the bottom marker on the last
+    // visible row (just above any reserved-bottom hint).
+    if cursor.scroll > 0 {
+        put_cell(
+            cells,
+            layout.inner_right(),
+            layout.first_row_y(),
+            Cell {
+                glyph: b'^',
+                fg: palette.panel_dim_fg,
+                bg: palette.panel_bg,
+            },
+        );
+    }
+    if cursor.scroll + visible < total {
+        put_cell(
+            cells,
+            layout.inner_right(),
+            layout.first_row_y() + visible as i32 - 1,
+            Cell {
+                glyph: b'v',
+                fg: palette.panel_dim_fg,
+                bg: palette.panel_bg,
+            },
+        );
+    }
+}
+
 /// Find the atlas index matching the saved key. Empty / unknown keys
 /// fall back to `atlases::DEFAULT_KEY`; that fallback also being absent
 /// (shouldn't happen — it's embedded) collapses to index 0.
@@ -2840,7 +3010,7 @@ fn wrap_index(cur: usize, delta: i32, len: usize) -> usize {
 fn draw_tileset_picker(
     cells: &mut [Option<Cell>],
     registry: &[AtlasEntry],
-    selected: usize,
+    cursor: &MenuCursor,
     current: usize,
     palette: &Palette,
 ) {
@@ -2853,33 +3023,24 @@ fn draw_tileset_picker(
         "A: select  B: close",
         palette,
     );
-    for (i, entry) in registry.iter().enumerate() {
-        let row_y = layout.first_row_y() + i as i32;
-        if row_y >= layout.footer_y() {
-            break;
-        }
-        let is_selected = i == selected;
-        let label_fg = if is_selected {
-            palette.panel_title_fg
-        } else {
-            palette.panel_fg
-        };
-        let right = if i == current {
-            Some(("(current)", palette.panel_dim_fg))
-        } else {
-            None
-        };
-        draw_menu_row(
-            cells,
-            &layout,
-            row_y,
-            is_selected,
-            &entry.display_name,
-            label_fg,
-            right,
-            palette,
-        );
-    }
+    let rows: Vec<MenuRow<'_>> = registry
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let is_selected = i == cursor.selected;
+            let label_fg = if is_selected {
+                palette.panel_title_fg
+            } else {
+                palette.panel_fg
+            };
+            let mut row = MenuRow::new(&entry.display_name, label_fg);
+            if i == current {
+                row = row.with_right("(current)", palette.panel_dim_fg);
+            }
+            row
+        })
+        .collect();
+    draw_menu_list(cells, &layout, palette, &rows, cursor, 0);
 }
 
 /// Tile-remap list: pick which TerrainKind to edit. Each row shows the
@@ -2888,7 +3049,7 @@ fn draw_tileset_picker(
 fn draw_tile_remap_list(
     cells: &mut [Option<Cell>],
     overrides: &HashMap<TerrainKind, u8>,
-    selected: usize,
+    cursor: &MenuCursor,
     palette: &Palette,
 ) {
     let h = (REMAPPABLE_TERRAINS.len() as i32 + 6).clamp(8, WORLD_H as i32 - 2);
@@ -2900,64 +3061,45 @@ fn draw_tile_remap_list(
         "A: edit  X: reset  B: close",
         palette,
     );
-    for (i, kind) in REMAPPABLE_TERRAINS.iter().enumerate() {
-        let row_y = layout.first_row_y() + i as i32;
-        if row_y >= layout.footer_y() {
-            break;
-        }
-        let is_selected = i == selected;
-        let def = kind.def();
-        let override_glyph = overrides.get(kind).copied();
-        let effective_glyph = override_glyph.unwrap_or(def.glyph);
 
-        // Cursor + a one-cell glyph preview slotted between cursor and name.
-        let cursor = if is_selected { b'>' } else { b' ' };
-        put_cell(
-            cells,
-            layout.inner_x(),
-            row_y,
-            Cell {
-                glyph: cursor,
-                fg: palette.panel_title_fg,
-                bg: palette.panel_bg,
-            },
-        );
-        put_cell(
-            cells,
-            layout.inner_x() + 2,
-            row_y,
-            Cell {
-                glyph: effective_glyph,
-                fg: palette.panel_fg,
-                bg: palette.panel_bg,
-            },
-        );
-        let label_fg = if is_selected {
-            palette.panel_title_fg
-        } else {
-            palette.panel_fg
-        };
-        put_text(
-            cells,
-            layout.inner_x() + 4,
-            row_y,
-            def.name,
-            label_fg,
-            palette.panel_bg,
-        );
+    // Right-status strings live in their own vec so the MenuRow refs
+    // can borrow them.
+    let rights: Vec<(String, Color, u8, Option<u8>)> = REMAPPABLE_TERRAINS
+        .iter()
+        .map(|kind| {
+            let def = kind.def();
+            let override_glyph = overrides.get(kind).copied();
+            let effective_glyph = override_glyph.unwrap_or(def.glyph);
+            let text = match override_glyph {
+                Some(g) => format!("0x{:02X}", g),
+                None => format!("default 0x{:02X}", def.glyph),
+            };
+            let status_fg = if override_glyph.is_some() {
+                palette.panel_title_fg
+            } else {
+                palette.panel_dim_fg
+            };
+            (text, status_fg, effective_glyph, override_glyph)
+        })
+        .collect();
 
-        let right = match override_glyph {
-            Some(g) => format!("0x{:02X}", g),
-            None => format!("default 0x{:02X}", def.glyph),
-        };
-        let status_fg = if override_glyph.is_some() {
-            palette.panel_title_fg
-        } else {
-            palette.panel_dim_fg
-        };
-        let status_x = layout.inner_right() - right.len() as i32;
-        put_text(cells, status_x, row_y, &right, status_fg, palette.panel_bg);
-    }
+    let rows: Vec<MenuRow<'_>> = REMAPPABLE_TERRAINS
+        .iter()
+        .zip(rights.iter())
+        .enumerate()
+        .map(|(i, (kind, (text, status_fg, glyph, _override)))| {
+            let is_selected = i == cursor.selected;
+            let label_fg = if is_selected {
+                palette.panel_title_fg
+            } else {
+                palette.panel_fg
+            };
+            MenuRow::new(kind.def().name, label_fg)
+                .with_prefix_glyph(*glyph, palette.panel_fg)
+                .with_right(text, *status_fg)
+        })
+        .collect();
+    draw_menu_list(cells, &layout, palette, &rows, cursor, 0);
 }
 
 /// Glyph picker reused for the tile-remap flow. Same 16x16 grid as the
@@ -2990,6 +3132,19 @@ fn info_tab_row_count(world: &World, tab: InfoTab) -> usize {
         InfoTab::Attributes => 5,
         // Fire Making, Foraging, Melee, Ranged, Dodge.
         InfoTab::Skills => 5,
+    }
+}
+
+/// Rows the info panel can show at once for a given tab. The info hub
+/// uses a 22-tall centered panel; body lives between `first_row_y` and
+/// `footer_y`. Inventory reserves one row above the footer for the
+/// pack-weight summary; the other tabs use the full body.
+fn info_tab_visible_rows(tab: InfoTab) -> usize {
+    // Mirrors PanelLayout::centered(36, 22): footer_y - first_row_y = 17.
+    const BODY_ROWS: usize = 17;
+    match tab {
+        InfoTab::Inventory | InfoTab::Crafting => BODY_ROWS - 1,
+        InfoTab::Attributes | InfoTab::Skills => BODY_ROWS,
     }
 }
 
@@ -3046,10 +3201,12 @@ fn draw_info_menu(
 
     // Body branches on the active tab.
     match state.tab {
-        InfoTab::Inventory => draw_info_inventory(cells, &layout, world, state.selected, palette),
-        InfoTab::Crafting => draw_info_crafting(cells, &layout, world, state.selected, palette),
-        InfoTab::Attributes => draw_info_attributes(cells, &layout, world, state.selected, palette),
-        InfoTab::Skills => draw_info_skills(cells, &layout, world, state.selected, palette),
+        InfoTab::Inventory => draw_info_inventory(cells, &layout, world, &state.cursor, palette),
+        InfoTab::Crafting => draw_info_crafting(cells, &layout, world, &state.cursor, palette),
+        InfoTab::Attributes => {
+            draw_info_attributes(cells, &layout, world, state.cursor.selected, palette)
+        }
+        InfoTab::Skills => draw_info_skills(cells, &layout, world, state.cursor.selected, palette),
     }
 }
 
@@ -3060,40 +3217,32 @@ fn draw_info_crafting(
     cells: &mut [Option<Cell>],
     layout: &PanelLayout,
     world: &World,
-    selected: usize,
+    cursor: &MenuCursor,
     palette: &Palette,
 ) {
-    let max_rows = (layout.footer_y() - layout.first_row_y() - 1).max(1) as usize;
-    let visible = crafting::RECIPES.iter().take(max_rows);
-    for (i, recipe) in visible.enumerate() {
-        let row_y = layout.first_row_y() + i as i32;
-        let is_selected = i == selected;
-        let avail = action::evaluate(world, recipe.action);
-        let (right, dim) = match avail {
+    // Per-recipe availability text (owned so the &str refs we hand to
+    // MenuRow outlive the borrow).
+    let avails: Vec<(String, bool)> = crafting::RECIPES
+        .iter()
+        .map(|r| match action::evaluate(world, r.action) {
             action::Availability::Available { cost_game_seconds } => {
                 (format!("ok {}s", cost_game_seconds), false)
             }
             action::Availability::Unavailable { reason } => (reason.to_string(), true),
-        };
-        let fg = if dim {
-            palette.panel_dim_fg
-        } else {
-            palette.panel_fg
-        };
-        draw_menu_row(
-            cells,
-            layout,
-            row_y,
-            is_selected,
-            recipe.name,
-            fg,
-            Some((&right, palette.panel_dim_fg)),
-            palette,
-        );
-    }
+        })
+        .collect();
+    let rows: Vec<MenuRow<'_>> = crafting::RECIPES
+        .iter()
+        .zip(avails.iter())
+        .map(|(recipe, (right, dim))| {
+            let fg = if *dim { palette.panel_dim_fg } else { palette.panel_fg };
+            MenuRow::new(recipe.name, fg).with_right(right, palette.panel_dim_fg)
+        })
+        .collect();
+    draw_menu_list(cells, layout, palette, &rows, cursor, 1);
 
     // Footer-adjacent hint. Selecting a row with A queues the recipe.
-    let hint = if let Some(recipe) = crafting::RECIPES.get(selected) {
+    let hint = if let Some(recipe) = crafting::RECIPES.get(cursor.selected) {
         format!("A: craft  ({})", recipe.name)
     } else {
         String::new()
@@ -3112,72 +3261,55 @@ fn draw_info_inventory(
     cells: &mut [Option<Cell>],
     layout: &PanelLayout,
     world: &World,
-    selected: usize,
+    cursor: &MenuCursor,
     palette: &Palette,
 ) {
     let pack = world.player_pack();
     let equipment = world.player_equipment();
+    let slot_count = world::EquipSlot::ALL.len();
 
-    let max_rows = (layout.footer_y() - layout.first_row_y() - 1).max(1) as usize;
-    let mut row_idx = 0usize;
-
-    // Equipment slots first: one row per slot, labelled "[slot] item" or
-    // "[slot] —". Selecting one and pressing A unequips the slot.
-    for &slot in &world::EquipSlot::ALL {
-        if row_idx >= max_rows {
-            break;
-        }
-        let row_y = layout.first_row_y() + row_idx as i32;
-        let is_selected = row_idx == selected;
-        let label = match equipment.get(slot) {
+    // Equip slots first (one row per slot), then pack items. Owned
+    // labels/weights live in side vectors so the MenuRow borrows stay
+    // valid across the draw call.
+    let slot_labels: Vec<String> = world::EquipSlot::ALL
+        .iter()
+        .map(|slot| match equipment.get(*slot) {
             Some(kind) => format!("[{}] {}", slot.label(), kind.name()),
             None => format!("[{}] —", slot.label()),
-        };
-        draw_menu_row(
-            cells,
-            layout,
-            row_y,
-            is_selected,
-            &label,
-            palette.panel_dim_fg,
-            None,
-            palette,
-        );
-        row_idx += 1;
-    }
+        })
+        .collect();
+    let pack_labels: Vec<String> = pack.contents.iter().map(|i| i.display_label()).collect();
+    let pack_weights: Vec<String> = pack
+        .contents
+        .iter()
+        .map(|i| fmt_weight(i.total_weight_g()))
+        .collect();
 
-    // Pack rows below. Skip the empty hint if we have equipment lines
-    // above — the player still sees the slot list when the pack is empty.
-    if pack.contents.is_empty() && row_idx < max_rows {
-        let row_y = layout.first_row_y() + row_idx as i32;
-        put_text(
-            cells,
-            layout.inner_x(),
-            row_y,
-            "(pack empty)",
-            palette.panel_dim_fg,
-            palette.panel_bg,
-        );
-    } else {
-        for item in pack.contents.iter() {
-            if row_idx >= max_rows {
-                break;
-            }
-            let row_y = layout.first_row_y() + row_idx as i32;
-            let is_selected = row_idx == selected;
-            let label = item.display_label();
-            let weight = fmt_weight(item.total_weight_g());
-            draw_menu_row(
+    let mut rows: Vec<MenuRow<'_>> = Vec::with_capacity(slot_count + pack.contents.len());
+    for label in &slot_labels {
+        rows.push(MenuRow::new(label, palette.panel_dim_fg));
+    }
+    for (label, weight) in pack_labels.iter().zip(pack_weights.iter()) {
+        rows.push(MenuRow::new(label, palette.panel_fg).with_right(weight, palette.panel_dim_fg));
+    }
+    draw_menu_list(cells, layout, palette, &rows, cursor, 1);
+
+    // Empty-pack hint sits directly below the equip slot list when the
+    // pack is empty — drawn after draw_menu_list so it lands in the
+    // viewport at the correct visual row.
+    if pack.contents.is_empty() {
+        let visible = menu_visible_rows(layout, 1);
+        let view_idx = slot_count.saturating_sub(cursor.scroll);
+        if view_idx < visible {
+            let row_y = layout.first_row_y() + view_idx as i32;
+            put_text(
                 cells,
-                layout,
+                layout.inner_x(),
                 row_y,
-                is_selected,
-                &label,
-                palette.panel_fg,
-                Some((&weight, palette.panel_dim_fg)),
-                palette,
+                "(pack empty)",
+                palette.panel_dim_fg,
+                palette.panel_bg,
             );
-            row_idx += 1;
         }
     }
 
@@ -3392,7 +3524,7 @@ fn draw_death_screen(cells: &mut [Option<Cell>], cause: DeathCause, palette: &Pa
     );
 }
 
-fn draw_pause_menu(cells: &mut [Option<Cell>], selected: usize, palette: &Palette) {
+fn draw_pause_menu(cells: &mut [Option<Cell>], cursor: &MenuCursor, palette: &Palette) {
     let layout = PanelLayout::centered(28, 9);
     draw_panel_frame(
         cells,
@@ -3402,27 +3534,22 @@ fn draw_pause_menu(cells: &mut [Option<Cell>], selected: usize, palette: &Palett
         palette,
     );
 
-    for (i, (action, label)) in PAUSE_OPTIONS.iter().enumerate() {
-        let row_y = layout.first_row_y() + i as i32;
-        let is_selected = i == selected;
-        // ResetSave row is always tinted red — destructive option
-        // visibility shouldn't depend on the selection cursor.
-        let label_fg = match (is_selected, action) {
-            (_, PauseAction::ResetSave) => palette.need_critical_fg,
-            (true, _) => palette.panel_fg,
-            (false, _) => palette.hud_fg,
-        };
-        draw_menu_row(
-            cells,
-            &layout,
-            row_y,
-            is_selected,
-            label,
-            label_fg,
-            None,
-            palette,
-        );
-    }
+    // ResetSave row is always tinted red — destructive option
+    // visibility shouldn't depend on the selection cursor.
+    let rows: Vec<MenuRow<'_>> = PAUSE_OPTIONS
+        .iter()
+        .enumerate()
+        .map(|(i, (action, label))| {
+            let is_selected = i == cursor.selected;
+            let label_fg = match (is_selected, action) {
+                (_, PauseAction::ResetSave) => palette.need_critical_fg,
+                (true, _) => palette.panel_fg,
+                (false, _) => palette.hud_fg,
+            };
+            MenuRow::new(label, label_fg)
+        })
+        .collect();
+    draw_menu_list(cells, &layout, palette, &rows, cursor, 0);
 }
 
 fn draw_multi_turn_banner(
@@ -3484,7 +3611,7 @@ fn draw_multi_turn_banner(
 fn draw_command_menu(
     cells: &mut [Option<Cell>],
     world: &World,
-    selected: usize,
+    cursor: &MenuCursor,
     palette: &Palette,
 ) {
     let layout = PanelLayout::anchored(2, 4, 36, 21);
@@ -3496,47 +3623,46 @@ fn draw_command_menu(
         palette,
     );
 
-    for (i, ca) in action::ALL_ACTIONS.iter().enumerate() {
-        let row_y = layout.first_row_y() + i as i32;
-        let is_selected = i == selected;
-
-        let avail = action::evaluate(world, ca.id);
-        let available = matches!(avail, action::Availability::Available { .. });
-        // Selected + available -> full panel fg (highlight).
-        // Selected + unavailable -> critical red (you tried to confirm
-        //     a verb that can't run; this color reinforces the bounce).
-        // Unselected + available -> panel fg.
-        // Unselected + unavailable -> dim fg (greyed-out catalog row).
-        let label_fg = match (is_selected, available) {
-            (true, false) => palette.need_critical_fg,
-            (_, true) => palette.panel_fg,
-            (false, false) => palette.panel_dim_fg,
-        };
-
-        let (status_text, status_fg) = match avail {
+    // Per-action availability + status strings. Held in owned vecs so
+    // the MenuRow borrows below stay valid.
+    let avails: Vec<action::Availability> = action::ALL_ACTIONS
+        .iter()
+        .map(|ca| action::evaluate(world, ca.id))
+        .collect();
+    let statuses: Vec<(String, Color)> = avails
+        .iter()
+        .map(|av| match av {
             action::Availability::Available { cost_game_seconds } => {
                 (format!("{}s", cost_game_seconds), palette.panel_fg)
             }
             action::Availability::Unavailable { reason } => {
                 (reason.to_string(), palette.panel_dim_fg)
             }
-        };
-
-        draw_menu_row(
-            cells,
-            &layout,
-            row_y,
-            is_selected,
-            ca.name,
-            label_fg,
-            Some((&status_text, status_fg)),
-            palette,
-        );
-    }
+        })
+        .collect();
+    let rows: Vec<MenuRow<'_>> = action::ALL_ACTIONS
+        .iter()
+        .zip(avails.iter())
+        .zip(statuses.iter())
+        .enumerate()
+        .map(|(i, ((ca, avail), (status, status_fg)))| {
+            let is_selected = i == cursor.selected;
+            let available = matches!(avail, action::Availability::Available { .. });
+            // Selected + unavailable shows critical red so a bounce is
+            // visible; everything else uses the standard fg/dim pair.
+            let label_fg = match (is_selected, available) {
+                (true, false) => palette.need_critical_fg,
+                (_, true) => palette.panel_fg,
+                (false, false) => palette.panel_dim_fg,
+            };
+            MenuRow::new(ca.name, label_fg).with_right(status.as_str(), *status_fg)
+        })
+        .collect();
+    draw_menu_list(cells, &layout, palette, &rows, cursor, 1);
 
     // Description for the selected row, one line above the footer.
     let desc_y = layout.footer_y() - 1;
-    if let Some(sel) = action::ALL_ACTIONS.get(selected) {
+    if let Some(sel) = action::ALL_ACTIONS.get(cursor.selected) {
         let max_desc_len = (layout.w as usize).saturating_sub(4);
         let desc: String = sel.description.chars().take(max_desc_len).collect();
         put_text(
