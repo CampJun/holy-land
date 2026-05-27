@@ -625,6 +625,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut radial_open: bool = false;
     let mut radial_consumed: bool = false;
 
+    // PR B Drop card: X-hold detection inside the info-hub Inventory tab.
+    // Press edge captures the pack-row index; release decides between
+    // tap (drop 1 unit) and hold (drop the whole stack) using the same
+    // 250 ms `HOLD_THRESHOLD` the Y-radial uses, mirroring the card's
+    // "tap = one unit, hold = whole stack" pattern. Goes inert when
+    // info_menu is closed or the active tab isn't Inventory.
+    let mut x_press_at: Option<(Instant, usize)> = None;
+
     // Dev tool: X-button toggles a CP437 glyph palette overlay so we
     // can audit which bytes have which sprites in our custom atlas.
     // Browse with dpad; the header shows the highlighted byte's value
@@ -723,6 +731,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 && command_menu.is_none()
             {
                 radial_open = true;
+            }
+        }
+
+        // PR B Drop card: X press/release tracking for the Inventory
+        // tab. We only arm on press while a PackItem row is selected;
+        // release fires the drop with count = 1 (tap) or whole stack
+        // (hold ≥ HOLD_THRESHOLD). Releases outside Inventory mode are
+        // silently dropped.
+        let x_held = input.is_held(Action::X);
+        if x_press_at.is_none() && x_held {
+            // Only arm if the info_menu is open on Inventory and the
+            // current row is a pack item — Equipment slots are a no-op
+            // per the card (unequip first).
+            if let Some(state) = info_menu.as_ref() {
+                if matches!(state.tab, InfoTab::Inventory) {
+                    if let Some(InventoryRow::PackItem(_)) =
+                        inventory_row_at(&world, state.selected)
+                    {
+                        let slot_count = world::EquipSlot::ALL.len();
+                        let pack_idx = state.selected - slot_count;
+                        x_press_at = Some((frame_start, pack_idx));
+                    }
+                }
+            }
+        } else if x_press_at.is_some() && !x_held {
+            if let Some((t0, pack_idx)) = x_press_at.take() {
+                let is_hold = frame_start.saturating_duration_since(t0) >= HOLD_THRESHOLD;
+                let count = if is_hold {
+                    world
+                        .player_pack()
+                        .contents
+                        .get(pack_idx)
+                        .map(|i| i.count)
+                        .unwrap_or(1)
+                } else {
+                    1
+                };
+                if let Some(msg) = world.try_drop_from_pack(pack_idx, count) {
+                    world.push_message(msg);
+                }
             }
         }
 

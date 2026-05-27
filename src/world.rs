@@ -127,6 +127,11 @@ impl StrideMode {
 /// active Jog auto-falls back to Walk. Per the carry/stride card.
 pub const STRIDE_JOG_STAMINA_FLOOR: i16 = 20;
 
+/// PR B Drop card: move-cost for dropping items from the pack onto the
+/// player's cell. Matches Pickup's 300 moves — the verb mirrors Pickup
+/// in cost and shape (the card says "cost ~300 moves").
+pub const DROP_MOVE_COST: u32 = 300;
+
 /// Phase-9 multi-turn interrupt threshold. When any need drops below this
 /// during a multi-turn tick, the active action queue cancels and control
 /// returns to the player. Death gate (phase 14) re-uses the same value.
@@ -3100,6 +3105,66 @@ impl World {
         picked
     }
 
+    /// PR B Drop card: place a single `ItemInstance` on the player's
+    /// current cell, merging into an existing same-kind / same-metadata
+    /// stack when possible. Mirrors `Pack::try_add` merge rules so the
+    /// drop ↔ pickup round-trip doesn't fragment stacks.
+    pub fn try_drop_to_cell(&mut self, item: crate::items::ItemInstance) {
+        let pos = self.player_pos();
+        let wx = pos.x as i64;
+        let wy = pos.y as i64;
+        let Some(cell) = self.cell_at_mut(wx, wy) else {
+            return;
+        };
+        // Only None-metadata fungibles merge; uniques / cooked / cookware
+        // carry per-instance state that must stay separated.
+        if item.kind.is_fungible()
+            && matches!(item.metadata, crate::items::ItemMetadata::None)
+            && item.charges.is_none()
+        {
+            if let Some(existing) = cell.items.iter_mut().find(|i| {
+                i.kind == item.kind
+                    && matches!(i.metadata, crate::items::ItemMetadata::None)
+                    && i.charges.is_none()
+                    && i.weight_g_each == item.weight_g_each
+            }) {
+                existing.count = existing.count.saturating_add(item.count);
+                return;
+            }
+        }
+        cell.items.push(item);
+    }
+
+    /// PR B Drop card: drop `count` units from `pack_idx` of the player's
+    /// pack onto the player's cell. Tap-X drops one (count = 1); hold-X
+    /// past 250 ms drops the whole stack. Spends `DROP_MOVE_COST` moves
+    /// on success. Returns a status message for the HUD log; returns
+    /// `None` if the index is out of range (silent no-op).
+    pub fn try_drop_from_pack(&mut self, pack_idx: usize, count: u16) -> Option<String> {
+        // Lift the item out of the pack first so we don't hold a mutable
+        // borrow while calling `try_drop_to_cell` (which also takes
+        // `&mut self`).
+        let to_drop = {
+            let mut pack = self.player_pack_mut();
+            let item = pack.contents.get(pack_idx)?;
+            let take = count.min(item.count).max(1);
+            if take >= item.count {
+                pack.contents.remove(pack_idx)
+            } else {
+                let mut split = item.clone();
+                split.count = take;
+                let item_mut = &mut pack.contents[pack_idx];
+                item_mut.count -= take;
+                split
+            }
+        };
+        let label = to_drop.display_label();
+        let dropped_count = to_drop.count;
+        self.try_drop_to_cell(to_drop);
+        self.spend_moves(DROP_MOVE_COST);
+        Some(format!("dropped {} {}", dropped_count, label))
+    }
+
     /// Snapshot all non-empty cells across loaded chunks. Used by the save
     /// path. Coords are world-coords (slice 1 always world == local since
     /// chunk (0, 0) starts at (0, 0)).
@@ -5772,6 +5837,100 @@ mod tests {
         // STR 10 → 113 kg (momentary lift); STR 20 → 453.2 kg.
         assert_eq!(crate::items::derived_pack_cap_g(10), 100 * 1133);
         assert_eq!(crate::items::derived_pack_cap_g(20), 400 * 1133);
+    }
+
+    #[test]
+    fn try_drop_to_cell_merges_into_existing_fungible_stack() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let pos = world.player_pos();
+        // Seed the player's cell with a stack of 3 twigs.
+        if let Some(c) = world.cell_at_mut(pos.x as i64, pos.y as i64) {
+            c.items.clear();
+            c.items.push(ItemInstance::stack(
+                ItemKind::Twig,
+                3,
+                5,
+                None,
+                ItemMetadata::None,
+            ));
+        }
+        world.try_drop_to_cell(ItemInstance::stack(
+            ItemKind::Twig,
+            2,
+            5,
+            None,
+            ItemMetadata::None,
+        ));
+        let cell = world.cell_at(pos.x as i64, pos.y as i64).unwrap();
+        assert_eq!(cell.items.len(), 1, "fungible same-kind drops must merge");
+        assert_eq!(cell.items[0].count, 5);
+    }
+
+    #[test]
+    fn try_drop_from_pack_tap_drops_one_unit_and_keeps_stack() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let pos = world.player_pos();
+        // Clear adjacent cells of seeded debris so we can assert.
+        if let Some(c) = world.cell_at_mut(pos.x as i64, pos.y as i64) {
+            c.items.clear();
+        }
+        // Starting pack has a stack of 3 rations — find that index.
+        let ration_idx = world
+            .player_pack()
+            .contents
+            .iter()
+            .position(|i| i.kind == ItemKind::Ration)
+            .expect("rations in starting pack");
+        let before_count = world.player_pack().contents[ration_idx].count;
+        assert!(before_count >= 2, "test needs a multi-stack to drop from");
+        let msg = world.try_drop_from_pack(ration_idx, 1).expect("drop ok");
+        assert!(msg.starts_with("dropped 1"));
+        // The pack stack shrank by 1.
+        let ration_idx2 = world
+            .player_pack()
+            .contents
+            .iter()
+            .position(|i| i.kind == ItemKind::Ration)
+            .expect("stack still present");
+        assert_eq!(
+            world.player_pack().contents[ration_idx2].count,
+            before_count - 1
+        );
+        // The cell has one ration now.
+        let cell = world.cell_at(pos.x as i64, pos.y as i64).unwrap();
+        assert!(cell.items.iter().any(|i| i.kind == ItemKind::Ration && i.count == 1));
+    }
+
+    #[test]
+    fn try_drop_from_pack_hold_drops_whole_stack_and_removes_entry() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let pos = world.player_pos();
+        if let Some(c) = world.cell_at_mut(pos.x as i64, pos.y as i64) {
+            c.items.clear();
+        }
+        let ration_idx = world
+            .player_pack()
+            .contents
+            .iter()
+            .position(|i| i.kind == ItemKind::Ration)
+            .expect("rations in starting pack");
+        let stack_count = world.player_pack().contents[ration_idx].count;
+        let msg = world.try_drop_from_pack(ration_idx, stack_count).expect("drop ok");
+        assert!(msg.starts_with(&format!("dropped {}", stack_count)));
+        // Pack no longer contains rations.
+        assert!(
+            world.player_pack().contents.iter().all(|i| i.kind != ItemKind::Ration),
+            "whole-stack drop must remove the pack entry"
+        );
+        // Cell holds the whole stack.
+        let cell = world.cell_at(pos.x as i64, pos.y as i64).unwrap();
+        let cell_rations: u16 = cell
+            .items
+            .iter()
+            .filter(|i| i.kind == ItemKind::Ration)
+            .map(|i| i.count)
+            .sum();
+        assert_eq!(cell_rations, stack_count);
     }
 
     #[test]
