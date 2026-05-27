@@ -2729,32 +2729,79 @@ fn draw_info_skills(
     palette: &Palette,
 ) {
     let skills = world.player_skills();
-    let rows: [(SkillKind, &skill::Skill); 5] = [
-        (SkillKind::FireMaking, skills.get(SkillKind::FireMaking)),
-        (SkillKind::Foraging, skills.get(SkillKind::Foraging)),
-        (SkillKind::Melee, skills.get(SkillKind::Melee)),
-        (SkillKind::Ranged, skills.get(SkillKind::Ranged)),
-        (SkillKind::Dodge, skills.get(SkillKind::Dodge)),
+    // Always-visible top-level rows: survival + combat + defensive.
+    // Proficiency rows are appended below when they've earned any XP
+    // (value > 0 or daily_xp > 0), so a fresh player sees a clean
+    // panel and trained proficiencies surface as you actually use them.
+    let top: &[SkillKind] = &[
+        SkillKind::FireMaking,
+        SkillKind::Foraging,
+        SkillKind::Melee,
+        SkillKind::Ranged,
+        SkillKind::Dodge,
+        SkillKind::Block,
+        SkillKind::LightArmor,
+        SkillKind::MediumArmor,
+        SkillKind::HeavyArmor,
     ];
-
-    for (i, (kind, s)) in rows.into_iter().enumerate() {
-        let row_y = layout.first_row_y() + i as i32;
-        let is_selected = i == selected;
-        let label = kind.display_name();
-        // Single row per skill: value % + daily XP banked toward next
-        // level. Drops the multi-line sub-row pattern so all five fit
-        // in the 22-cell panel without scrolling.
+    let max_rows = (layout.footer_y() - layout.first_row_y()).max(1) as usize;
+    let mut row_idx: usize = 0;
+    for &kind in top {
+        if row_idx >= max_rows {
+            break;
+        }
+        let s = skills.get(kind);
+        let row_y = layout.first_row_y() + row_idx as i32;
+        let is_selected = row_idx == selected;
         let value = format!("{}% (+{}xp)", s.value, s.daily_xp);
         draw_menu_row(
             cells,
             layout,
             row_y,
             is_selected,
-            label,
+            kind.display_name(),
             palette.panel_fg,
             Some((&value, palette.panel_dim_fg)),
             palette,
         );
+        row_idx += 1;
+    }
+    // Per-weapon proficiencies: only render rows the player has trained.
+    let profs: &[skill::Proficiency] = &[
+        skill::Proficiency::Knife,
+        skill::Proficiency::Sword,
+        skill::Proficiency::Falchion,
+        skill::Proficiency::Axe,
+        skill::Proficiency::MaceCudgel,
+        skill::Proficiency::Quarterstaff,
+        skill::Proficiency::SpearLance,
+        skill::Proficiency::GisarmeBill,
+        skill::Proficiency::Unarmed,
+        skill::Proficiency::Bow,
+        skill::Proficiency::Crossbow,
+    ];
+    for &prof in profs {
+        if row_idx >= max_rows {
+            break;
+        }
+        let s = skills.proficiencies.get(prof);
+        if s.value == 0 && s.daily_xp == 0 {
+            continue;
+        }
+        let row_y = layout.first_row_y() + row_idx as i32;
+        let is_selected = row_idx == selected;
+        let value = format!("{}% (+{}xp)", s.value, s.daily_xp);
+        draw_menu_row(
+            cells,
+            layout,
+            row_y,
+            is_selected,
+            prof.display_name(),
+            palette.panel_dim_fg,
+            Some((&value, palette.panel_dim_fg)),
+            palette,
+        );
+        row_idx += 1;
     }
 }
 

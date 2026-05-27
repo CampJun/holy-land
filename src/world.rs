@@ -2973,6 +2973,39 @@ impl World {
         }
     }
 
+    /// Card 3 — per-weapon proficiency XP. Always called on the player
+    /// (the only `Skills` carrier) and gated by the caller to hit-only
+    /// per the card. Uses the same URW chassis as `award_combat_xp`.
+    fn award_proficiency_xp(&mut self, prof: crate::skill::Proficiency, success: bool) {
+        let mut skills = self
+            .ecs
+            .get::<&mut crate::skill::Skills>(self.player)
+            .map(|s| *s)
+            .unwrap_or_default();
+        crate::skill::award_xp(skills.proficiencies.get_mut(prof), success);
+        self.set_player_skills(skills);
+    }
+
+    /// Card 3 — for each piece whose layer caught the swing, award the
+    /// matching armor-class skill +5 XP (URW "success" grant). Daily
+    /// cap chassis from `skill::award_xp` keeps grinding bounded.
+    fn award_armor_xp_for_catches(&mut self, caught: &[crate::items::ItemKind]) {
+        if caught.is_empty() {
+            return;
+        }
+        let mut skills = self
+            .ecs
+            .get::<&mut crate::skill::Skills>(self.player)
+            .map(|s| *s)
+            .unwrap_or_default();
+        for &kind in caught {
+            if let Some(skill_kind) = crate::combat::armor_skill_for(kind) {
+                crate::skill::award_xp(skills.get_mut(skill_kind), true);
+            }
+        }
+        self.set_player_skills(skills);
+    }
+
     /// Sync the player's `CombatSkills` (the in-fight stat block read by
     /// the resolver) from the URW `Skills` (the long-run training
     /// ledger). +1 to the matching CombatSkills entry per Skills level.
@@ -3040,7 +3073,7 @@ impl World {
             crate::combat::HitOutcome::Hit { .. } | crate::combat::HitOutcome::Crit { .. } => {
                 let crit = outcome.is_crit();
                 let part = crate::combat::roll_body_part(&mut self.rng);
-                let armor = self.layered_dr_for(target, part);
+                let (armor, caught_pieces) = self.layered_dr_with_catches(target, part);
                 let situational_pct = if weapon.reach >= 2 && range == 1 {
                     crate::combat::NO_REACH_DAMAGE_PCT
                 } else {
@@ -3064,6 +3097,19 @@ impl World {
                     crit,
                 ));
                 self.apply_damage_to_part(target, part, dmg);
+                // Card 3: per-armor-class XP grant. Every piece whose
+                // coverage roll caught the swing teaches the matching
+                // armor skill — daily cap chassis stops grind.
+                if target_is_player {
+                    self.award_armor_xp_for_catches(&caught_pieces);
+                }
+                // Card 3: per-weapon proficiency XP — hit-only. Melee
+                // top-level already trains on the swing earlier.
+                if attacker_is_player {
+                    if let Some(prof) = crate::combat::proficiency_for(weapon_kind) {
+                        self.award_proficiency_xp(prof, true);
+                    }
+                }
             }
         }
         // Reach-2 from full extension is a heavy action per the
@@ -3172,7 +3218,7 @@ impl World {
             crate::combat::HitOutcome::Hit { .. } | crate::combat::HitOutcome::Crit { .. } => {
                 let crit = outcome.is_crit();
                 let part = crate::combat::roll_body_part(&mut self.rng);
-                let armor = self.layered_dr_for(target, part);
+                let (armor, caught_pieces) = self.layered_dr_with_catches(target, part);
                 let dmg = crate::combat::roll_damage(weapon, atk_stats, armor, crit, &mut self.rng);
                 let total = dmg.total();
                 self.push_message(self.ranged_hit_line(
@@ -3184,6 +3230,14 @@ impl World {
                     crit,
                 ));
                 self.apply_damage_to_part(target, part, dmg);
+                if target_is_player {
+                    self.award_armor_xp_for_catches(&caught_pieces);
+                }
+                if attacker_is_player {
+                    if let Some(prof) = crate::combat::proficiency_for(weapon_kind) {
+                        self.award_proficiency_xp(prof, true);
+                    }
+                }
                 if let Some(kind) = ammo_kind {
                     // 70% of arrows survive embedded in the target —
                     // pickup gives them back. Crits break the arrow
@@ -3374,30 +3428,41 @@ impl World {
     /// and rolls under its coverage %. The roll happens per-piece, not
     /// per-type — a single piece either catches the swing or it doesn't.
     fn layered_dr_for(&mut self, target: Entity, part: crate::combat::BodyPart) -> crate::combat::ArmorDr {
+        self.layered_dr_with_catches(target, part).0
+    }
+
+    /// Same as `layered_dr_for` but also surfaces the `ItemKind` of every
+    /// piece whose coverage roll succeeded. Card 3 routes those caught
+    /// item_kinds into per-armor-class XP grants.
+    fn layered_dr_with_catches(
+        &mut self,
+        target: Entity,
+        part: crate::combat::BodyPart,
+    ) -> (crate::combat::ArmorDr, Vec<crate::items::ItemKind>) {
         let Ok(worn) = self.ecs.get::<&Worn>(target) else {
-            return crate::combat::ArmorDr::default();
+            return (crate::combat::ArmorDr::default(), Vec::new());
         };
-        // Collect into a local Vec so we can drop the ECS borrow before
-        // touching the Rng (rng.d100 doesn't borrow the ECS but the
-        // Worn ref is &; keeping it open across a self.rng call is fine
-        // but the small alloc keeps the surface simple).
-        let pieces: Vec<(u8, crate::combat::ArmorDr)> = worn
+        let pieces: Vec<(u8, crate::combat::ArmorDr, Option<crate::items::ItemKind>)> = worn
             .pieces
             .iter()
             .filter(|p| p.regions.contains(part))
-            .map(|p| (p.coverage_pct, p.dr))
+            .map(|p| (p.coverage_pct, p.dr, p.item_kind))
             .collect();
         drop(worn);
         let mut total = crate::combat::ArmorDr::default();
-        for (coverage_pct, dr) in pieces {
+        let mut caught: Vec<crate::items::ItemKind> = Vec::new();
+        for (coverage_pct, dr, kind) in pieces {
             let roll = self.rng.d100();
             if roll <= coverage_pct {
                 total.bash = total.bash.saturating_add(dr.bash);
                 total.cut = total.cut.saturating_add(dr.cut);
                 total.stab = total.stab.saturating_add(dr.stab);
+                if let Some(k) = kind {
+                    caught.push(k);
+                }
             }
         }
-        total
+        (total, caught)
     }
 
     fn attacker_loadout(&self, e: Entity) -> Option<(crate::combat::AttackerStats, crate::items::ItemKind)> {
@@ -5549,6 +5614,49 @@ mod tests {
         let after = world.player_skills().ranged;
         let advanced = after.value > before_value || after.daily_xp > before_daily;
         assert!(advanced, "shot should grant Ranged XP (value or daily)");
+    }
+
+    #[test]
+    fn knife_swing_grants_knife_proficiency_xp_on_hit() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let bandit = drop_test_bandit(&mut world, 1, 0);
+        let before = world.player_skills().proficiencies.knife;
+        // Run several swings; some will miss the hit-roll so check
+        // that at least one of them lifted the knife pool.
+        for _ in 0..20 {
+            world.perform_melee_attack(world.player, bandit, 1);
+        }
+        let after = world.player_skills().proficiencies.knife;
+        let advanced = after.value > before.value || after.daily_xp > before.daily_xp;
+        assert!(advanced, "knife hit should grant Knife proficiency XP");
+    }
+
+    #[test]
+    fn padded_doublet_catch_grants_light_armor_xp() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Dress the player in a padded doublet so a hostile swing
+        // routes damage through the LightArmor layer.
+        let doublet = ArmorPiece {
+            regions: BodyRegionMask::empty()
+                .with(crate::combat::BodyPart::Torso)
+                .with(crate::combat::BodyPart::LArm)
+                .with(crate::combat::BodyPart::RArm),
+            coverage_pct: 100,
+            dr: crate::combat::ArmorDr { bash: 4, cut: 2, stab: 1 },
+            encumbrance: 2,
+            item_kind: Some(crate::items::ItemKind::PaddedDoublet),
+        };
+        let _ = world
+            .ecs
+            .insert_one(world.player, Worn::new(vec![doublet]));
+        let bandit = drop_test_bandit(&mut world, 1, 0);
+        let before = world.player_skills().light_armor;
+        for _ in 0..20 {
+            world.perform_melee_attack(bandit, world.player, 1);
+        }
+        let after = world.player_skills().light_armor;
+        let advanced = after.value > before.value || after.daily_xp > before.daily_xp;
+        assert!(advanced, "doublet catching a hit should grant LightArmor XP");
     }
 
     #[test]

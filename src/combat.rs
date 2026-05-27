@@ -347,6 +347,25 @@ pub fn proficiency_for(kind: ItemKind) -> Option<crate::skill::Proficiency> {
     })
 }
 
+/// PR A card 3 — which top-level armor-class skill a worn armor
+/// `ItemKind` trains when its layer catches a hit. Padded/leather =
+/// LightArmor; iron mail and helms = MediumArmor; coat-of-plates +
+/// great helm = HeavyArmor. Returns `None` for shields and any worn
+/// item that doesn't sort into a class.
+pub fn armor_skill_for(kind: ItemKind) -> Option<crate::skill::SkillKind> {
+    use crate::skill::SkillKind;
+    Some(match kind {
+        ItemKind::PaddedDoublet | ItemKind::LeatherJerkin => SkillKind::LightArmor,
+        ItemKind::Hauberk
+        | ItemKind::MailChausses
+        | ItemKind::MailCoif
+        | ItemKind::IronSkullcap
+        | ItemKind::KettleHat => SkillKind::MediumArmor,
+        ItemKind::CoatOfPlates | ItemKind::GreatHelm => SkillKind::HeavyArmor,
+        _ => return None,
+    })
+}
+
 fn roll_die(max: u16, rng: &mut Rng) -> u16 {
     if max == 0 {
         return 0;
