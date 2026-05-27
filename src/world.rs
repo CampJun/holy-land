@@ -248,9 +248,11 @@ pub enum GroundCover {
 /// burnt-out groves) — see assets/CP437_MAP.md.
 pub const TREE_VARIANT_GLYPHS: &[u8] = &[0x05, 0x06, 0x17, 0x18];
 
-/// Iteration order for `TerrainKind::from_save_key`. Keep in sync with
-/// the enum variants — adding a kind here makes from_save_key find it.
-const ALL_TERRAINS: &[TerrainKind] = &[
+/// Canonical iteration order for `TerrainKind::from_save_key`. Keep in
+/// sync with the enum variants — adding a kind here makes from_save_key
+/// find it. The in-game tile-remap UI uses `REMAPPABLE_TERRAINS`
+/// (a filtered subset) instead.
+pub const ALL_TERRAINS: &[TerrainKind] = &[
     TerrainKind::Grass,
     TerrainKind::BareDirt,
     TerrainKind::SandShore,
@@ -260,6 +262,21 @@ const ALL_TERRAINS: &[TerrainKind] = &[
     TerrainKind::Wall,
     TerrainKind::StoneWall,
     TerrainKind::WoodWall,
+    TerrainKind::Floor,
+    TerrainKind::CobbleRoad,
+];
+
+/// Subset of `ALL_TERRAINS` shown in the tile-remap UI. Walls and the
+/// OOB sentinel are excluded — `StoneWall` / `WoodWall` auto-tile via
+/// `wall_connector_glyph` and don't have a single representative glyph;
+/// `Wall` is internal (out-of-loaded-chunks sentinel).
+pub const REMAPPABLE_TERRAINS: &[TerrainKind] = &[
+    TerrainKind::Grass,
+    TerrainKind::BareDirt,
+    TerrainKind::SandShore,
+    TerrainKind::TreeTrunk,
+    TerrainKind::StreamWater,
+    TerrainKind::PondWater,
     TerrainKind::Floor,
     TerrainKind::CobbleRoad,
 ];
@@ -274,6 +291,14 @@ impl TerrainKind {
 
     pub fn from_save_key(s: &str) -> Option<Self> {
         ALL_TERRAINS.iter().copied().find(|t| t.def().save_key == s)
+    }
+
+    /// True for kinds that connect via the wall auto-tiling tables in
+    /// `wall_connector_glyph`. Excludes `Wall` (the OOB sentinel).
+    /// TODO: add future `Door` / `Gate` kinds here so wall runs stitch
+    /// across openings.
+    pub fn is_wall_like(self) -> bool {
+        matches!(self, TerrainKind::StoneWall | TerrainKind::WoodWall)
     }
 
     /// Cells where weather (snow, frost, rain) can land directly.
@@ -457,6 +482,60 @@ impl TerrainKind {
                 blocks_sight: false,
             },
         }
+    }
+}
+
+/// Neighbor-aware connector glyph for a wall cell. Reads the 4 cardinal
+/// neighbors via `World::tile_at` and picks the matching CP437
+/// box-drawing glyph from the thick (double-line) or thin (single-line)
+/// set depending on `kind`. Cross-tier neighbors still count as
+/// connections — a thin house wall abutting Exeter's thick perimeter
+/// renders connected (the perimeter cell picks its thick stub or T,
+/// the house cell picks its thin stub or T). Isolated cell (no wall
+/// neighbors) renders as a vertical pillar.
+pub fn wall_connector_glyph(world: &World, wx: i64, wy: i64, kind: TerrainKind) -> u8 {
+    let n = world.tile_at(wx, wy - 1).is_wall_like();
+    let s = world.tile_at(wx, wy + 1).is_wall_like();
+    let e = world.tile_at(wx + 1, wy).is_wall_like();
+    let w = world.tile_at(wx - 1, wy).is_wall_like();
+    match kind {
+        TerrainKind::StoneWall => match (n, s, e, w) {
+            (true, true, true, true) => 0xCE,    // ╬
+            (true, true, true, false) => 0xCC,   // ╠
+            (true, true, false, true) => 0xB9,   // ╣
+            (true, false, true, true) => 0xCA,   // ╩
+            (false, true, true, true) => 0xCB,   // ╦
+            (true, true, false, false) => 0xBA,  // ║
+            (false, false, true, true) => 0xCD,  // ═
+            (true, false, true, false) => 0xC8,  // ╚
+            (true, false, false, true) => 0xBC,  // ╝
+            (false, true, true, false) => 0xC9,  // ╔
+            (false, true, false, true) => 0xBB,  // ╗
+            (true, false, false, false) => 0xBA, // ║ (N stub)
+            (false, true, false, false) => 0xBA, // ║ (S stub)
+            (false, false, true, false) => 0xCD, // ═ (E stub)
+            (false, false, false, true) => 0xCD, // ═ (W stub)
+            (false, false, false, false) => 0xBA, // ║ isolated
+        },
+        TerrainKind::WoodWall => match (n, s, e, w) {
+            (true, true, true, true) => 0xC5,    // ┼
+            (true, true, true, false) => 0xC3,   // ├
+            (true, true, false, true) => 0xB4,   // ┤
+            (true, false, true, true) => 0xC1,   // ┴
+            (false, true, true, true) => 0xC2,   // ┬
+            (true, true, false, false) => 0xB3,  // │
+            (false, false, true, true) => 0xC4,  // ─
+            (true, false, true, false) => 0xC0,  // └
+            (true, false, false, true) => 0xD9,  // ┘
+            (false, true, true, false) => 0xDA,  // ┌
+            (false, true, false, true) => 0xBF,  // ┐
+            (true, false, false, false) => 0xB3, // │ (N stub)
+            (false, true, false, false) => 0xB3, // │ (S stub)
+            (false, false, true, false) => 0xC4, // ─ (E stub)
+            (false, false, false, true) => 0xC4, // ─ (W stub)
+            (false, false, false, false) => 0xB3, // │ isolated
+        },
+        _ => kind.def().glyph,
     }
 }
 
@@ -4175,6 +4254,118 @@ mod tests {
         assert_eq!(world.tile_at(CHUNK_W as i64, 5), TerrainKind::Wall);
         assert_eq!(world.tile_at(5, -1), TerrainKind::Wall);
         assert_eq!(world.tile_at(5, CHUNK_H as i64), TerrainKind::Wall);
+    }
+
+    /// Clear a `(2*radius+1)`-square of cells around (cx, cy) to
+    /// `BareDirt` so neighbor-aware tests don't pick up procgen
+    /// content (the origin chunk is Exeter — walls everywhere).
+    fn clear_test_patch(world: &mut World, cx: i64, cy: i64, radius: i64) {
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                world.set_terrain_at(cx + dx, cy + dy, TerrainKind::BareDirt);
+            }
+        }
+    }
+
+    #[test]
+    fn wall_connector_glyph_thick_plus_shape() {
+        // Stamp a +-shape of StoneWall centered at (10, 10) inside the
+        // loaded origin chunk. The center cell has wall neighbors on
+        // all four sides → cross. The four arm-ends have exactly one
+        // wall neighbor (back toward center) → stubs.
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        clear_test_patch(&mut world, 10, 10, 3);
+        for (x, y) in [(10, 10), (10, 9), (10, 11), (9, 10), (11, 10)] {
+            world.set_terrain_at(x, y, TerrainKind::StoneWall);
+        }
+        // Center: all four neighbors are walls → ╬
+        assert_eq!(
+            wall_connector_glyph(&world, 10, 10, TerrainKind::StoneWall),
+            0xCE
+        );
+        // North arm-end (10, 9): only south neighbor (10, 10) is wall → vertical stub ║
+        assert_eq!(
+            wall_connector_glyph(&world, 10, 9, TerrainKind::StoneWall),
+            0xBA
+        );
+        // East arm-end (11, 10): only west neighbor is wall → horizontal stub ═
+        assert_eq!(
+            wall_connector_glyph(&world, 11, 10, TerrainKind::StoneWall),
+            0xCD
+        );
+    }
+
+    #[test]
+    fn wall_connector_glyph_thick_corners() {
+        // L-shape: vertical run + horizontal run meet at (10, 10).
+        // The meeting cell has neighbors south + east → ╔.
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        clear_test_patch(&mut world, 11, 11, 4);
+        for (x, y) in [(10, 10), (10, 11), (10, 12), (11, 10), (12, 10)] {
+            world.set_terrain_at(x, y, TerrainKind::StoneWall);
+        }
+        assert_eq!(
+            wall_connector_glyph(&world, 10, 10, TerrainKind::StoneWall),
+            0xC9
+        );
+        // (12, 10): only west neighbor → horizontal stub.
+        assert_eq!(
+            wall_connector_glyph(&world, 12, 10, TerrainKind::StoneWall),
+            0xCD
+        );
+    }
+
+    #[test]
+    fn wall_connector_glyph_thick_isolated_pillar() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        clear_test_patch(&mut world, 15, 15, 2);
+        world.set_terrain_at(15, 15, TerrainKind::StoneWall);
+        // No wall neighbors → vertical pillar.
+        assert_eq!(
+            wall_connector_glyph(&world, 15, 15, TerrainKind::StoneWall),
+            0xBA
+        );
+    }
+
+    #[test]
+    fn wall_connector_glyph_thin_plus_shape() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        clear_test_patch(&mut world, 10, 10, 3);
+        for (x, y) in [(10, 10), (10, 9), (10, 11), (9, 10), (11, 10)] {
+            world.set_terrain_at(x, y, TerrainKind::WoodWall);
+        }
+        // Center: cross ┼
+        assert_eq!(
+            wall_connector_glyph(&world, 10, 10, TerrainKind::WoodWall),
+            0xC5
+        );
+        // West arm-end (9, 10): only east neighbor → horizontal stub ─.
+        assert_eq!(
+            wall_connector_glyph(&world, 9, 10, TerrainKind::WoodWall),
+            0xC4
+        );
+    }
+
+    #[test]
+    fn wall_connector_glyph_mixed_tier_connects() {
+        // A StoneWall cell with a single WoodWall neighbor to its east
+        // still picks from the thick table — but treats the thin
+        // neighbor as a connection, so it stubs east as ═, not as the
+        // isolated ║.
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        clear_test_patch(&mut world, 10, 10, 2);
+        world.set_terrain_at(10, 10, TerrainKind::StoneWall);
+        world.set_terrain_at(11, 10, TerrainKind::WoodWall);
+        assert_eq!(
+            wall_connector_glyph(&world, 10, 10, TerrainKind::StoneWall),
+            0xCD
+        );
+        // The thin cell sees its west neighbor as wall-like and stubs
+        // ─ (using its own thin table).
+        assert_eq!(
+            wall_connector_glyph(&world, 11, 10, TerrainKind::WoodWall),
+            0xC4
+        );
     }
 
     #[test]
