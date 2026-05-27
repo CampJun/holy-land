@@ -145,21 +145,31 @@ impl DeathCause {
     }
 }
 
-/// Select-button info hub tabs. Display order = `INFO_TABS`.
+/// Select-button info hub tabs. Display order = `INFO_TABS`. Attributes
+/// sits between Crafting and Skills — the trained Skills cluster feeds
+/// off the underlying Attribute baseline, so they read naturally
+/// adjacent in the tab strip.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InfoTab {
     Inventory,
     Crafting,
+    Attributes,
     Skills,
 }
 
-const INFO_TABS: &[InfoTab] = &[InfoTab::Inventory, InfoTab::Crafting, InfoTab::Skills];
+const INFO_TABS: &[InfoTab] = &[
+    InfoTab::Inventory,
+    InfoTab::Crafting,
+    InfoTab::Attributes,
+    InfoTab::Skills,
+];
 
 impl InfoTab {
     fn label(self) -> &'static str {
         match self {
             InfoTab::Inventory => "Inventory",
             InfoTab::Crafting => "Crafting",
+            InfoTab::Attributes => "Attrs",
             InfoTab::Skills => "Skills",
         }
     }
@@ -462,6 +472,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(eq) = run.player_equipment.as_ref() {
             world.set_player_equipment(save_equipment_to_world(eq));
         }
+        if let Some(a) = run.player_attributes.as_ref() {
+            world.set_player_attributes(world::Attributes {
+                str_: a.str_,
+                agi: a.agi,
+                con: a.con,
+                int_: a.int_,
+                spirit: a.spirit,
+                attribute_xp: a.attribute_xp,
+            });
+        }
+        if let Some(stride) = world::StrideMode::from_save_key(&run.player_stride) {
+            world.player_stride = stride;
+        }
+        world.player_dragging = run.player_dragging;
         if let Some(stam) = run.player_stamina.as_ref() {
             world.set_player_stamina(world::Stamina {
                 cur: stam.cur,
@@ -612,6 +636,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut radial_open: bool = false;
     let mut radial_consumed: bool = false;
 
+    // PR B Drop card: X-hold detection inside the info-hub Inventory tab.
+    // Press edge captures the pack-row index; release decides between
+    // tap (drop 1 unit) and hold (drop the whole stack) using the same
+    // 250 ms `HOLD_THRESHOLD` the Y-radial uses, mirroring the card's
+    // "tap = one unit, hold = whole stack" pattern. Goes inert when
+    // info_menu is closed or the active tab isn't Inventory.
+    let mut x_press_at: Option<(Instant, usize)> = None;
+
     // Dev tool: X-button toggles a CP437 glyph palette overlay so we
     // can audit which bytes have which sprites in our custom atlas.
     // Browse with dpad; the header shows the highlighted byte's value
@@ -722,6 +754,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // PR B Drop card: X press/release tracking for the Inventory
+        // tab. We only arm on press while a PackItem row is selected;
+        // release fires the drop with count = 1 (tap) or whole stack
+        // (hold ≥ HOLD_THRESHOLD). Releases outside Inventory mode are
+        // silently dropped.
+        let x_held = input.is_held(Action::X);
+        if x_press_at.is_none() && x_held {
+            // Only arm if the info_menu is open on Inventory and the
+            // current row is a pack item — Equipment slots are a no-op
+            // per the card (unequip first).
+            if let Some(state) = info_menu.as_ref() {
+                if matches!(state.tab, InfoTab::Inventory) {
+                    if let Some(InventoryRow::PackItem(_)) =
+                        inventory_row_at(&world, state.selected)
+                    {
+                        let slot_count = world::EquipSlot::ALL.len();
+                        let pack_idx = state.selected - slot_count;
+                        x_press_at = Some((frame_start, pack_idx));
+                    }
+                }
+            }
+        } else if x_press_at.is_some() && !x_held {
+            if let Some((t0, pack_idx)) = x_press_at.take() {
+                let is_hold = frame_start.saturating_duration_since(t0) >= HOLD_THRESHOLD;
+                let count = if is_hold {
+                    world
+                        .player_pack()
+                        .contents
+                        .get(pack_idx)
+                        .map(|i| i.count)
+                        .unwrap_or(1)
+                } else {
+                    1
+                };
+                if let Some(msg) = world.try_drop_from_pack(pack_idx, count) {
+                    world.push_message(msg);
+                }
+            }
+        }
+
         let drained_actions = input.drain();
         // Fast-travel watcher: any input action (other than the M
         // toggle that opens the map) cancels the queue. We compute this
@@ -811,10 +883,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let count = PAUSE_OPTIONS.len();
                 match input_action {
                     Action::Up => {
-                        pause_menu = Some(selected.saturating_sub(1));
+                        pause_menu = Some(wrap_index(selected, -1, count));
                     }
                     Action::Down => {
-                        pause_menu = Some((selected + 1).min(count - 1));
+                        pause_menu = Some(wrap_index(selected, 1, count));
                     }
                     Action::A => {
                         let (chosen, _) = PAUSE_OPTIONS[selected];
@@ -1121,14 +1193,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         state.selected = 0;
                     }
                     Action::Up => {
-                        if row_count > 0 {
-                            state.selected = state.selected.saturating_sub(1);
-                        }
+                        state.selected = wrap_index(state.selected, -1, row_count);
                     }
                     Action::Down => {
-                        if row_count > 0 {
-                            state.selected = (state.selected + 1).min(row_count - 1);
-                        }
+                        state.selected = wrap_index(state.selected, 1, row_count);
                     }
                     Action::A => {
                         match state.tab {
@@ -1176,7 +1244,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     None => {}
                                 }
                             }
-                            InfoTab::Skills => {}
+                            InfoTab::Attributes | InfoTab::Skills => {}
                         }
                     }
                     Action::B | Action::Select => {
@@ -1222,13 +1290,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // closes. Everything else is dropped so the world doesn't tick
             // while the player is browsing the catalog.
             if let Some(selected) = command_menu {
+                let count = action::ALL_ACTIONS.len();
                 match input_action {
                     Action::Up => {
-                        command_menu = Some(selected.saturating_sub(1));
+                        command_menu = Some(wrap_index(selected, -1, count));
                     }
                     Action::Down => {
-                        let max = action::ALL_ACTIONS.len().saturating_sub(1);
-                        command_menu = Some((selected + 1).min(max));
+                        command_menu = Some(wrap_index(selected, 1, count));
                     }
                     Action::A => {
                         let id = action::ALL_ACTIONS[selected].id;
@@ -1289,6 +1357,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         tab: InfoTab::Inventory,
                         selected: 0,
                     });
+                }
+                // PR B Wait card: desktop `.` and the Miyoo B button
+                // (B is a no-op in open world today since all menu-
+                // close paths fire B from higher-priority `continue`
+                // blocks above) both pass one tile-step of time.
+                // Holding either fires repeats via the input layer's
+                // repeat-on-hold, which approximates the card's
+                // "continuous wait" UX without a dedicated multi-turn
+                // queue wrap.
+                Action::Wait | Action::B => {
+                    match action::execute(&mut world, action::ActionId::Wait) {
+                        action::ExecuteOutcome::Done(msg) => log_debug!("{}", msg),
+                        action::ExecuteOutcome::OpenAim => {}
+                    }
                 }
                 _ => {}
             }
@@ -1997,6 +2079,17 @@ fn save_game(
     run.player_body_parts = Some(world_bp_to_save(&player_body));
     let player_eq = world.player_equipment();
     run.player_equipment = Some(world_equipment_to_save(&player_eq));
+    let attrs = world.player_attributes();
+    run.player_attributes = Some(save::AttributesSave {
+        str_: attrs.str_,
+        agi: attrs.agi,
+        con: attrs.con,
+        int_: attrs.int_,
+        spirit: attrs.spirit,
+        attribute_xp: attrs.attribute_xp,
+    });
+    run.player_stride = world.player_stride.save_key().to_string();
+    run.player_dragging = world.player_dragging;
     run.player_stamina = world.player_stamina_full().map(|s| StaminaSave {
         cur: s.cur,
         max: s.max,
@@ -2448,6 +2541,15 @@ fn draw_here_line(cells: &mut [Option<Cell>], world: &World, palette: &Palette) 
             palette.hud_bg,
         );
     }
+    // Stride indicator — flush-right under the godmode badge (or in its
+    // place when godmode is off). Per the carry/stride card: "shows
+    // current mode in the HUD here-line".
+    {
+        let stride_tag = format!("[{}]", world.player_stride.label());
+        let stride_x =
+            WORLD_W as i32 - stride_tag.len() as i32 - 1 - if world.godmode { 6 } else { 0 };
+        put_text(cells, stride_x, row, &stride_tag, palette.hud_fg, palette.hud_bg);
+    }
     let pos = world.player_pos();
     let Some(cell) = world.cell_at(pos.x as i64, pos.y as i64) else {
         return;
@@ -2720,6 +2822,19 @@ fn draw_glyph_grid(
     }
 }
 
+/// PR B menu-wrap card: shift `cur` by `delta` within `[0, len)` and
+/// wrap at both ends (Down at the bottom goes to 0, Up at 0 jumps to
+/// `len - 1`). Returns 0 on empty lists. The card replaces the four
+/// `saturating_sub` / `.min(len-1)` clamp sites in the menu input
+/// handlers with a single call.
+fn wrap_index(cur: usize, delta: i32, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let len_i = len as i64;
+    ((cur as i64 + delta as i64).rem_euclid(len_i)) as usize
+}
+
 /// Tileset picker: vertical list of discovered atlases. The currently
 /// loaded entry is marked "(current)" on the right; A confirms.
 fn draw_tileset_picker(
@@ -2871,6 +2986,8 @@ fn info_tab_row_count(world: &World, tab: InfoTab) -> usize {
         // item. A on a slot row unequips; A on a pack row equips.
         InfoTab::Inventory => world::EquipSlot::ALL.len() + world.player_pack().contents.len(),
         InfoTab::Crafting => crafting::RECIPES.len(),
+        // STR, AGI, CON, INT, SPIRIT.
+        InfoTab::Attributes => 5,
         // Fire Making, Foraging, Melee, Ranged, Dodge.
         InfoTab::Skills => 5,
     }
@@ -2931,6 +3048,7 @@ fn draw_info_menu(
     match state.tab {
         InfoTab::Inventory => draw_info_inventory(cells, &layout, world, state.selected, palette),
         InfoTab::Crafting => draw_info_crafting(cells, &layout, world, state.selected, palette),
+        InfoTab::Attributes => draw_info_attributes(cells, &layout, world, state.selected, palette),
         InfoTab::Skills => draw_info_skills(cells, &layout, world, state.selected, palette),
     }
 }
@@ -3075,6 +3193,45 @@ fn draw_info_inventory(
         palette.hud_fg,
         palette.panel_bg,
     );
+}
+
+fn draw_info_attributes(
+    cells: &mut [Option<Cell>],
+    layout: &PanelLayout,
+    world: &World,
+    selected: usize,
+    palette: &Palette,
+) {
+    let attrs = world.player_attributes();
+    // STR/AGI/CON drive combat + carry today; INT/SPIRIT are plumbed
+    // through save and shown here but inert in v1 (no system reads
+    // them yet — that lands with later cards).
+    let rows: [(&str, u8, u32); 5] = [
+        ("STR", attrs.str_, attrs.attribute_xp[0]),
+        ("AGI", attrs.agi, attrs.attribute_xp[1]),
+        ("CON", attrs.con, attrs.attribute_xp[2]),
+        ("INT", attrs.int_, attrs.attribute_xp[3]),
+        ("SPIRIT", attrs.spirit, attrs.attribute_xp[4]),
+    ];
+    // Per the Attributes card: training threshold formula is a future
+    // card; show banked XP next to the value so the tab matches the
+    // `STR 10 (xp 47/300)` mock without committing to a number yet.
+    const XP_TO_NEXT_PLACEHOLDER: u32 = 300;
+    for (i, (label, value, xp)) in rows.into_iter().enumerate() {
+        let row_y = layout.first_row_y() + i as i32;
+        let is_selected = i == selected;
+        let detail = format!("{} (xp {}/{})", value, xp, XP_TO_NEXT_PLACEHOLDER);
+        draw_menu_row(
+            cells,
+            layout,
+            row_y,
+            is_selected,
+            label,
+            palette.panel_fg,
+            Some((&detail, palette.panel_dim_fg)),
+            palette,
+        );
+    }
 }
 
 fn draw_info_skills(
@@ -3851,5 +4008,36 @@ impl Default for Palette {
             panel_dim_fg: Color::RGB(110, 100, 80),
             panel_title_fg: Color::RGB(230, 200, 120),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrap_index_handles_normal_moves_within_bounds() {
+        assert_eq!(wrap_index(2, 1, 5), 3);
+        assert_eq!(wrap_index(2, -1, 5), 1);
+    }
+
+    #[test]
+    fn wrap_index_wraps_at_both_ends() {
+        // Past the end → back to 0.
+        assert_eq!(wrap_index(4, 1, 5), 0);
+        // Before 0 → jumps to last.
+        assert_eq!(wrap_index(0, -1, 5), 4);
+    }
+
+    #[test]
+    fn wrap_index_returns_zero_for_empty_list() {
+        assert_eq!(wrap_index(0, 1, 0), 0);
+        assert_eq!(wrap_index(0, -1, 0), 0);
+    }
+
+    #[test]
+    fn wrap_index_handles_single_entry_list_stably() {
+        assert_eq!(wrap_index(0, 1, 1), 0);
+        assert_eq!(wrap_index(0, -1, 1), 0);
     }
 }

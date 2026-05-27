@@ -28,6 +28,12 @@ pub enum Action {
     /// Toggle the full-screen Cornwall overmap. Bound to `M` on desktop;
     /// the Miyoo binding lands later as a Select+R chord.
     OpenOvermap,
+    /// PR B Wait card: explicit pass-turn binding. Bound to `.` (period)
+    /// on desktop. Miyoo lacks a dedicated wait key — the open-world
+    /// input handler interprets `B` (a no-op in the open world today,
+    /// since menu-close uses `B` only after higher-priority blocks
+    /// already short-circuited) as Wait instead.
+    Wait,
 }
 
 const INITIAL_DELAY: Duration = Duration::from_millis(250);
@@ -172,6 +178,7 @@ fn keycode_to_action(kc: Keycode) -> Option<Action> {
         Keycode::Escape => Action::Start,
         Keycode::LShift | Keycode::RShift => Action::Select,
         Keycode::M => Action::OpenOvermap,
+        Keycode::Period => Action::Wait,
         _ => return None,
     })
 }

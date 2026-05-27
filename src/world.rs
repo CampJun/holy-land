@@ -47,13 +47,90 @@ pub const DUSK_HOUR: u64 = 20;
 /// compose by changing the speed input — not by special-casing verbs.
 pub const MOVES_PER_SECOND: u32 = 100;
 
-/// World-primitive action cost for a single tile step. Each verb's costs
-/// live in `action.rs` next to its eval/execute code per STYLE.md §2 —
-/// but movement is not a menu verb (it's a direct dpad mapping), so its
-/// cost lives where `try_move_player` consumes it. 500 moves at the
-/// baseline speed of 100 = 5 game-seconds per tile (preserves slice-1
-/// pacing pre-combat-foundation).
+/// World-primitive action cost for a single tile step at `StrideMode::Creep`.
+/// Each verb's costs live in `action.rs` next to its eval/execute code per
+/// STYLE.md §2 — but movement is not a menu verb (it's a direct dpad
+/// mapping), so its cost lives where `try_move_player` consumes it. 500
+/// moves at the baseline speed of 100 = 5 game-seconds per tile (canonical
+/// 1 cell = 5 ft, ≈0.68 mph creep). `StrideMode::Walk` and `Jog` scale
+/// this through `World::tile_step_cost`.
 pub const MOVE_COST_TILE: u32 = 500;
+
+/// PR B stride card: tile-step pace selector. Cycled via the command menu.
+/// Default = `Creep` (the card's "cautious-roguelike default" preserving
+/// the canonical 5 sec/tile pacing); Walk and Jog are opt-in faster
+/// modes selected via the command menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum StrideMode {
+    #[default]
+    Creep,
+    Walk,
+    Jog,
+}
+
+impl StrideMode {
+    /// Tile-step cost in moves at this stride. Per the
+    /// `Real world scale carry overload and stride modes` card.
+    pub fn tile_cost(self) -> u32 {
+        match self {
+            StrideMode::Creep => MOVE_COST_TILE,
+            StrideMode::Walk => 110,
+            StrideMode::Jog => 50,
+        }
+    }
+
+    /// Stamina drain per tile at this stride. Only Jog burns stamina in
+    /// v1 — Walk's over-free-carry drain is queued for a follow-up.
+    pub fn stamina_per_tile(self) -> i16 {
+        match self {
+            StrideMode::Jog => 2,
+            _ => 0,
+        }
+    }
+
+    /// Cycle order matches the command-menu prompt (Creep → Walk → Jog → Creep).
+    pub fn cycle_next(self) -> Self {
+        match self {
+            StrideMode::Creep => StrideMode::Walk,
+            StrideMode::Walk => StrideMode::Jog,
+            StrideMode::Jog => StrideMode::Creep,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            StrideMode::Creep => "Creep",
+            StrideMode::Walk => "Walk",
+            StrideMode::Jog => "Jog",
+        }
+    }
+
+    pub fn save_key(self) -> &'static str {
+        match self {
+            StrideMode::Creep => "creep",
+            StrideMode::Walk => "walk",
+            StrideMode::Jog => "jog",
+        }
+    }
+
+    pub fn from_save_key(s: &str) -> Option<Self> {
+        match s {
+            "creep" => Some(StrideMode::Creep),
+            "walk" => Some(StrideMode::Walk),
+            "jog" => Some(StrideMode::Jog),
+            _ => None,
+        }
+    }
+}
+
+/// Below this stamina threshold the player can't initiate Jog and an
+/// active Jog auto-falls back to Walk. Per the carry/stride card.
+pub const STRIDE_JOG_STAMINA_FLOOR: i16 = 20;
+
+/// PR B Drop card: move-cost for dropping items from the pack onto the
+/// player's cell. Matches Pickup's 300 moves — the verb mirrors Pickup
+/// in cost and shape (the card says "cost ~300 moves").
+pub const DROP_MOVE_COST: u32 = 300;
 
 /// Phase-9 multi-turn interrupt threshold. When any need drops below this
 /// during a multi-turn tick, the active action queue cancels and control
@@ -664,22 +741,28 @@ pub struct BodyParts {
 }
 
 impl BodyParts {
-    /// Per-part max-HP scale used by both player and bandit baselines.
-    /// Phase 3 will scale these by the Stam attribute per the damage-
-    /// math card; phase 2 keeps them flat.
+    /// Per-part max-HP scale at `CON = Attributes::BASELINE` (= 10).
+    /// `starting_human_with_con` scales linearly off these — CON 10
+    /// reproduces the original numbers, CON 20 doubles them.
     pub const HEAD_MAX: i16 = 40;
     pub const TORSO_MAX: i16 = 80;
     pub const ARM_MAX: i16 = 60;
     pub const LEG_MAX: i16 = 60;
 
     pub fn starting_human() -> Self {
+        Self::starting_human_with_con(Attributes::BASELINE)
+    }
+
+    pub fn starting_human_with_con(con: u8) -> Self {
+        let scale = con as i16;
+        let denom = Attributes::BASELINE as i16;
         Self {
-            head: BodyPartHp::full(Self::HEAD_MAX),
-            torso: BodyPartHp::full(Self::TORSO_MAX),
-            l_arm: BodyPartHp::full(Self::ARM_MAX),
-            r_arm: BodyPartHp::full(Self::ARM_MAX),
-            l_leg: BodyPartHp::full(Self::LEG_MAX),
-            r_leg: BodyPartHp::full(Self::LEG_MAX),
+            head: BodyPartHp::full(Self::HEAD_MAX * scale / denom),
+            torso: BodyPartHp::full(Self::TORSO_MAX * scale / denom),
+            l_arm: BodyPartHp::full(Self::ARM_MAX * scale / denom),
+            r_arm: BodyPartHp::full(Self::ARM_MAX * scale / denom),
+            l_leg: BodyPartHp::full(Self::LEG_MAX * scale / denom),
+            r_leg: BodyPartHp::full(Self::LEG_MAX * scale / denom),
         }
     }
 
@@ -1156,6 +1239,14 @@ pub fn spawn_humanoid_bandit(
         BanditTier::Sergeant => CombatSkills::starting_sergeant(),
         BanditTier::Knight => CombatSkills::starting_knight(),
     };
+    let attrs = match tier {
+        // Rabble = peasants in revolt: average human attributes (the
+        // tier's weakness is in CombatSkills, not raw STR/AGI/CON).
+        BanditTier::Rabble => Attributes::starting_player(),
+        BanditTier::Yeoman => Attributes::starting_bandit(),
+        BanditTier::Sergeant => Attributes::starting_sergeant(),
+        BanditTier::Knight => Attributes::starting_knight(),
+    };
     let entity = ecs.spawn((
         pos,
         Renderable {
@@ -1164,12 +1255,13 @@ pub fn spawn_humanoid_bandit(
             bg: [20, 17, 13, 255],
         },
         Speed::default(),
-        BodyParts::starting_human(),
+        BodyParts::starting_human_with_con(attrs.con),
         Hostile,
         Ai(AiKind::ChaseAndBump),
         CornishBandit,
         Wielded(main_hand),
         skills,
+        attrs,
         worn_from_items(&worn_kinds),
         Stamina::starting_human(),
     ));
@@ -1376,8 +1468,6 @@ pub struct CombatSkills {
     pub dodge: i16,
     /// Stand-in for the per-weapon proficiency the phase-3 card unlocks.
     pub weapon_prof: i16,
-    pub str_bonus: i16,
-    pub agi_mod: i16,
     pub encumbrance: i16,
 }
 
@@ -1391,8 +1481,6 @@ impl CombatSkills {
             melee: 6,
             dodge: 4,
             weapon_prof: 1,
-            str_bonus: 1,
-            agi_mod: 1,
             encumbrance: 0,
         }
     }
@@ -1406,8 +1494,6 @@ impl CombatSkills {
             melee: 7,
             dodge: 5,
             weapon_prof: 1,
-            str_bonus: 1,
-            agi_mod: 0,
             encumbrance: 0,
         }
     }
@@ -1419,8 +1505,6 @@ impl CombatSkills {
             melee: 3,
             dodge: 3,
             weapon_prof: 0,
-            str_bonus: 0,
-            agi_mod: 0,
             encumbrance: 0,
         }
     }
@@ -1432,8 +1516,6 @@ impl CombatSkills {
             melee: 12,
             dodge: 8,
             weapon_prof: 3,
-            str_bonus: 2,
-            agi_mod: 1,
             encumbrance: 0,
         }
     }
@@ -1445,10 +1527,78 @@ impl CombatSkills {
             melee: 18,
             dodge: 10,
             weapon_prof: 5,
-            str_bonus: 3,
-            agi_mod: 1,
             encumbrance: 0,
         }
+    }
+}
+
+/// Five core attributes — `STR AGI CON INT SPIRIT`. Per the Attributes
+/// card (`obsidian/Survival.md` Drafts): 10 = average human, 20 = peak
+/// human. `str_bonus()` and `agi_mod()` are linear deltas from 10 —
+/// combat reads these via `attacker_loadout` / `defender_stats` rather
+/// than carrying a separate stat on `CombatSkills`. `int_` and `spirit`
+/// are inert in v1 — plumbed for save + Attributes tab display but no
+/// system reads them yet. `attribute_xp` is the use-based train-up
+/// ledger (CDDA-style per `Combat - Skill XP sources` card); thresholds
+/// land in a later card.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Attributes {
+    pub str_: u8,
+    pub agi: u8,
+    pub con: u8,
+    pub int_: u8,
+    pub spirit: u8,
+    pub attribute_xp: [u32; 5],
+}
+
+impl Attributes {
+    pub const BASELINE: u8 = 10;
+
+    pub fn starting_player() -> Self {
+        Self {
+            str_: Self::BASELINE,
+            agi: Self::BASELINE,
+            con: Self::BASELINE,
+            int_: Self::BASELINE,
+            spirit: Self::BASELINE,
+            attribute_xp: [0; 5],
+        }
+    }
+
+    /// Yeoman-tier bandit: same body as the player. The previous
+    /// `CombatSkills.str_bonus = 1` rolled into `STR = 11`.
+    pub fn starting_bandit() -> Self {
+        Self { str_: 11, ..Self::starting_player() }
+    }
+
+    /// Sergeant-tier. Previous `str_bonus = 2, agi_mod = 1` → STR 12, AGI 11.
+    pub fn starting_sergeant() -> Self {
+        Self {
+            str_: 12,
+            agi: 11,
+            ..Self::starting_player()
+        }
+    }
+
+    /// Knight-tier. Previous `str_bonus = 3, agi_mod = 1` → STR 13, AGI 11.
+    pub fn starting_knight() -> Self {
+        Self {
+            str_: 13,
+            agi: 11,
+            ..Self::starting_player()
+        }
+    }
+
+    /// Damage / to-hit bonus from STR — linear delta from baseline 10.
+    #[inline]
+    pub fn str_bonus(self) -> i16 {
+        self.str_ as i16 - Self::BASELINE as i16
+    }
+
+    /// Dodge / to-hit modifier from AGI — linear delta from baseline 10.
+    #[inline]
+    pub fn agi_mod(self) -> i16 {
+        self.agi as i16 - Self::BASELINE as i16
     }
 }
 
@@ -1518,6 +1668,20 @@ pub struct World {
     /// at 0 HP. main.rs reads this each frame for the death overlay
     /// alongside the existing needs-based gate. Cleared on new-run.
     pub player_killed_by_combat: bool,
+    /// Player's tile-step pace selector. Default = `Walk`. Cycled via
+    /// the command-menu `CycleStride` verb. Persists across save load
+    /// through the additive `RunSave.player_stride` field. Hostiles
+    /// don't have a stride — bandit speed is the `Speed` ECS component
+    /// for now.
+    pub player_stride: StrideMode,
+    /// PR B Drag card: the player is currently dragging a `Log`. Set
+    /// via `ActionId::DragStart`, cleared via `DragEnd`. While true:
+    /// tile-step cost in `spend_player_tile_step` doubles per the
+    /// card's "2× movement cost while dragging" rule, and
+    /// `try_move_player` slides a `Log` ItemKind from the player's
+    /// old cell to the new cell as the player walks. The drag breaks
+    /// silently if the log is gone (e.g. the player chopped it up).
+    pub player_dragging: bool,
     /// PR A card 4: whether the player's crossbow currently has a bolt
     /// chambered. The Aim verb refuses to fire an unloaded crossbow;
     /// the Reload verb sets this true at heavy move/stamina cost.
@@ -1627,6 +1791,7 @@ impl World {
         let mut ecs = Ecs::new();
         let (sx, sy) = crate::cornwall::EXETER_SPAWN_CELL;
         let spawn = Position { x: sx, y: sy };
+        let player_attrs = Attributes::starting_player();
         let player = ecs.spawn((
             Player,
             spawn,
@@ -1639,8 +1804,9 @@ impl World {
             Needs::starting(),
             Skills::starting(),
             Speed::default(),
-            BodyParts::starting_human(),
+            BodyParts::starting_human_with_con(player_attrs.con),
             CombatSkills::starting_player(),
+            player_attrs,
             Stamina::starting_human(),
             // Player's equipment is the source of truth; Wielded /
             // OffHand / Worn are derived caches kept in sync via
@@ -1671,6 +1837,8 @@ impl World {
             godmode: false,
             message_log: VecDeque::new(),
             player_killed_by_combat: false,
+            player_stride: StrideMode::default(),
+            player_dragging: false,
             crossbow_loaded: false,
         };
         // First-frame FOV so the renderer doesn't draw a black screen on
@@ -2030,8 +2198,17 @@ impl World {
         // chunk's bounds) — ensure_chunk_ring above already loaded the
         // target ring, so any in-world cell is now reachable.
         if self.godmode || self.cell_walkable_at(nx as i64, ny as i64) {
+            // Capture player's pre-move cell so a dragged log slides
+            // from there onto the new player cell. Done before
+            // `set_player_pos` so the source cell is still authoritative.
+            let dragging = self.player_dragging;
+            let from_x = pos.x as i64;
+            let from_y = pos.y as i64;
             self.set_player_pos(Position { x: nx, y: ny });
-            self.spend_moves(MOVE_COST_TILE);
+            if dragging {
+                self.slide_dragged_log(from_x, from_y, nx as i64, ny as i64);
+            }
+            self.spend_player_tile_step();
             self.recompute_fov();
             // After the player moves, any hostile in the chunk gets a
             // turn. Phase 1 wakes hostiles via player-action ticks (no
@@ -2039,6 +2216,98 @@ impl World {
             // proper CDDA speed-based interleaving.
             self.tick_hostiles();
         }
+    }
+
+    /// PR B Drag card: slide one `Log` ItemKind from `(from_x, from_y)`
+    /// to `(to_x, to_y)`, merging into any existing log stack on the
+    /// destination. If no log exists on the source cell (the player
+    /// chopped or dropped it elsewhere), silently clears the dragging
+    /// flag — the chain breaks invisibly rather than leaving the
+    /// player perpetually "dragging" nothing.
+    fn slide_dragged_log(&mut self, from_x: i64, from_y: i64, to_x: i64, to_y: i64) {
+        let log = match self.cell_at_mut(from_x, from_y) {
+            Some(cell) => match cell.items.iter().position(|i| i.kind == crate::items::ItemKind::Log) {
+                Some(idx) => Some(cell.items.remove(idx)),
+                None => None,
+            },
+            None => None,
+        };
+        let Some(log) = log else {
+            self.player_dragging = false;
+            return;
+        };
+        self.try_drop_to_cell_at(to_x, to_y, log);
+    }
+
+    /// Place an `ItemInstance` on an arbitrary cell, merging same-kind
+    /// fungibles per `try_drop_to_cell`. Used by the drag-slide path
+    /// when the destination isn't the player's current cell.
+    pub fn try_drop_to_cell_at(&mut self, wx: i64, wy: i64, item: crate::items::ItemInstance) {
+        let Some(cell) = self.cell_at_mut(wx, wy) else {
+            return;
+        };
+        if item.kind.is_fungible()
+            && matches!(item.metadata, crate::items::ItemMetadata::None)
+            && item.charges.is_none()
+        {
+            if let Some(existing) = cell.items.iter_mut().find(|i| {
+                i.kind == item.kind
+                    && matches!(i.metadata, crate::items::ItemMetadata::None)
+                    && i.charges.is_none()
+                    && i.weight_g_each == item.weight_g_each
+            }) {
+                existing.count = existing.count.saturating_add(item.count);
+                return;
+            }
+        }
+        cell.items.push(item);
+    }
+
+    /// Pay the player's stride-adjusted tile-step cost: charges
+    /// `stride.tile_cost()` moves, then drains Jog stamina (if any).
+    /// An active Jog auto-falls to Walk once stamina sinks below
+    /// `STRIDE_JOG_STAMINA_FLOOR`. The cycle entrypoint mirrors the
+    /// same gate so the player can't initiate Jog while exhausted.
+    pub fn spend_player_tile_step(&mut self) {
+        if matches!(self.player_stride, StrideMode::Jog) {
+            let stam = self
+                .ecs
+                .get::<&Stamina>(self.player)
+                .map(|s| s.cur)
+                .unwrap_or(i16::MAX);
+            if stam < STRIDE_JOG_STAMINA_FLOOR {
+                self.player_stride = StrideMode::Walk;
+            }
+        }
+        let stride = self.player_stride;
+        // PR B Drag card: 2× movement cost while dragging a log.
+        // Composes with stride — a Jog drag is 2× of Jog's already-
+        // fast 0.5 sec/tile = 1.0 sec/tile, etc.
+        let drag_mul: u32 = if self.player_dragging { 2 } else { 1 };
+        self.spend_moves(stride.tile_cost() * drag_mul);
+        let drain = stride.stamina_per_tile();
+        if drain > 0 {
+            self.spend_stamina(self.player, drain);
+        }
+    }
+
+    /// Cycle player stride Creep → Walk → Jog → Creep. Skips Jog when
+    /// stamina is below the gate, falling through to Creep on the next
+    /// call. Returns the new stride so callers can log a message.
+    pub fn cycle_player_stride(&mut self) -> StrideMode {
+        let mut next = self.player_stride.cycle_next();
+        if matches!(next, StrideMode::Jog) {
+            let stam = self
+                .ecs
+                .get::<&Stamina>(self.player)
+                .map(|s| s.cur)
+                .unwrap_or(i16::MAX);
+            if stam < STRIDE_JOG_STAMINA_FLOOR {
+                next = StrideMode::Creep;
+            }
+        }
+        self.player_stride = next;
+        next
     }
 
     /// Player's currently-wielded weapon profile, if any. Used by the
@@ -2104,6 +2373,31 @@ impl World {
             .ecs
             .get::<&mut Skills>(self.player)
             .expect("player has Skills") = skills;
+    }
+
+    pub fn player_attributes(&self) -> Attributes {
+        self.ecs
+            .get::<&Attributes>(self.player)
+            .map(|a| *a)
+            .unwrap_or_else(|_| Attributes::starting_player())
+    }
+
+    pub fn set_player_attributes(&mut self, attrs: Attributes) {
+        let exists = self.ecs.satisfies::<&Attributes>(self.player).unwrap_or(false);
+        if exists {
+            if let Ok(mut a) = self.ecs.get::<&mut Attributes>(self.player) {
+                *a = attrs;
+            }
+        } else {
+            let _ = self.ecs.insert_one(self.player, attrs);
+        }
+        // STR drives the pack carry ceiling — sync it now so attribute
+        // changes (load, future train-ups) propagate without waiting
+        // for the next pickup. Bandits don't carry packs, so this only
+        // applies to the player.
+        if let Ok(mut pack) = self.ecs.get::<&mut crate::items::Pack>(self.player) {
+            pack.capacity_g = crate::items::derived_pack_cap_g(attrs.str_);
+        }
     }
 
     /// Read the player's per-body-part HP for save serialization.
@@ -3039,6 +3333,45 @@ impl World {
         picked
     }
 
+    /// PR B Drop card: place a single `ItemInstance` on the player's
+    /// current cell, merging into an existing same-kind / same-metadata
+    /// stack when possible. Mirrors `Pack::try_add` merge rules so the
+    /// drop ↔ pickup round-trip doesn't fragment stacks.
+    pub fn try_drop_to_cell(&mut self, item: crate::items::ItemInstance) {
+        let pos = self.player_pos();
+        self.try_drop_to_cell_at(pos.x as i64, pos.y as i64, item);
+    }
+
+    /// PR B Drop card: drop `count` units from `pack_idx` of the player's
+    /// pack onto the player's cell. Tap-X drops one (count = 1); hold-X
+    /// past 250 ms drops the whole stack. Spends `DROP_MOVE_COST` moves
+    /// on success. Returns a status message for the HUD log; returns
+    /// `None` if the index is out of range (silent no-op).
+    pub fn try_drop_from_pack(&mut self, pack_idx: usize, count: u16) -> Option<String> {
+        // Lift the item out of the pack first so we don't hold a mutable
+        // borrow while calling `try_drop_to_cell` (which also takes
+        // `&mut self`).
+        let to_drop = {
+            let mut pack = self.player_pack_mut();
+            let item = pack.contents.get(pack_idx)?;
+            let take = count.min(item.count).max(1);
+            if take >= item.count {
+                pack.contents.remove(pack_idx)
+            } else {
+                let mut split = item.clone();
+                split.count = take;
+                let item_mut = &mut pack.contents[pack_idx];
+                item_mut.count -= take;
+                split
+            }
+        };
+        let label = to_drop.display_label();
+        let dropped_count = to_drop.count;
+        self.try_drop_to_cell(to_drop);
+        self.spend_moves(DROP_MOVE_COST);
+        Some(format!("dropped {} {}", dropped_count, label))
+    }
+
     /// Snapshot all non-empty cells across loaded chunks. Used by the save
     /// path. Coords are world-coords (slice 1 always world == local since
     /// chunk (0, 0) starts at (0, 0)).
@@ -3456,13 +3789,14 @@ impl World {
         let kind = self.ecs.get::<&Wielded>(e).ok().map(|w| w.0)?;
         let ranged = kind.def().ranged?;
         let skills = self.ecs.get::<&CombatSkills>(e).ok()?;
+        let attrs = self.ecs.get::<&Attributes>(e).ok();
         let atk = crate::combat::AttackerStats {
             // Ranged uses melee skill as a stand-in until phase 9 splits
             // Melee + Ranged into separate top-level skills.
             melee_skill: skills.melee,
             weapon_prof: skills.weapon_prof,
-            agi_mod: skills.agi_mod,
-            str_bonus: skills.str_bonus,
+            agi_mod: attrs.as_deref().map(|a| a.agi_mod()).unwrap_or(0),
+            str_bonus: attrs.as_deref().map(|a| a.str_bonus()).unwrap_or(0),
         };
         Some((atk, kind, ranged))
     }
@@ -3643,12 +3977,13 @@ impl World {
     fn attacker_loadout(&self, e: Entity) -> Option<(crate::combat::AttackerStats, crate::items::ItemKind)> {
         let wielded = self.ecs.get::<&Wielded>(e).ok()?;
         let skills = self.ecs.get::<&CombatSkills>(e).ok()?;
+        let attrs = self.ecs.get::<&Attributes>(e).ok();
         Some((
             crate::combat::AttackerStats {
                 melee_skill: skills.melee,
                 weapon_prof: skills.weapon_prof,
-                agi_mod: skills.agi_mod,
-                str_bonus: skills.str_bonus,
+                agi_mod: attrs.as_deref().map(|a| a.agi_mod()).unwrap_or(0),
+                str_bonus: attrs.as_deref().map(|a| a.str_bonus()).unwrap_or(0),
             },
             wielded.0,
         ))
@@ -3658,6 +3993,7 @@ impl World {
         let Ok(skills) = self.ecs.get::<&CombatSkills>(e) else {
             return crate::combat::DefenderStats::default();
         };
+        let attrs = self.ecs.get::<&Attributes>(e).ok();
         let worn_enc = self
             .ecs
             .get::<&Worn>(e)
@@ -3684,7 +4020,7 @@ impl World {
         };
         crate::combat::DefenderStats {
             dodge_skill: skills.dodge,
-            agi_mod: skills.agi_mod,
+            agi_mod: attrs.as_deref().map(|a| a.agi_mod()).unwrap_or(0),
             encumbrance: skills.encumbrance + worn_enc + stam_penalty + grappled_pen + prone_pen,
         }
     }
@@ -3845,13 +4181,13 @@ impl World {
     fn str_contest(&mut self, attacker: Entity, target: Entity) -> bool {
         let atk_str = self
             .ecs
-            .get::<&CombatSkills>(attacker)
-            .map(|s| s.str_bonus)
+            .get::<&Attributes>(attacker)
+            .map(|a| a.str_bonus())
             .unwrap_or(0);
         let def_str = self
             .ecs
-            .get::<&CombatSkills>(target)
-            .map(|s| s.str_bonus)
+            .get::<&Attributes>(target)
+            .map(|a| a.str_bonus())
             .unwrap_or(0);
         let stam_pen = self
             .ecs
@@ -4708,13 +5044,15 @@ mod tests {
         let pos = world.player_pos();
         let east_x = pos.x + 1;
         let east_y = pos.y;
-        // Replace the existing debris with a single 10 kg boulder.
+        // STR-10 momentary-lift cap is ≈113 kg, so a single 200 kg
+        // monolith won't fit in the starting kit's slack regardless of
+        // what else is in the pack.
         if let Some(c) = world.cell_at_mut(east_x as i64, east_y as i64) {
             c.items.clear();
             c.items.push(ItemInstance::stack(
                 ItemKind::Stone,
                 1,
-                10_000,
+                200_000,
                 None,
                 ItemMetadata::None,
             ));
@@ -4722,7 +5060,7 @@ mod tests {
         world.try_move_player(1, 0);
         let before_count = world.player_pack().contents.len();
         let picked = world.try_pickup_all_at_player();
-        assert_eq!(picked, 0, "10kg boulder must not fit in 1.8kg of slack");
+        assert_eq!(picked, 0, "200kg monolith must not fit in the carry ceiling");
         assert_eq!(world.player_pack().contents.len(), before_count);
         let cell = world.cell_at(east_x as i64, east_y as i64).expect("cell");
         assert_eq!(cell.items.len(), 1);
@@ -5926,6 +6264,341 @@ mod tests {
     }
 
     #[test]
+    fn attributes_starting_player_has_baseline_ten_with_zero_bonuses() {
+        let a = Attributes::starting_player();
+        assert_eq!(a.str_, 10);
+        assert_eq!(a.agi, 10);
+        assert_eq!(a.con, 10);
+        assert_eq!(a.int_, 10);
+        assert_eq!(a.spirit, 10);
+        assert_eq!(a.str_bonus(), 0);
+        assert_eq!(a.agi_mod(), 0);
+    }
+
+    #[test]
+    fn attributes_bonus_is_linear_delta_from_baseline() {
+        // The old `CombatSkills.str_bonus = N` semantics now ride on
+        // `Attributes.str_ = 10 + N`. The combat resolver still reads
+        // `AttackerStats.str_bonus`, so the only thing that changed is
+        // *where* the bonus is sourced from.
+        let a = Attributes {
+            str_: 13,
+            agi: 8,
+            con: 10,
+            int_: 10,
+            spirit: 10,
+            attribute_xp: [0; 5],
+        };
+        assert_eq!(a.str_bonus(), 3);
+        assert_eq!(a.agi_mod(), -2);
+    }
+
+    #[test]
+    fn player_attributes_round_trip_via_world_setter() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let custom = Attributes {
+            str_: 14,
+            agi: 12,
+            con: 11,
+            int_: 9,
+            spirit: 13,
+            attribute_xp: [10, 20, 30, 40, 50],
+        };
+        world.set_player_attributes(custom);
+        let got = world.player_attributes();
+        assert_eq!(got.str_, 14);
+        assert_eq!(got.agi, 12);
+        assert_eq!(got.con, 11);
+        assert_eq!(got.attribute_xp, [10, 20, 30, 40, 50]);
+    }
+
+    #[test]
+    fn stride_default_is_creep() {
+        let world = World::new(CHUNK_W, CHUNK_H);
+        assert_eq!(world.player_stride, StrideMode::Creep);
+    }
+
+    #[test]
+    fn stride_cycle_walks_creep_walk_jog_back_to_creep() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Top up stamina so the Jog branch isn't gated.
+        if let Ok(mut s) = world.ecs.get::<&mut Stamina>(world.player) {
+            s.cur = s.max;
+        }
+        world.player_stride = StrideMode::Creep;
+        assert_eq!(world.cycle_player_stride(), StrideMode::Walk);
+        assert_eq!(world.cycle_player_stride(), StrideMode::Jog);
+        assert_eq!(world.cycle_player_stride(), StrideMode::Creep);
+    }
+
+    #[test]
+    fn stride_cycle_skips_jog_when_stamina_below_floor() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        if let Ok(mut s) = world.ecs.get::<&mut Stamina>(world.player) {
+            s.cur = STRIDE_JOG_STAMINA_FLOOR - 1;
+        }
+        world.player_stride = StrideMode::Walk;
+        // Walk -> next would be Jog, but stamina gate falls through to Creep.
+        assert_eq!(world.cycle_player_stride(), StrideMode::Creep);
+    }
+
+    #[test]
+    fn spend_player_tile_step_drains_stamina_under_jog() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        if let Ok(mut s) = world.ecs.get::<&mut Stamina>(world.player) {
+            s.cur = s.max;
+        }
+        let before = world
+            .ecs
+            .get::<&Stamina>(world.player)
+            .map(|s| s.cur)
+            .unwrap();
+        world.player_stride = StrideMode::Jog;
+        world.spend_player_tile_step();
+        let after = world
+            .ecs
+            .get::<&Stamina>(world.player)
+            .map(|s| s.cur)
+            .unwrap();
+        assert_eq!(after, before - 2);
+    }
+
+    #[test]
+    fn derived_pack_cap_scales_quadratically_with_str() {
+        // STR 10 → 113 kg (momentary lift); STR 20 → 453.2 kg.
+        assert_eq!(crate::items::derived_pack_cap_g(10), 100 * 1133);
+        assert_eq!(crate::items::derived_pack_cap_g(20), 400 * 1133);
+    }
+
+    #[test]
+    fn drag_start_lifts_log_onto_player_cell_and_sets_flag() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let pos = world.player_pos();
+        // Spawn a Log on the cell east of the player.
+        let east_x = (pos.x + 1) as i64;
+        let east_y = pos.y as i64;
+        if let Some(c) = world.cell_at_mut(east_x, east_y) {
+            c.items.clear();
+            c.items.push(ItemInstance::stack(ItemKind::Log, 1, 200_000, None, ItemMetadata::None));
+        }
+        match crate::action::execute(&mut world, crate::action::ActionId::DragStart) {
+            crate::action::ExecuteOutcome::Done(_) => {}
+            other => panic!("expected Done, got {:?}", other),
+        }
+        assert!(world.player_dragging, "drag flag should be set");
+        // Log moved off the east cell, onto the player cell.
+        let east_after = world.cell_at(east_x, east_y).unwrap();
+        assert!(east_after.items.iter().all(|i| i.kind != ItemKind::Log));
+        let here = world.cell_at(pos.x as i64, pos.y as i64).unwrap();
+        assert!(here.items.iter().any(|i| i.kind == ItemKind::Log));
+    }
+
+    #[test]
+    fn dragging_a_log_slides_it_along_with_player_moves() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let pos = world.player_pos();
+        // Seed Log on player cell + set flag directly (skipping
+        // DragStart eval so the test stays focused on slide_dragged_log).
+        if let Some(c) = world.cell_at_mut(pos.x as i64, pos.y as i64) {
+            c.items.push(ItemInstance::stack(ItemKind::Log, 1, 200_000, None, ItemMetadata::None));
+        }
+        world.player_dragging = true;
+        world.try_move_player(1, 0);
+        let new_pos = world.player_pos();
+        // Log is on the new pos, not the old.
+        let new_cell = world.cell_at(new_pos.x as i64, new_pos.y as i64).unwrap();
+        assert!(new_cell.items.iter().any(|i| i.kind == ItemKind::Log));
+        let old_cell = world.cell_at(pos.x as i64, pos.y as i64).unwrap();
+        assert!(old_cell.items.iter().all(|i| i.kind != ItemKind::Log));
+        assert!(world.player_dragging, "drag continues across moves");
+    }
+
+    #[test]
+    fn dragging_doubles_tile_step_cost() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Stride Creep = 500 moves/tile = 5 game-sec.
+        world.player_stride = StrideMode::Creep;
+        // Baseline: one tile-step advances 5 game-sec.
+        let before = world.clock_seconds;
+        world.spend_player_tile_step();
+        let baseline_delta = world.clock_seconds - before;
+        // Now with drag on: same call advances 10 game-sec (2× cost).
+        world.player_dragging = true;
+        let before2 = world.clock_seconds;
+        world.spend_player_tile_step();
+        let drag_delta = world.clock_seconds - before2;
+        assert_eq!(drag_delta, baseline_delta * 2);
+    }
+
+    #[test]
+    fn chop_log_consumes_log_and_drops_firewood() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let pos = world.player_pos();
+        // Place a Log on the player cell. Player already has an axe.
+        if let Some(c) = world.cell_at_mut(pos.x as i64, pos.y as i64) {
+            c.items.push(ItemInstance::stack(ItemKind::Log, 1, 200_000, None, ItemMetadata::None));
+        }
+        match crate::action::execute(&mut world, crate::action::ActionId::ChopLog) {
+            crate::action::ExecuteOutcome::Done(msg) => {
+                assert!(msg.contains("firewood"), "got {:?}", msg);
+            }
+            other => panic!("expected Done, got {:?}", other),
+        }
+        let here = world.cell_at(pos.x as i64, pos.y as i64).unwrap();
+        assert!(here.items.iter().all(|i| i.kind != ItemKind::Log), "log was consumed");
+        let firewood: u16 = here
+            .items
+            .iter()
+            .filter(|i| i.kind == ItemKind::Firewood)
+            .map(|i| i.count)
+            .sum();
+        assert!(
+            (3..=6).contains(&firewood),
+            "expected 3-6 firewood, got {}",
+            firewood
+        );
+    }
+
+    #[test]
+    fn wait_action_advances_clock_by_one_tile_step() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let before = world.clock_seconds;
+        match crate::action::execute(&mut world, crate::action::ActionId::Wait) {
+            crate::action::ExecuteOutcome::Done(_) => {}
+            other => panic!("expected Done, got {:?}", other),
+        }
+        // MOVE_COST_TILE / MOVES_PER_SECOND = 500 / 100 = 5 game-seconds.
+        assert_eq!(world.clock_seconds, before + 5);
+    }
+
+    #[test]
+    fn wait_action_does_not_move_player() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let before = world.player_pos();
+        let _ = crate::action::execute(&mut world, crate::action::ActionId::Wait);
+        assert_eq!(world.player_pos(), before);
+    }
+
+    #[test]
+    fn try_drop_to_cell_merges_into_existing_fungible_stack() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let pos = world.player_pos();
+        // Seed the player's cell with a stack of 3 twigs.
+        if let Some(c) = world.cell_at_mut(pos.x as i64, pos.y as i64) {
+            c.items.clear();
+            c.items.push(ItemInstance::stack(
+                ItemKind::Twig,
+                3,
+                5,
+                None,
+                ItemMetadata::None,
+            ));
+        }
+        world.try_drop_to_cell(ItemInstance::stack(
+            ItemKind::Twig,
+            2,
+            5,
+            None,
+            ItemMetadata::None,
+        ));
+        let cell = world.cell_at(pos.x as i64, pos.y as i64).unwrap();
+        assert_eq!(cell.items.len(), 1, "fungible same-kind drops must merge");
+        assert_eq!(cell.items[0].count, 5);
+    }
+
+    #[test]
+    fn try_drop_from_pack_tap_drops_one_unit_and_keeps_stack() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let pos = world.player_pos();
+        // Clear adjacent cells of seeded debris so we can assert.
+        if let Some(c) = world.cell_at_mut(pos.x as i64, pos.y as i64) {
+            c.items.clear();
+        }
+        // Starting pack has a stack of 3 rations — find that index.
+        let ration_idx = world
+            .player_pack()
+            .contents
+            .iter()
+            .position(|i| i.kind == ItemKind::Ration)
+            .expect("rations in starting pack");
+        let before_count = world.player_pack().contents[ration_idx].count;
+        assert!(before_count >= 2, "test needs a multi-stack to drop from");
+        let msg = world.try_drop_from_pack(ration_idx, 1).expect("drop ok");
+        assert!(msg.starts_with("dropped 1"));
+        // The pack stack shrank by 1.
+        let ration_idx2 = world
+            .player_pack()
+            .contents
+            .iter()
+            .position(|i| i.kind == ItemKind::Ration)
+            .expect("stack still present");
+        assert_eq!(
+            world.player_pack().contents[ration_idx2].count,
+            before_count - 1
+        );
+        // The cell has one ration now.
+        let cell = world.cell_at(pos.x as i64, pos.y as i64).unwrap();
+        assert!(cell.items.iter().any(|i| i.kind == ItemKind::Ration && i.count == 1));
+    }
+
+    #[test]
+    fn try_drop_from_pack_hold_drops_whole_stack_and_removes_entry() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let pos = world.player_pos();
+        if let Some(c) = world.cell_at_mut(pos.x as i64, pos.y as i64) {
+            c.items.clear();
+        }
+        let ration_idx = world
+            .player_pack()
+            .contents
+            .iter()
+            .position(|i| i.kind == ItemKind::Ration)
+            .expect("rations in starting pack");
+        let stack_count = world.player_pack().contents[ration_idx].count;
+        let msg = world.try_drop_from_pack(ration_idx, stack_count).expect("drop ok");
+        assert!(msg.starts_with(&format!("dropped {}", stack_count)));
+        // Pack no longer contains rations.
+        assert!(
+            world.player_pack().contents.iter().all(|i| i.kind != ItemKind::Ration),
+            "whole-stack drop must remove the pack entry"
+        );
+        // Cell holds the whole stack.
+        let cell = world.cell_at(pos.x as i64, pos.y as i64).unwrap();
+        let cell_rations: u16 = cell
+            .items
+            .iter()
+            .filter(|i| i.kind == ItemKind::Ration)
+            .map(|i| i.count)
+            .sum();
+        assert_eq!(cell_rations, stack_count);
+    }
+
+    #[test]
+    fn set_player_attributes_resyncs_pack_capacity_from_str() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let strong = Attributes {
+            str_: 20,
+            ..Attributes::starting_player()
+        };
+        world.set_player_attributes(strong);
+        assert_eq!(
+            world.player_pack().capacity_g,
+            crate::items::derived_pack_cap_g(20)
+        );
+    }
+
+    #[test]
+    fn con_scales_starting_body_part_max_hp() {
+        // CON=10 reproduces the legacy flat numbers; CON=20 doubles them.
+        let baseline = BodyParts::starting_human_with_con(10);
+        assert_eq!(baseline.torso.max, BodyParts::TORSO_MAX);
+        assert_eq!(baseline.head.max, BodyParts::HEAD_MAX);
+        let beefy = BodyParts::starting_human_with_con(20);
+        assert_eq!(beefy.torso.max, BodyParts::TORSO_MAX * 2);
+        assert_eq!(beefy.head.max, BodyParts::HEAD_MAX * 2);
+    }
+
+    #[test]
     fn crossbow_must_be_loaded_to_fire_and_reload_chambers_a_bolt() {
         let mut world = World::new(CHUNK_W, CHUNK_H);
         // Equip crossbow + give bolts.
@@ -6294,10 +6967,10 @@ mod tests {
         let mut world = World::new(CHUNK_W, CHUNK_H);
         let bandit = drop_test_bandit(&mut world, 1, 0);
         // Force the player to be much stronger so the contest reliably
-        // wins. Player default str_bonus = 1; bump to 20.
+        // wins. Player default STR = 10 (bonus 0); bump to 30 (bonus +20).
         {
-            let mut cs = world.ecs.get::<&mut CombatSkills>(world.player).unwrap();
-            cs.str_bonus = 20;
+            let mut attrs = world.ecs.get::<&mut Attributes>(world.player).unwrap();
+            attrs.str_ = 30;
         }
         // Grapple first so throw has a valid target state. We'll also
         // confirm Prone arrives.
@@ -6317,8 +6990,8 @@ mod tests {
         let mut world = World::new(CHUNK_W, CHUNK_H);
         let bandit = drop_test_bandit(&mut world, 1, 0);
         {
-            let mut cs = world.ecs.get::<&mut CombatSkills>(world.player).unwrap();
-            cs.str_bonus = 20;
+            let mut attrs = world.ecs.get::<&mut Attributes>(world.player).unwrap();
+            attrs.str_ = 30;
         }
         let pos = world.ecs.get::<&Position>(bandit).map(|p| *p).unwrap();
         // Drop a kid: a few attempts since contest variance is small.

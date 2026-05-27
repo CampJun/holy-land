@@ -102,6 +102,11 @@ pub enum ItemKind {
     CoatOfPlates,
     /// Large kite/round shield — Knight off-hand.
     LargeShield,
+    /// PR B Drag card: a whole felled log. Too heavy to fit in any pack
+    /// — handled exclusively via the Drag verb. `ChopLog` at the
+    /// destination converts one log into 3-6 firewood. 200 kg per the
+    /// card spec (`Felled tree weight: ~200 kg`).
+    Log,
     // ---- PR A card 5: Rabble melee ----
     /// One-handed bash weapon — commoner blunt per the Statute of
     /// Winchester rabble class. Trains Mace/Cudgel proficiency.
@@ -220,6 +225,7 @@ const ALL_KINDS: &[ItemKind] = &[
     ItemKind::GreatHelm,
     ItemKind::CoatOfPlates,
     ItemKind::LargeShield,
+    ItemKind::Log,
     ItemKind::Gisarme,
     ItemKind::Crossbow,
     ItemKind::CrossbowBolt,
@@ -901,6 +907,21 @@ impl ItemKind {
                 armor: None,
                 ranged: None,
             },
+            ItemKind::Log => ItemDef {
+                save_key: "log",
+                name: "log",
+                // Fungible so multiple logs stacked on the same cell
+                // collapse to one entry — they're whole-felled trunks,
+                // indistinguishable from each other for v1.
+                is_fungible: true,
+                glyph: b'L',
+                color: [120, 80, 50],
+                default_weight_g: 200_000,
+                blends_with_terrain: false,
+                weapon: None,
+                armor: None,
+                ranged: None,
+            },
             // ---- PR A card 4 items ----
             ItemKind::Gisarme => ItemDef {
                 save_key: "gisarme",
@@ -1440,9 +1461,26 @@ impl Pack {
     }
 }
 
-/// Slice-1 starting inventory. Total 13.2 kg in a 15 kg pack.
+/// PR B carry-overload card: pack capacity derived from STR.
+///
+/// The card lays out three thresholds per `STR² × Klbs`:
+///   - **free carry** (no stamina cost): `STR² × 0.25 lbs`
+///   - **max walking** (4× free, stamina drain peaks): `STR² × 1.0 lbs`
+///   - **momentary lift** (hard reject): `STR² × 2.5 lbs`
+///
+/// This helper returns the hard-reject ceiling (`STR² × 2.5 lbs ≈ STR²
+/// × 1133 g`) — the only one that participates in `Pack::try_add`. The
+/// soft tiers (free-carry stamina-cost, max-walking exhaustion-per-
+/// tile) are a follow-up after PR A merges its Stamina pool work; they
+/// land in `World::tick_carry_overload`. STR 10 → 113 kg lift cap (the
+/// starting kit's 13.2 kg fits with room).
+pub fn derived_pack_cap_g(str_: u8) -> u32 {
+    (str_ as u32).pow(2) * 1133
+}
+
+/// Slice-1 starting inventory. Total 13.2 kg in a STR-derived pack.
 pub fn starting_pack() -> Pack {
-    let mut p = Pack::empty(15_000);
+    let mut p = Pack::empty(derived_pack_cap_g(10));
     p.contents
         .push(ItemInstance::unique(ItemKind::Axe, 1_000, None, ItemMetadata::None));
     p.contents
