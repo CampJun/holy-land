@@ -71,6 +71,12 @@ pub struct MetaSave {
     pub xp: u64,
     #[serde(default)]
     pub unlocks: Vec<String>,
+    /// Player-chosen tileset + per-terrain glyph overrides. Additive
+    /// (rides schema v2 via `#[serde(default)]` on the field and on
+    /// every inner field) so older meta saves load with an empty
+    /// `RenderSettings` and fall back to the default atlas + glyphs.
+    #[serde(default)]
+    pub render: RenderSettings,
 }
 
 impl MetaSave {
@@ -79,8 +85,29 @@ impl MetaSave {
             header,
             xp: 0,
             unlocks: Vec::new(),
+            render: RenderSettings::default(),
         }
     }
+}
+
+/// In-game-customizable render settings. Empty `atlas_key` means
+/// "fall back to the default atlas" (`atlases::DEFAULT_KEY`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RenderSettings {
+    #[serde(default)]
+    pub atlas_key: String,
+    #[serde(default)]
+    pub terrain_overrides: Vec<TerrainOverride>,
+}
+
+/// One terrain → glyph override. `kind_key` is `TerrainKind::save_key`;
+/// unknown keys are dropped on load (forward-compat).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TerrainOverride {
+    #[serde(default)]
+    pub kind_key: String,
+    #[serde(default)]
+    pub glyph: u8,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -749,6 +776,60 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_meta_render_settings() {
+        let dir = std::env::temp_dir().join(format!("survival-render-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("meta.cbor");
+
+        let mut meta = MetaSave::empty(SaveHeader::fresh(None));
+        meta.render.atlas_key = "aesomatica".to_string();
+        meta.render.terrain_overrides.push(TerrainOverride {
+            kind_key: "cobble_road".to_string(),
+            glyph: 0xCD,
+        });
+        save_atomic(&path, &meta).unwrap();
+
+        let loaded = load_meta(&path).unwrap();
+        assert_eq!(loaded.render.atlas_key, "aesomatica");
+        assert_eq!(loaded.render.terrain_overrides.len(), 1);
+        assert_eq!(loaded.render.terrain_overrides[0].kind_key, "cobble_road");
+        assert_eq!(loaded.render.terrain_overrides[0].glyph, 0xCD);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn legacy_meta_loads_with_default_render_settings() {
+        // Simulate a pre-render-settings meta by serializing only the
+        // fields that existed before. The #[serde(default)] on
+        // `render` must fill in an empty RenderSettings.
+        #[derive(Serialize)]
+        struct LegacyMeta {
+            header: SaveHeader,
+            xp: u64,
+            unlocks: Vec<String>,
+        }
+        let dir =
+            std::env::temp_dir().join(format!("survival-meta-legacy-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy_meta.cbor");
+
+        let legacy = LegacyMeta {
+            header: SaveHeader::fresh(None),
+            xp: 7,
+            unlocks: vec!["a".to_string()],
+        };
+        save_atomic(&path, &legacy).unwrap();
+
+        let loaded = load_meta(&path).unwrap();
+        assert_eq!(loaded.xp, 7);
+        assert!(loaded.render.atlas_key.is_empty());
+        assert!(loaded.render.terrain_overrides.is_empty());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn round_trip_run_with_combat_state() {
         let dir = std::env::temp_dir().join(format!("survival-combat-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
@@ -1029,6 +1110,7 @@ mod tests {
             header,
             xp: 0,
             unlocks: Vec::new(),
+            render: RenderSettings::default(),
         };
         save_atomic(&path, &meta).unwrap();
 

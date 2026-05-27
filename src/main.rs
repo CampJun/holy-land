@@ -1,4 +1,5 @@
 mod action;
+mod atlases;
 mod calendar;
 mod chunkgen;
 mod city;
@@ -20,6 +21,7 @@ mod save;
 mod skill;
 mod world;
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
@@ -28,51 +30,25 @@ use sdl2::pixels::{Color, PixelFormatEnum};
 use sdl2::rect::Rect;
 use sdl2::surface::Surface;
 
+use atlases::AtlasEntry;
 use input::{Action, Input};
 use items::{ItemInstance, Pack};
 use needs::Needs;
-use render::{draw_glyph, load_atlas, CELL_SIZE};
+use render::{draw_glyph, CELL_SIZE};
 use save::{
     ActionStepSave, ActiveActionSave, CellItemsSave, DecorationMutationSave, MetaSave, NeedsSave,
-    RunSave, SaveHeader, SkillSave, SkillsSave, StaminaSave, TerrainMutationSave,
-    TreeSpeciesMutationSave,
+    RenderSettings, RunSave, SaveHeader, SkillSave, SkillsSave, StaminaSave, TerrainMutationSave,
+    TerrainOverride, TreeSpeciesMutationSave,
 };
 use skill::{Rng, Skill, SkillKind, Skills};
 use world::{
-    brightness_at, dawns_elapsed, ChunkCoord, FastTravelStep, GroundCover, Position, TerrainKind,
-    ViewMode, World, MULTI_TURN_GAME_SEC_PER_FRAME, TREE_VARIANT_GLYPHS,
+    brightness_at, dawns_elapsed, wall_connector_glyph, ChunkCoord, FastTravelStep, GroundCover,
+    Position, TerrainKind, ViewMode, World, MULTI_TURN_GAME_SEC_PER_FRAME, REMAPPABLE_TERRAINS,
+    TREE_VARIANT_GLYPHS,
 };
 
 const WORLD_W: u32 = 40;
 const WORLD_H: u32 = 30;
-// Bundled character-set atlases. Player picks which one the binary loads
-// at boot via a plain-text `atlas.txt` in `save_dir` (one of: "cp437",
-// "aesomatica"). Missing / unrecognized → Cp437. See AtlasChoice below.
-const CP437_PNG: &[u8] = include_bytes!("../assets/cp437_16x16.png");
-const AESOMATICA_PNG: &[u8] = include_bytes!("../assets/Aesomatica_16x16.png");
-const ATLAS_CONFIG_FILE: &str = "atlas.txt";
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum AtlasChoice {
-    Cp437,
-    Aesomatica,
-}
-
-impl AtlasChoice {
-    fn from_save_key(s: &str) -> Self {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "aesomatica" => Self::Aesomatica,
-            _ => Self::Cp437,
-        }
-    }
-
-    fn png_bytes(self) -> &'static [u8] {
-        match self {
-            Self::Cp437 => CP437_PNG,
-            Self::Aesomatica => AESOMATICA_PNG,
-        }
-    }
-}
 const META_FILE: &str = "meta.cbor";
 const RUN_FILE: &str = "run.cbor";
 const TARGET_FRAME: Duration = Duration::from_micros(16_667);
@@ -94,6 +70,8 @@ const PAUSE_OPTIONS: &[(PauseAction, &str)] = &[
     (PauseAction::Save, "Save"),
     (PauseAction::Quit, "Quit to desktop"),
     (PauseAction::ResetSave, "Delete save and reset"),
+    (PauseAction::TilesetPicker, "Tileset…"),
+    (PauseAction::TileRemap, "Tile remap…"),
     (PauseAction::GlyphPalette, "CP437 glyph palette (dev)"),
 ];
 
@@ -102,6 +80,8 @@ enum PauseAction {
     Save,
     Quit,
     ResetSave,
+    TilesetPicker,
+    TileRemap,
     GlyphPalette,
 }
 
@@ -284,25 +264,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // working pattern on Onion's libSDL2 (mmiyoo backend) — its renderer drops
     // every per-cell call.
     let texture_creator = canvas.texture_creator();
-    // Boot-time atlas pick. The config sits next to the binary (not in
-    // save_dir) — easy to find and edit. On Miyoo this lands at
-    // `App/HolyLand/atlas.txt`; on desktop, next to the built binary
-    // (e.g. `target/release/atlas.txt`). Bootstraps with "cp437" on
-    // first launch so the player has a discoverable file to edit later.
-    // Failures are silent; the game still runs.
-    let atlas_path = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(ATLAS_CONFIG_FILE);
-    if !atlas_path.exists() {
-        let _ = std::fs::write(&atlas_path, "cp437\n");
-    }
-    let atlas_choice = std::fs::read_to_string(&atlas_path)
-        .map(|s| AtlasChoice::from_save_key(&s))
-        .unwrap_or(AtlasChoice::Cp437);
-    log_info!("atlas: {:?} ({})", atlas_choice, atlas_path.display());
-    let mut atlas = load_atlas(atlas_choice.png_bytes())?;
+    // Discover available atlases (embedded defaults + any 256x256 PNG
+    // dropped into `assets/` next to the binary). The user-chosen key
+    // lives in meta.cbor under `render.atlas_key`; empty / unknown
+    // falls back to the embedded default.
+    let atlas_registry: Vec<AtlasEntry> = atlases::discover();
+    let atlas_idx = pick_atlas_index(&atlas_registry, &meta.render.atlas_key);
+    log_info!(
+        "atlas: {} (from {} discovered)",
+        atlas_registry[atlas_idx].key,
+        atlas_registry.len()
+    );
+    let mut atlas = atlases::load(&atlas_registry[atlas_idx])?;
+    let mut current_atlas_idx = atlas_idx;
+    let mut terrain_overrides: HashMap<TerrainKind, u8> =
+        build_terrain_overrides(&meta.render);
     let mut framebuf = Surface::new(logical_w, logical_h, PixelFormatEnum::ARGB8888)?;
     let mut present_tex = texture_creator
         .create_texture_streaming(PixelFormatEnum::ARGB8888, logical_w, logical_h)?;
@@ -643,6 +619,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // fields.
     let mut glyph_palette: Option<u8> = None;
 
+    // Pause-menu sub-screens. `tileset_picker` is a row cursor into
+    // `atlas_registry`; `tile_remap_list` is a row cursor into
+    // REMAPPABLE_TERRAINS; `tile_remap_pick` is `Some((terrain_idx, glyph))`
+    // while the user is choosing a new glyph for that terrain. All
+    // three persist their choices into `meta.render` and back to disk.
+    let mut tileset_picker: Option<usize> = None;
+    let mut tile_remap_list: Option<usize> = None;
+    let mut tile_remap_pick: Option<(usize, u8)> = None;
+
     // Ranged-targeting cursor. Opened by the `Aim` verb (via
     // `ExecuteOutcome::OpenAim`); A commits the shot, B cancels.
     // Sits between command_menu and pause priority — see input loop
@@ -862,6 +847,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 pause_menu = None;
                                 glyph_palette = Some(0);
                             }
+                            PauseAction::TilesetPicker => {
+                                pause_menu = None;
+                                tileset_picker = Some(current_atlas_idx);
+                            }
+                            PauseAction::TileRemap => {
+                                pause_menu = None;
+                                tile_remap_list = Some(0);
+                            }
                         }
                     }
                     Action::B | Action::Start => {
@@ -954,9 +947,146 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 && command_menu.is_none()
                 && info_menu.is_none()
                 && glyph_palette.is_none()
+                && tileset_picker.is_none()
+                && tile_remap_list.is_none()
+                && tile_remap_pick.is_none()
                 && world.active_action.is_none()
             {
                 overmap_mode = Some(OvermapMode::open(&world, last_overmap_destination));
+                continue;
+            }
+
+            // Tile-remap glyph picker: pick which CP437 byte to use
+            // for the currently-being-edited terrain. Reuses the
+            // glyph-palette dpad pattern; A confirms, X resets to
+            // default, B cancels back to the terrain list.
+            if let Some((terrain_idx, cursor)) = tile_remap_pick {
+                match input_action {
+                    Action::Up => {
+                        tile_remap_pick = Some((terrain_idx, cursor.wrapping_sub(16)));
+                    }
+                    Action::Down => {
+                        tile_remap_pick = Some((terrain_idx, cursor.wrapping_add(16)));
+                    }
+                    Action::Left => {
+                        tile_remap_pick = Some((terrain_idx, cursor.wrapping_sub(1)));
+                    }
+                    Action::Right => {
+                        tile_remap_pick = Some((terrain_idx, cursor.wrapping_add(1)));
+                    }
+                    Action::A => {
+                        let kind = REMAPPABLE_TERRAINS[terrain_idx];
+                        set_terrain_override(&mut meta.render, kind, Some(cursor));
+                        terrain_overrides = build_terrain_overrides(&meta.render);
+                        save_meta_only(&save_dir, &mut meta, &mut prev_meta_header);
+                        prev_cells.fill(None);
+                        tile_remap_pick = None;
+                    }
+                    Action::X => {
+                        let kind = REMAPPABLE_TERRAINS[terrain_idx];
+                        set_terrain_override(&mut meta.render, kind, None);
+                        terrain_overrides = build_terrain_overrides(&meta.render);
+                        save_meta_only(&save_dir, &mut meta, &mut prev_meta_header);
+                        prev_cells.fill(None);
+                        tile_remap_pick = None;
+                    }
+                    Action::B => tile_remap_pick = None,
+                    Action::Start => {
+                        tile_remap_pick = None;
+                        tile_remap_list = None;
+                        pause_menu = Some(0);
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            // Tile-remap terrain list: pick which TerrainKind to edit.
+            // A enters the glyph picker; X resets the highlighted
+            // terrain back to its default glyph; B closes.
+            if let Some(selected) = tile_remap_list {
+                let count = REMAPPABLE_TERRAINS.len();
+                match input_action {
+                    Action::Up => {
+                        tile_remap_list = Some(selected.saturating_sub(1));
+                    }
+                    Action::Down => {
+                        tile_remap_list = Some((selected + 1).min(count - 1));
+                    }
+                    Action::A => {
+                        let kind = REMAPPABLE_TERRAINS[selected];
+                        let start = terrain_overrides
+                            .get(&kind)
+                            .copied()
+                            .unwrap_or(kind.def().glyph);
+                        tile_remap_pick = Some((selected, start));
+                    }
+                    Action::X => {
+                        let kind = REMAPPABLE_TERRAINS[selected];
+                        set_terrain_override(&mut meta.render, kind, None);
+                        terrain_overrides = build_terrain_overrides(&meta.render);
+                        save_meta_only(&save_dir, &mut meta, &mut prev_meta_header);
+                        prev_cells.fill(None);
+                    }
+                    Action::B => tile_remap_list = None,
+                    Action::Start => {
+                        tile_remap_list = None;
+                        pause_menu = Some(0);
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            // Tileset picker: pick an atlas from the discovered list.
+            // A confirms (hot-swaps the atlas surface and persists);
+            // B cancels.
+            if let Some(selected) = tileset_picker {
+                let count = atlas_registry.len();
+                match input_action {
+                    Action::Up => {
+                        tileset_picker = Some(selected.saturating_sub(1));
+                    }
+                    Action::Down => {
+                        tileset_picker = Some((selected + 1).min(count - 1));
+                    }
+                    Action::A => {
+                        if selected != current_atlas_idx {
+                            match atlases::load(&atlas_registry[selected]) {
+                                Ok(surf) => {
+                                    atlas = surf;
+                                    current_atlas_idx = selected;
+                                    meta.render.atlas_key =
+                                        atlas_registry[selected].key.clone();
+                                    save_meta_only(
+                                        &save_dir,
+                                        &mut meta,
+                                        &mut prev_meta_header,
+                                    );
+                                    prev_cells.fill(None);
+                                    log_info!(
+                                        "[tileset] swapped to {}",
+                                        atlas_registry[selected].key
+                                    );
+                                }
+                                Err(e) => {
+                                    log_info!(
+                                        "[tileset] load failed for {}: {}",
+                                        atlas_registry[selected].key,
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        tileset_picker = None;
+                    }
+                    Action::B => tileset_picker = None,
+                    Action::Start => {
+                        tileset_picker = None;
+                        pause_menu = Some(0);
+                    }
+                    _ => {}
+                }
                 continue;
             }
 
@@ -1374,6 +1504,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(cursor) = glyph_palette {
             draw_glyph_palette(&mut ui_cells, cursor, &palette);
         }
+        if let Some(selected) = tileset_picker {
+            draw_tileset_picker(
+                &mut ui_cells,
+                &atlas_registry,
+                selected,
+                current_atlas_idx,
+                &palette,
+            );
+        }
+        if let Some(selected) = tile_remap_list {
+            draw_tile_remap_list(&mut ui_cells, &terrain_overrides, selected, &palette);
+        }
+        if let Some((terrain_idx, cursor)) = tile_remap_pick {
+            draw_tile_remap_glyph_picker(
+                &mut ui_cells,
+                REMAPPABLE_TERRAINS[terrain_idx],
+                cursor,
+                &palette,
+            );
+        }
         if radial_open {
             draw_radial_menu(&mut ui_cells, &world, &palette);
         }
@@ -1407,6 +1557,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let terrain = world.tile_at(wx, wy);
                 let terrain_def = terrain.def();
                 let mut glyph = terrain_def.glyph;
+                if terrain.is_wall_like() {
+                    glyph = wall_connector_glyph(&world, wx, wy, terrain);
+                } else if let Some(&g) = terrain_overrides.get(&terrain) {
+                    glyph = g;
+                }
                 // Per-cell color gradient for walkable terrain: small
                 // hash-driven RGB offset on fg+bg so the floor reads as
                 // organic texture rather than a flat region. Unwalkable
@@ -2441,33 +2596,92 @@ fn draw_menu_row(
     }
 }
 
+/// Find the atlas index matching the saved key. Empty / unknown keys
+/// fall back to `atlases::DEFAULT_KEY`; that fallback also being absent
+/// (shouldn't happen — it's embedded) collapses to index 0.
+fn pick_atlas_index(registry: &[AtlasEntry], key: &str) -> usize {
+    if let Some(i) = registry.iter().position(|e| e.key == key) {
+        return i;
+    }
+    registry
+        .iter()
+        .position(|e| e.key == atlases::DEFAULT_KEY)
+        .unwrap_or(0)
+}
+
+/// Resolve `RenderSettings.terrain_overrides` into a fast lookup keyed
+/// by `TerrainKind`. Unknown `kind_key` strings (e.g. a future variant
+/// the save mentions but this build doesn't recognize) are dropped.
+fn build_terrain_overrides(settings: &RenderSettings) -> HashMap<TerrainKind, u8> {
+    settings
+        .terrain_overrides
+        .iter()
+        .filter_map(|o| TerrainKind::from_save_key(&o.kind_key).map(|k| (k, o.glyph)))
+        .collect()
+}
+
+/// Insert / replace / remove a terrain override. `None` clears the
+/// override so the terrain reverts to its `def().glyph` default.
+fn set_terrain_override(settings: &mut RenderSettings, kind: TerrainKind, glyph: Option<u8>) {
+    let key = kind.save_key();
+    settings.terrain_overrides.retain(|o| o.kind_key != key);
+    if let Some(g) = glyph {
+        settings.terrain_overrides.push(TerrainOverride {
+            kind_key: key.to_string(),
+            glyph: g,
+        });
+    }
+}
+
+/// Persist meta.cbor only (no run.cbor write). Used by the tileset /
+/// tile-remap UI so a single setting change doesn't have to drag a
+/// full RunSave roundtrip with it.
+fn save_meta_only(
+    save_dir: &std::path::Path,
+    meta: &mut MetaSave,
+    prev_meta_header: &mut SaveHeader,
+) {
+    let new_header = SaveHeader::fresh(Some(prev_meta_header));
+    let mut next = meta.clone();
+    next.header = new_header.clone();
+    if let Err(e) = save::save_atomic(&save_dir.join(META_FILE), &next) {
+        log_info!("meta save failed: {}", e);
+    } else {
+        *meta = next;
+        *prev_meta_header = new_header;
+    }
+}
+
 /// Dev overlay: render every CP437 byte (0x00–0xFF) in a 16x16 grid so
 /// we can audit what's actually in our custom atlas. The cursor byte
 /// is inverted (bg <-> fg) and shown in the header. Dpad navigates
 /// (wraps); B/X closes.
 fn draw_glyph_palette(cells: &mut [Option<Cell>], cursor: u8, palette: &Palette) {
-    let layout = PanelLayout::centered(36, 24);
-    let cur_row = cursor >> 4;
-    let cur_col = cursor & 0x0F;
     let title = format!(
         "CP437 0x{:02X} (row {:X}, col {:X})",
-        cursor, cur_row, cur_col
+        cursor,
+        cursor >> 4,
+        cursor & 0x0F
     );
-    draw_panel_frame(
-        cells,
-        &layout,
-        &title,
-        "dpad: navigate   B: close",
-        palette,
-    );
+    draw_glyph_grid(cells, cursor, &title, "dpad: navigate   B: close", palette);
+}
 
-    // The grid sits at first_row_y, taking 16 rows x 16 columns. We
-    // also draw thin row/column labels in hex above and beside the
-    // grid so the player can read coords without counting.
-    let grid_x = layout.inner_x() + 2; // leave 2 cols for row labels
-    let grid_y = layout.first_row_y() + 1; // row above is column header
+/// Shared 16x16 glyph grid renderer. Used by the dev palette and by the
+/// tile-remap glyph picker (which passes a terrain-specific title and
+/// footer). Layout is identical; only the chrome strings differ.
+fn draw_glyph_grid(
+    cells: &mut [Option<Cell>],
+    cursor: u8,
+    title: &str,
+    footer: &str,
+    palette: &Palette,
+) {
+    let layout = PanelLayout::centered(36, 24);
+    draw_panel_frame(cells, &layout, title, footer, palette);
 
-    // Column header row.
+    let grid_x = layout.inner_x() + 2;
+    let grid_y = layout.first_row_y() + 1;
+
     for col in 0..16u8 {
         put_text(
             cells,
@@ -2479,7 +2693,6 @@ fn draw_glyph_palette(cells: &mut [Option<Cell>], cursor: u8, palette: &Palette)
         );
     }
 
-    // Row labels + cells.
     for row in 0..16u8 {
         put_text(
             cells,
@@ -2492,8 +2705,6 @@ fn draw_glyph_palette(cells: &mut [Option<Cell>], cursor: u8, palette: &Palette)
         for col in 0..16u8 {
             let byte = (row << 4) | col;
             let is_cursor = byte == cursor;
-            // Render the glyph at its real byte index. Inversion on
-            // the cursor cell (bg as fg, fg as bg) so it stands out.
             let (fg, bg) = if is_cursor {
                 (palette.panel_bg, palette.panel_fg)
             } else {
@@ -2507,6 +2718,149 @@ fn draw_glyph_palette(cells: &mut [Option<Cell>], cursor: u8, palette: &Palette)
             );
         }
     }
+}
+
+/// Tileset picker: vertical list of discovered atlases. The currently
+/// loaded entry is marked "(current)" on the right; A confirms.
+fn draw_tileset_picker(
+    cells: &mut [Option<Cell>],
+    registry: &[AtlasEntry],
+    selected: usize,
+    current: usize,
+    palette: &Palette,
+) {
+    let h = (registry.len() as i32 + 6).clamp(8, WORLD_H as i32 - 2);
+    let layout = PanelLayout::centered(32, h);
+    draw_panel_frame(
+        cells,
+        &layout,
+        "Tileset",
+        "A: select  B: close",
+        palette,
+    );
+    for (i, entry) in registry.iter().enumerate() {
+        let row_y = layout.first_row_y() + i as i32;
+        if row_y >= layout.footer_y() {
+            break;
+        }
+        let is_selected = i == selected;
+        let label_fg = if is_selected {
+            palette.panel_title_fg
+        } else {
+            palette.panel_fg
+        };
+        let right = if i == current {
+            Some(("(current)", palette.panel_dim_fg))
+        } else {
+            None
+        };
+        draw_menu_row(
+            cells,
+            &layout,
+            row_y,
+            is_selected,
+            &entry.display_name,
+            label_fg,
+            right,
+            palette,
+        );
+    }
+}
+
+/// Tile-remap list: pick which TerrainKind to edit. Each row shows the
+/// terrain's current effective glyph as a preview cell, the human name,
+/// and (in the right column) either the override byte or "default".
+fn draw_tile_remap_list(
+    cells: &mut [Option<Cell>],
+    overrides: &HashMap<TerrainKind, u8>,
+    selected: usize,
+    palette: &Palette,
+) {
+    let h = (REMAPPABLE_TERRAINS.len() as i32 + 6).clamp(8, WORLD_H as i32 - 2);
+    let layout = PanelLayout::centered(36, h);
+    draw_panel_frame(
+        cells,
+        &layout,
+        "Tile remap",
+        "A: edit  X: reset  B: close",
+        palette,
+    );
+    for (i, kind) in REMAPPABLE_TERRAINS.iter().enumerate() {
+        let row_y = layout.first_row_y() + i as i32;
+        if row_y >= layout.footer_y() {
+            break;
+        }
+        let is_selected = i == selected;
+        let def = kind.def();
+        let override_glyph = overrides.get(kind).copied();
+        let effective_glyph = override_glyph.unwrap_or(def.glyph);
+
+        // Cursor + a one-cell glyph preview slotted between cursor and name.
+        let cursor = if is_selected { b'>' } else { b' ' };
+        put_cell(
+            cells,
+            layout.inner_x(),
+            row_y,
+            Cell {
+                glyph: cursor,
+                fg: palette.panel_title_fg,
+                bg: palette.panel_bg,
+            },
+        );
+        put_cell(
+            cells,
+            layout.inner_x() + 2,
+            row_y,
+            Cell {
+                glyph: effective_glyph,
+                fg: palette.panel_fg,
+                bg: palette.panel_bg,
+            },
+        );
+        let label_fg = if is_selected {
+            palette.panel_title_fg
+        } else {
+            palette.panel_fg
+        };
+        put_text(
+            cells,
+            layout.inner_x() + 4,
+            row_y,
+            def.name,
+            label_fg,
+            palette.panel_bg,
+        );
+
+        let right = match override_glyph {
+            Some(g) => format!("0x{:02X}", g),
+            None => format!("default 0x{:02X}", def.glyph),
+        };
+        let status_fg = if override_glyph.is_some() {
+            palette.panel_title_fg
+        } else {
+            palette.panel_dim_fg
+        };
+        let status_x = layout.inner_right() - right.len() as i32;
+        put_text(cells, status_x, row_y, &right, status_fg, palette.panel_bg);
+    }
+}
+
+/// Glyph picker reused for the tile-remap flow. Same 16x16 grid as the
+/// dev palette but the header names the terrain being edited.
+fn draw_tile_remap_glyph_picker(
+    cells: &mut [Option<Cell>],
+    kind: TerrainKind,
+    cursor: u8,
+    palette: &Palette,
+) {
+    let title = format!("{}  →  0x{:02X}", kind.def().name, cursor);
+    draw_glyph_grid(
+        cells,
+        cursor,
+        &title,
+        "A: pick  X: reset  B: cancel",
+        palette,
+    );
 }
 
 // ---- Info hub (Select-button tabbed overlay) -------------------------
