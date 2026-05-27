@@ -41,8 +41,9 @@ use save::{
 };
 use skill::{Rng, Skill, SkillKind, Skills};
 use world::{
-    brightness_at, dawns_elapsed, ChunkCoord, FastTravelStep, GroundCover, Position, TerrainKind,
-    ViewMode, World, ALL_TERRAINS, MULTI_TURN_GAME_SEC_PER_FRAME, TREE_VARIANT_GLYPHS,
+    brightness_at, dawns_elapsed, wall_connector_glyph, ChunkCoord, FastTravelStep, GroundCover,
+    Position, TerrainKind, ViewMode, World, MULTI_TURN_GAME_SEC_PER_FRAME, REMAPPABLE_TERRAINS,
+    TREE_VARIANT_GLYPHS,
 };
 
 const WORLD_W: u32 = 40;
@@ -482,7 +483,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Pause-menu sub-screens. `tileset_picker` is a row cursor into
     // `atlas_registry`; `tile_remap_list` is a row cursor into
-    // ALL_TERRAINS; `tile_remap_pick` is `Some((terrain_idx, glyph))`
+    // REMAPPABLE_TERRAINS; `tile_remap_pick` is `Some((terrain_idx, glyph))`
     // while the user is choosing a new glyph for that terrain. All
     // three persist their choices into `meta.render` and back to disk.
     let mut tileset_picker: Option<usize> = None;
@@ -795,7 +796,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         tile_remap_pick = Some((terrain_idx, cursor.wrapping_add(1)));
                     }
                     Action::A => {
-                        let kind = ALL_TERRAINS[terrain_idx];
+                        let kind = REMAPPABLE_TERRAINS[terrain_idx];
                         set_terrain_override(&mut meta.render, kind, Some(cursor));
                         terrain_overrides = build_terrain_overrides(&meta.render);
                         save_meta_only(&save_dir, &mut meta, &mut prev_meta_header);
@@ -803,7 +804,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         tile_remap_pick = None;
                     }
                     Action::X => {
-                        let kind = ALL_TERRAINS[terrain_idx];
+                        let kind = REMAPPABLE_TERRAINS[terrain_idx];
                         set_terrain_override(&mut meta.render, kind, None);
                         terrain_overrides = build_terrain_overrides(&meta.render);
                         save_meta_only(&save_dir, &mut meta, &mut prev_meta_header);
@@ -825,7 +826,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // A enters the glyph picker; X resets the highlighted
             // terrain back to its default glyph; B closes.
             if let Some(selected) = tile_remap_list {
-                let count = ALL_TERRAINS.len();
+                let count = REMAPPABLE_TERRAINS.len();
                 match input_action {
                     Action::Up => {
                         tile_remap_list = Some(selected.saturating_sub(1));
@@ -834,7 +835,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         tile_remap_list = Some((selected + 1).min(count - 1));
                     }
                     Action::A => {
-                        let kind = ALL_TERRAINS[selected];
+                        let kind = REMAPPABLE_TERRAINS[selected];
                         let start = terrain_overrides
                             .get(&kind)
                             .copied()
@@ -842,7 +843,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         tile_remap_pick = Some((selected, start));
                     }
                     Action::X => {
-                        let kind = ALL_TERRAINS[selected];
+                        let kind = REMAPPABLE_TERRAINS[selected];
                         set_terrain_override(&mut meta.render, kind, None);
                         terrain_overrides = build_terrain_overrides(&meta.render);
                         save_meta_only(&save_dir, &mut meta, &mut prev_meta_header);
@@ -1283,7 +1284,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some((terrain_idx, cursor)) = tile_remap_pick {
             draw_tile_remap_glyph_picker(
                 &mut ui_cells,
-                ALL_TERRAINS[terrain_idx],
+                REMAPPABLE_TERRAINS[terrain_idx],
                 cursor,
                 &palette,
             );
@@ -1321,7 +1322,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let terrain = world.tile_at(wx, wy);
                 let terrain_def = terrain.def();
                 let mut glyph = terrain_def.glyph;
-                if let Some(&g) = terrain_overrides.get(&terrain) {
+                if terrain.is_wall_like() {
+                    glyph = wall_connector_glyph(&world, wx, wy, terrain);
+                } else if let Some(&g) = terrain_overrides.get(&terrain) {
                     glyph = g;
                 }
                 // Per-cell color gradient for walkable terrain: small
@@ -2260,7 +2263,7 @@ fn draw_tile_remap_list(
     selected: usize,
     palette: &Palette,
 ) {
-    let h = (ALL_TERRAINS.len() as i32 + 6).clamp(8, WORLD_H as i32 - 2);
+    let h = (REMAPPABLE_TERRAINS.len() as i32 + 6).clamp(8, WORLD_H as i32 - 2);
     let layout = PanelLayout::centered(36, h);
     draw_panel_frame(
         cells,
@@ -2269,7 +2272,7 @@ fn draw_tile_remap_list(
         "A: edit  X: reset  B: close",
         palette,
     );
-    for (i, kind) in ALL_TERRAINS.iter().enumerate() {
+    for (i, kind) in REMAPPABLE_TERRAINS.iter().enumerate() {
         let row_y = layout.first_row_y() + i as i32;
         if row_y >= layout.footer_y() {
             break;

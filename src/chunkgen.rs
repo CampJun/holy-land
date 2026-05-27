@@ -819,9 +819,14 @@ mod tests {
         assert!(tree_count >= 12, "expected >= 12 trees, got {}", tree_count);
     }
 
+    /// Wilderness chunk well outside Exeter's wall + Rougemont bbox.
+    /// Used by debris-roll tests — chunk (0, 0) is Exeter, which now
+    /// strips items from every cell inside the wall.
+    const WILDERNESS_CHUNK: ChunkCoord = ChunkCoord { cx: 10, cy: 10 };
+
     #[test]
     fn chunk_has_herbs() {
-        let chunk = gen(ChunkCoord { cx: 0, cy: 0 }, 0xC0FFEE);
+        let chunk = gen(WILDERNESS_CHUNK, 0xC0FFEE);
         let herb_count: usize = chunk
             .cells
             .iter()
@@ -832,7 +837,7 @@ mod tests {
 
     #[test]
     fn chunk_has_firewood_somewhere() {
-        let chunk = gen(ChunkCoord { cx: 0, cy: 0 }, 0xC0FFEE);
+        let chunk = gen(WILDERNESS_CHUNK, 0xC0FFEE);
         let fw_total: u32 = chunk
             .cells
             .iter()
@@ -952,8 +957,8 @@ mod tests {
 
     #[test]
     fn different_seeds_produce_different_chunks() {
-        let a = gen(ChunkCoord { cx: 0, cy: 0 }, 1);
-        let b = gen(ChunkCoord { cx: 0, cy: 0 }, 2);
+        let a = gen(WILDERNESS_CHUNK, 1);
+        let b = gen(WILDERNESS_CHUNK, 2);
         let mut diff = 0;
         for (ca, cb) in a.cells.iter().zip(b.cells.iter()) {
             if ca.terrain != cb.terrain {
