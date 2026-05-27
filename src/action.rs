@@ -82,6 +82,21 @@ pub enum ActionId {
     DigFern,
     CutGorse,
     CutBracken,
+    /// Open the ranged-targeting cursor. Available when the player's
+    /// wielded item has a ranged profile (bow / crossbow). The cursor
+    /// commits to a shot via A; cancel via B. Execution lives in main.rs
+    /// — the verb itself just signals "open targeting mode."
+    Aim,
+    /// Devon-wrestling grapple. Adjacent hostile only. Str contest;
+    /// success Grapples target (can't move/attack until break).
+    /// Drains stamina; requires Stamina >= HEAVY_FLOOR.
+    Grapple,
+    /// Throw a grappled hostile to the ground (Prone). Adjacent
+    /// grappled hostile only.
+    Throw,
+    /// Knock the wielded weapon out of an adjacent hostile's hand.
+    /// Str contest; success drops their Wielded onto their cell.
+    Disarm,
 }
 
 impl ActionId {
@@ -131,6 +146,17 @@ impl ActionId {
             ActionId::DigFern => 6_000,
             ActionId::CutGorse => 12_000,
             ActionId::CutBracken => 2_000,
+            // Aim itself is free — opening the targeting cursor doesn't
+            // advance the clock. The shot fires from the cursor's
+            // commit path (`World::perform_ranged_attack`), which
+            // charges the bow's `RangedProfile.move_cost`.
+            ActionId::Aim => 0,
+            // Heavy wrestling actions take longer than a normal swing
+            // (per the stamina card — grapple/throw/disarm are the
+            // canonical heavy-action examples).
+            ActionId::Grapple => 200,
+            ActionId::Throw => 150,
+            ActionId::Disarm => 150,
         }
     }
 
@@ -164,6 +190,10 @@ impl ActionId {
             ActionId::DigFern => "dig_fern",
             ActionId::CutGorse => "cut_gorse",
             ActionId::CutBracken => "cut_bracken",
+            ActionId::Aim => "aim",
+            ActionId::Grapple => "grapple",
+            ActionId::Throw => "throw",
+            ActionId::Disarm => "disarm",
         }
     }
 
@@ -194,6 +224,10 @@ impl ActionId {
             "dig_fern" => ActionId::DigFern,
             "cut_gorse" => ActionId::CutGorse,
             "cut_bracken" => ActionId::CutBracken,
+            "aim" => ActionId::Aim,
+            "grapple" => ActionId::Grapple,
+            "throw" => ActionId::Throw,
+            "disarm" => ActionId::Disarm,
             _ => return None,
         })
     }
@@ -309,6 +343,26 @@ pub const ALL_ACTIONS: &[ContextAction] = &[
         name: "Cut bracken",
         description: "Cut bracken straw for bedding (knife).",
     },
+    ContextAction {
+        id: ActionId::Aim,
+        name: "Aim",
+        description: "Raise your bow and pick a target.",
+    },
+    ContextAction {
+        id: ActionId::Grapple,
+        name: "Grapple",
+        description: "Lock up the adjacent foe — they can't act.",
+    },
+    ContextAction {
+        id: ActionId::Throw,
+        name: "Throw",
+        description: "Slam a grappled foe to the ground (Prone).",
+    },
+    ContextAction {
+        id: ActionId::Disarm,
+        name: "Disarm",
+        description: "Strike an adjacent foe's weapon free.",
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -411,7 +465,60 @@ pub fn evaluate(world: &World, id: ActionId) -> Availability {
             HARVEST_REQUIRES_KNIFE,
             "no bracken adjacent",
         ),
+        ActionId::Aim => eval_aim(world),
+        ActionId::Grapple => eval_grapple_or_disarm(world, false),
+        ActionId::Disarm => eval_grapple_or_disarm(world, true),
+        ActionId::Throw => eval_throw(world),
     }
+}
+
+fn eval_grapple_or_disarm(world: &World, require_wielded: bool) -> Availability {
+    if !world.player_has_stamina_for_heavy() {
+        return Availability::Unavailable { reason: "winded" };
+    }
+    let Some(target) = world.adjacent_hostile() else {
+        return Availability::Unavailable { reason: "no foe adjacent" };
+    };
+    if require_wielded && !world.entity_has_wielded(target) {
+        return Availability::Unavailable { reason: "foe is unarmed" };
+    }
+    Availability::Available { cost_game_seconds: 0 }
+}
+
+fn eval_throw(world: &World) -> Availability {
+    if !world.player_has_stamina_for_heavy() {
+        return Availability::Unavailable { reason: "winded" };
+    }
+    let Some(target) = world.adjacent_hostile() else {
+        return Availability::Unavailable { reason: "no foe adjacent" };
+    };
+    if !world.entity_is_grappled(target) {
+        return Availability::Unavailable { reason: "grapple them first" };
+    }
+    Availability::Available { cost_game_seconds: 0 }
+}
+
+fn eval_aim(world: &World) -> Availability {
+    // Available iff the player is wielding a ranged weapon AND has at
+    // least one round of the matching ammo in pack.
+    use crate::items::ItemKind as IK;
+    let pack = world.player_pack();
+    let wielded = world
+        .player_main_hand_kind()
+        .and_then(|k| k.def().ranged.map(|r| (k, r)));
+    let Some((kind, ranged)) = wielded else {
+        return Availability::Unavailable { reason: "no ranged weapon equipped" };
+    };
+    let _ = kind;
+    if !ranged.ammo_kind.is_empty() {
+        let Some(ammo) = IK::from_save_key(ranged.ammo_kind) else {
+            return Availability::Unavailable { reason: "ammo kind unknown" };
+        };
+        if !pack.has_stack(ammo) {
+            return Availability::Unavailable { reason: "no ammo in pack" };
+        }
+    }
+    Availability::Available { cost_game_seconds: 0 }
 }
 
 /// Counts the materials reachable by a Fire Making attempt: the
@@ -550,10 +657,23 @@ fn eval_pickup(world: &World) -> Availability {
 #[derive(Debug)]
 pub enum ExecuteOutcome {
     /// The action ran; the inner message is suitable for log_info.
-    /// Slice 1 wires every verb so this is the only variant; future
-    /// failure modes (e.g. async/queued failure) can extend the enum
-    /// without touching the call sites' Done arm.
     Done(String),
+    /// The action wants to open the ranged-targeting cursor instead of
+    /// resolving immediately. Main.rs catches this and switches input
+    /// mode; the actual shot resolution lives on the cursor's commit
+    /// path (`World::perform_ranged_attack`).
+    OpenAim,
+}
+
+impl ExecuteOutcome {
+    /// Convenience for callers that want the log message (or empty
+    /// string for non-Done outcomes).
+    pub fn message(&self) -> &str {
+        match self {
+            ExecuteOutcome::Done(s) => s.as_str(),
+            ExecuteOutcome::OpenAim => "",
+        }
+    }
 }
 
 pub fn execute(world: &mut World, id: ActionId) -> ExecuteOutcome {
@@ -629,7 +749,38 @@ pub fn execute(world: &mut World, id: ActionId) -> ExecuteOutcome {
         ActionId::DigFern => execute_dig_fern(world),
         ActionId::CutGorse => execute_cut_gorse(world),
         ActionId::CutBracken => execute_cut_bracken(world),
+        ActionId::Aim => ExecuteOutcome::OpenAim,
+        ActionId::Grapple => execute_grapple(world),
+        ActionId::Throw => execute_throw(world),
+        ActionId::Disarm => execute_disarm(world),
     }
+}
+
+fn execute_grapple(world: &mut World) -> ExecuteOutcome {
+    let Some(target) = world.adjacent_hostile() else {
+        return ExecuteOutcome::Done("no foe adjacent".to_string());
+    };
+    let msg = world.perform_grapple(target);
+    world.spend_moves(ActionId::Grapple.move_cost());
+    ExecuteOutcome::Done(msg)
+}
+
+fn execute_throw(world: &mut World) -> ExecuteOutcome {
+    let Some(target) = world.adjacent_hostile() else {
+        return ExecuteOutcome::Done("no foe adjacent".to_string());
+    };
+    let msg = world.perform_throw(target);
+    world.spend_moves(ActionId::Throw.move_cost());
+    ExecuteOutcome::Done(msg)
+}
+
+fn execute_disarm(world: &mut World) -> ExecuteOutcome {
+    let Some(target) = world.adjacent_hostile() else {
+        return ExecuteOutcome::Done("no foe adjacent".to_string());
+    };
+    let msg = world.perform_disarm(target);
+    world.spend_moves(ActionId::Disarm.move_cost());
+    ExecuteOutcome::Done(msg)
 }
 
 /// Crafting verbs share a single 5-second multi-turn queue path; the
@@ -1810,6 +1961,7 @@ mod tests {
         let outcome = execute(&mut world, ActionId::CutFern);
         match outcome {
             ExecuteOutcome::Done(ref msg) => assert!(msg.contains("fern"), "got {:?}", msg),
+            other => panic!("expected Done, got {:?}", other),
         }
         // Decoration cleared.
         assert!(matches!(
@@ -1865,6 +2017,7 @@ mod tests {
         let outcome = execute(&mut world, ActionId::ChopTree);
         match outcome {
             ExecuteOutcome::Done(_) => {}
+            other => panic!("expected Done, got {:?}", other),
         }
         assert_eq!(world.tile_at(east_x as i64, east_y as i64), TerrainKind::BareDirt);
         let cell = world.cell_at(east_x as i64, east_y as i64).expect("cell");

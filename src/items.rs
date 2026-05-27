@@ -13,6 +13,7 @@
 // - Save format uses stable string `save_key()`s for forward-compat. Unknown
 //   keys on load are dropped silently (see `Pack::from_save`).
 
+use crate::combat::{ArmorDr, BodyPart, DamageTriplet, RangedProfile, WeaponProfile};
 use crate::crafting::{CookableKind, CookedState, PanContents, Seasonings};
 use crate::save::{ItemInstanceSave, ItemMetadataSave, PackSave};
 
@@ -52,6 +53,55 @@ pub enum ItemKind {
     Hazelnut,
     Acorn,
     RowanBerry,
+    /// Two-handed thrusting weapon. Yeoman-tier main_hand for the
+    /// Cornish bandit (50% of rolls per `Bestiary slice 1.md`).
+    /// Combat profile lives on `ItemDef.weapon`.
+    Spear,
+    /// One-handed arming sword. Yeoman / Sergeant-tier main_hand.
+    /// Balanced cut + stab.
+    ShortSword,
+    /// Single-edged cleaver, cut-heavy. Yeoman alternate to ShortSword.
+    Falchion,
+    /// Off-hand defensive piece. Phase 3 carries it as inventory only;
+    /// the block-chance bonus lands in a later phase per the cards.
+    SmallRoundShield,
+    /// Iron skullcap — cheap head protection, Yeoman tier (70% roll).
+    IronSkullcap,
+    /// Padded fabric torso + arms armor. Yeoman tier (80% torso roll).
+    PaddedDoublet,
+    /// Cheaper torso-only armor. Yeoman tier (20% torso roll).
+    LeatherJerkin,
+    /// Drawn-string bow. Period-correct ranged weapon; 20% chance per
+    /// Yeoman bandit spawn (per `Bestiary slice 1.md`). Consumes one
+    /// `Arrow` from the attacker's pack per shot.
+    Bow,
+    /// Stackable bow ammo. Consumed per shot; drops on hit target's
+    /// cell for ~70% recovery (phase 6 placeholder break rule).
+    Arrow,
+    // ---- Phase 8: Sergeant + Knight tiers ----
+    /// One-handed arming sword. Sergeant-tier main_hand (75% roll per
+    /// Status armament tiers.md). Slightly better balance than the
+    /// Yeoman short sword.
+    ArmingSword,
+    /// Two-handed reach-2 thrusting lance. Knight-tier main_hand. Best
+    /// stab damage in the game; awkward at adjacent (no-reach penalty).
+    Lance,
+    /// Mail shirt covering torso + arms. The signature elite armor of
+    /// the period; rolls on Sergeant + Knight loadouts.
+    Hauberk,
+    /// Mail leggings — legs. Knight tier.
+    MailChausses,
+    /// Mail hood — head. Knight tier (often under a great helm).
+    MailCoif,
+    /// Iron / steel wide-brim helm. Sergeant tier (50% head roll).
+    KettleHat,
+    /// Heavy enclosed cavalry helm. Knight tier.
+    GreatHelm,
+    /// Riveted small plates over fabric — the bleeding-edge transition
+    /// armor of ~1300. Knight tier (40% roll, layered over Hauberk).
+    CoatOfPlates,
+    /// Large kite/round shield — Knight off-hand.
+    LargeShield,
 }
 
 /// All per-kind metadata in one place. Adding a new `ItemKind` variant is
@@ -75,6 +125,31 @@ pub struct ItemDef {
     /// herbs, tools, structures) keep their saturation so they pierce
     /// the floor as visual landmarks.
     pub blends_with_terrain: bool,
+    /// Weapon stats — `Some` for anything an entity can wield in melee.
+    /// Phase-3 ships melee only; ranged ammo / bow weapons get a sibling
+    /// `ranged: Option<RangedProfile>` in phase 5.
+    pub weapon: Option<WeaponProfile>,
+    /// Armor stats + body-region mask + coverage% + encumbrance per
+    /// covered region. `Some` for anything wearable; phase-3 reads this
+    /// to build the bandit's `Worn` from its rolled loadout instead of
+    /// hand-assembling pieces in world.rs.
+    pub armor: Option<ArmorStats>,
+    /// Ranged profile — `Some` for bows / crossbows. The Aim verb
+    /// surfaces only when the main-hand item has this set.
+    pub ranged: Option<RangedProfile>,
+}
+
+/// Static armor description for an `ItemKind`. The wearable mask
+/// determines which body regions a single equipped piece covers; the
+/// coverage % drives the per-hit catch roll; DR feeds the per-type
+/// subtraction; encumbrance is added once per covered region for the
+/// Dodge / move-cost penalties.
+#[derive(Clone, Copy, Debug)]
+pub struct ArmorStats {
+    pub regions: &'static [BodyPart],
+    pub coverage_pct: u8,
+    pub dr: ArmorDr,
+    pub encumbrance: u8,
 }
 
 /// Iteration order used by `from_save_key` and tests. Keep in sync with
@@ -108,6 +183,24 @@ const ALL_KINDS: &[ItemKind] = &[
     ItemKind::Hazelnut,
     ItemKind::Acorn,
     ItemKind::RowanBerry,
+    ItemKind::Spear,
+    ItemKind::ShortSword,
+    ItemKind::Falchion,
+    ItemKind::SmallRoundShield,
+    ItemKind::IronSkullcap,
+    ItemKind::PaddedDoublet,
+    ItemKind::LeatherJerkin,
+    ItemKind::Bow,
+    ItemKind::Arrow,
+    ItemKind::ArmingSword,
+    ItemKind::Lance,
+    ItemKind::Hauberk,
+    ItemKind::MailChausses,
+    ItemKind::MailCoif,
+    ItemKind::KettleHat,
+    ItemKind::GreatHelm,
+    ItemKind::CoatOfPlates,
+    ItemKind::LargeShield,
 ];
 
 impl ItemKind {
@@ -124,6 +217,14 @@ impl ItemKind {
                 color: [180, 180, 200],
                 default_weight_g: 1_000,
                 blends_with_terrain: false,
+                weapon: Some(WeaponProfile {
+                    to_hit: 0,
+                    damage_die: DamageTriplet { bash: 3, cut: 9, stab: 0 },
+                    move_cost: 130,
+                    reach: 1,
+                }),
+                armor: None,
+                ranged: None,
             },
             ItemKind::Knife => ItemDef {
                 save_key: "knife",
@@ -133,6 +234,14 @@ impl ItemKind {
                 color: [180, 180, 200],
                 default_weight_g: 200,
                 blends_with_terrain: false,
+                weapon: Some(WeaponProfile {
+                    to_hit: 1,
+                    damage_die: DamageTriplet { bash: 0, cut: 2, stab: 8 },
+                    move_cost: 70,
+                    reach: 1,
+                }),
+                armor: None,
+                ranged: None,
             },
             ItemKind::Pack => ItemDef {
                 save_key: "pack",
@@ -142,6 +251,9 @@ impl ItemKind {
                 color: [130, 90, 50],
                 default_weight_g: 1_000,
                 blends_with_terrain: false,
+                weapon: None,
+                armor: None,
+                ranged: None,
             },
             ItemKind::Tent => ItemDef {
                 save_key: "tent",
@@ -151,6 +263,9 @@ impl ItemKind {
                 color: [200, 180, 140],
                 default_weight_g: 5_000,
                 blends_with_terrain: false,
+                weapon: None,
+                armor: None,
+                ranged: None,
             },
             ItemKind::Bedroll => ItemDef {
                 save_key: "bedroll",
@@ -160,6 +275,9 @@ impl ItemKind {
                 color: [220, 200, 160],
                 default_weight_g: 2_000,
                 blends_with_terrain: false,
+                weapon: None,
+                armor: None,
+                ranged: None,
             },
             ItemKind::CookingPan => ItemDef {
                 save_key: "cooking_pan",
@@ -169,6 +287,9 @@ impl ItemKind {
                 color: [80, 80, 90],
                 default_weight_g: 1_000,
                 blends_with_terrain: false,
+                weapon: None,
+                armor: None,
+                ranged: None,
             },
             ItemKind::Waterskin => ItemDef {
                 save_key: "waterskin",
@@ -178,6 +299,9 @@ impl ItemKind {
                 color: [100, 140, 200],
                 default_weight_g: 200,
                 blends_with_terrain: false,
+                weapon: None,
+                armor: None,
+                ranged: None,
             },
             ItemKind::FlintAndSteel => ItemDef {
                 save_key: "flint_and_steel",
@@ -187,6 +311,9 @@ impl ItemKind {
                 color: [230, 140, 60],
                 default_weight_g: 100,
                 blends_with_terrain: false,
+                weapon: None,
+                armor: None,
+                ranged: None,
             },
             ItemKind::Herb => ItemDef {
                 save_key: "herb",
@@ -198,6 +325,9 @@ impl ItemKind {
                 color: [100, 165, 75],
                 default_weight_g: 10,
                 blends_with_terrain: false,
+                weapon: None,
+                armor: None,
+                ranged: None,
             },
             // Organic detritus: blends into the floor texture so the
             // eye glides past it. ChopTree drops firewood (which
@@ -210,6 +340,9 @@ impl ItemKind {
                 color: [200, 170, 110],
                 default_weight_g: 5,
                 blends_with_terrain: true,
+                weapon: None,
+                armor: None,
+                ranged: None,
             },
             ItemKind::Stick => ItemDef {
                 save_key: "stick",
@@ -219,6 +352,9 @@ impl ItemKind {
                 color: [200, 170, 110],
                 default_weight_g: 50,
                 blends_with_terrain: true,
+                weapon: None,
+                armor: None,
+                ranged: None,
             },
             ItemKind::Firewood => ItemDef {
                 save_key: "firewood",
@@ -229,6 +365,9 @@ impl ItemKind {
                 color: [150, 100, 55],
                 default_weight_g: 500,
                 blends_with_terrain: false,
+                weapon: None,
+                armor: None,
+                ranged: None,
             },
             ItemKind::GrassBlade => ItemDef {
                 save_key: "grass_blade",
@@ -238,6 +377,9 @@ impl ItemKind {
                 color: [80, 160, 70],
                 default_weight_g: 2,
                 blends_with_terrain: true,
+                weapon: None,
+                armor: None,
+                ranged: None,
             },
             ItemKind::Stone => ItemDef {
                 save_key: "stone",
@@ -250,6 +392,9 @@ impl ItemKind {
                 color: [165, 165, 175],
                 default_weight_g: 200,
                 blends_with_terrain: false,
+                weapon: None,
+                armor: None,
+                ranged: None,
             },
             ItemKind::MossPatch => ItemDef {
                 save_key: "moss_patch",
@@ -259,6 +404,9 @@ impl ItemKind {
                 color: [50, 100, 50],
                 default_weight_g: 10,
                 blends_with_terrain: true,
+                weapon: None,
+                armor: None,
+                ranged: None,
             },
             ItemKind::Mud => ItemDef {
                 save_key: "mud",
@@ -268,6 +416,9 @@ impl ItemKind {
                 color: [110, 80, 50],
                 default_weight_g: 300,
                 blends_with_terrain: true,
+                weapon: None,
+                armor: None,
+                ranged: None,
             },
             ItemKind::Ration => ItemDef {
                 save_key: "ration",
@@ -278,6 +429,9 @@ impl ItemKind {
                 color: [225, 180, 110],
                 default_weight_g: 500,
                 blends_with_terrain: false,
+                weapon: None,
+                armor: None,
+                ranged: None,
             },
             ItemKind::Fish => ItemDef {
                 save_key: "fish",
@@ -289,6 +443,9 @@ impl ItemKind {
                 color: [140, 170, 210],
                 default_weight_g: 400,
                 blends_with_terrain: false,
+                weapon: None,
+                armor: None,
+                ranged: None,
             },
             ItemKind::Cooked => ItemDef {
                 save_key: "cooked",
@@ -301,6 +458,9 @@ impl ItemKind {
                 color: [200, 150, 90],
                 default_weight_g: 400,
                 blends_with_terrain: false,
+                weapon: None,
+                armor: None,
+                ranged: None,
             },
             // Phase C: undergrowth harvest yields.
             ItemKind::Moss => ItemDef {
@@ -311,6 +471,9 @@ impl ItemKind {
                 color: [80, 130, 80],
                 default_weight_g: 10,
                 blends_with_terrain: true,
+                weapon: None,
+                armor: None,
+                ranged: None,
             },
             ItemKind::FernFrond => ItemDef {
                 save_key: "fern_frond",
@@ -320,6 +483,9 @@ impl ItemKind {
                 color: [90, 145, 70],
                 default_weight_g: 15,
                 blends_with_terrain: true,
+                weapon: None,
+                armor: None,
+                ranged: None,
             },
             ItemKind::FernRoot => ItemDef {
                 save_key: "fern_root",
@@ -329,6 +495,9 @@ impl ItemKind {
                 color: [140, 100, 60],
                 default_weight_g: 40,
                 blends_with_terrain: false,
+                weapon: None,
+                armor: None,
+                ranged: None,
             },
             ItemKind::GorseFaggot => ItemDef {
                 save_key: "gorse_faggot",
@@ -338,6 +507,9 @@ impl ItemKind {
                 color: [200, 170, 60],
                 default_weight_g: 250,
                 blends_with_terrain: false,
+                weapon: None,
+                armor: None,
+                ranged: None,
             },
             ItemKind::BrackenStraw => ItemDef {
                 save_key: "bracken_straw",
@@ -347,6 +519,9 @@ impl ItemKind {
                 color: [160, 110, 50],
                 default_weight_g: 5,
                 blends_with_terrain: true,
+                weapon: None,
+                armor: None,
+                ranged: None,
             },
             ItemKind::BrambleFruit => ItemDef {
                 save_key: "bramble_fruit",
@@ -356,6 +531,9 @@ impl ItemKind {
                 color: [140, 60, 95],
                 default_weight_g: 25,
                 blends_with_terrain: false,
+                weapon: None,
+                armor: None,
+                ranged: None,
             },
             ItemKind::Hazelnut => ItemDef {
                 save_key: "hazelnut",
@@ -365,6 +543,9 @@ impl ItemKind {
                 color: [180, 130, 70],
                 default_weight_g: 8,
                 blends_with_terrain: false,
+                weapon: None,
+                armor: None,
+                ranged: None,
             },
             ItemKind::Acorn => ItemDef {
                 save_key: "acorn",
@@ -374,6 +555,9 @@ impl ItemKind {
                 color: [150, 110, 60],
                 default_weight_g: 12,
                 blends_with_terrain: false,
+                weapon: None,
+                armor: None,
+                ranged: None,
             },
             ItemKind::RowanBerry => ItemDef {
                 save_key: "rowan_berry",
@@ -383,6 +567,315 @@ impl ItemKind {
                 color: [200, 70, 50],
                 default_weight_g: 10,
                 blends_with_terrain: false,
+                weapon: None,
+                armor: None,
+                ranged: None,
+            },
+            ItemKind::Spear => ItemDef {
+                save_key: "spear",
+                name: "spear",
+                is_fungible: false,
+                glyph: b'/',
+                color: [170, 140, 90],
+                default_weight_g: 1_800,
+                blends_with_terrain: false,
+                weapon: Some(WeaponProfile {
+                    to_hit: 1,
+                    damage_die: DamageTriplet { bash: 1, cut: 0, stab: 9 },
+                    move_cost: 110,
+                    // Reach-2 polearm. Player + bandit can swing at a
+                    // hostile 2 cells away in a cardinal/diagonal line
+                    // (subject to LoS). Adjacent swings take the
+                    // NO_REACH_DAMAGE_PCT penalty per the cards.
+                    reach: 2,
+                }),
+                armor: None,
+                ranged: None,
+            },
+            ItemKind::ShortSword => ItemDef {
+                save_key: "short_sword",
+                name: "short sword",
+                is_fungible: false,
+                glyph: b'(',
+                color: [200, 200, 215],
+                default_weight_g: 1_100,
+                blends_with_terrain: false,
+                weapon: Some(WeaponProfile {
+                    to_hit: 2,
+                    damage_die: DamageTriplet { bash: 1, cut: 6, stab: 6 },
+                    move_cost: 90,
+                    reach: 1,
+                }),
+                armor: None,
+                ranged: None,
+            },
+            ItemKind::Falchion => ItemDef {
+                save_key: "falchion",
+                name: "falchion",
+                is_fungible: false,
+                glyph: b')',
+                color: [195, 180, 140],
+                default_weight_g: 1_400,
+                blends_with_terrain: false,
+                weapon: Some(WeaponProfile {
+                    to_hit: 1,
+                    damage_die: DamageTriplet { bash: 2, cut: 9, stab: 1 },
+                    move_cost: 100,
+                    reach: 1,
+                }),
+                armor: None,
+                ranged: None,
+            },
+            ItemKind::SmallRoundShield => ItemDef {
+                save_key: "small_round_shield",
+                name: "small round shield",
+                is_fungible: false,
+                glyph: b'o',
+                color: [150, 95, 55],
+                default_weight_g: 2_000,
+                blends_with_terrain: false,
+                // Shields carry the block bonus in a later phase; for
+                // phase 3 they're inventory ballast that can drop on
+                // death.
+                weapon: None,
+                armor: None,
+                ranged: None,
+            },
+            ItemKind::IronSkullcap => ItemDef {
+                save_key: "iron_skullcap",
+                name: "iron skullcap",
+                is_fungible: false,
+                glyph: b'^',
+                color: [160, 160, 175],
+                default_weight_g: 900,
+                blends_with_terrain: false,
+                weapon: None,
+                armor: Some(ArmorStats {
+                    regions: &[BodyPart::Head],
+                    coverage_pct: 70,
+                    dr: ArmorDr { bash: 3, cut: 4, stab: 3 },
+                    encumbrance: 1,
+                }),
+                ranged: None,
+            },
+            ItemKind::PaddedDoublet => ItemDef {
+                save_key: "padded_doublet",
+                name: "padded doublet",
+                is_fungible: false,
+                glyph: b'[',
+                color: [180, 150, 110],
+                default_weight_g: 2_500,
+                blends_with_terrain: false,
+                weapon: None,
+                armor: Some(ArmorStats {
+                    regions: &[BodyPart::Torso, BodyPart::LArm, BodyPart::RArm],
+                    coverage_pct: 80,
+                    dr: ArmorDr { bash: 4, cut: 2, stab: 1 },
+                    // Per-region enc 1 (sums to 3 across torso + arms) —
+                    // padded is the lightest tier; mail bumps this to 2
+                    // and plate to 3 when those land in a later phase.
+                    encumbrance: 1,
+                }),
+                ranged: None,
+            },
+            ItemKind::LeatherJerkin => ItemDef {
+                save_key: "leather_jerkin",
+                name: "leather jerkin",
+                is_fungible: false,
+                glyph: b'[',
+                color: [130, 90, 55],
+                default_weight_g: 1_800,
+                blends_with_terrain: false,
+                weapon: None,
+                armor: Some(ArmorStats {
+                    regions: &[BodyPart::Torso],
+                    coverage_pct: 70,
+                    dr: ArmorDr { bash: 3, cut: 2, stab: 2 },
+                    encumbrance: 1,
+                }),
+                ranged: None,
+            },
+            ItemKind::Bow => ItemDef {
+                save_key: "bow",
+                name: "bow",
+                is_fungible: false,
+                glyph: b')',
+                color: [150, 110, 70],
+                default_weight_g: 800,
+                blends_with_terrain: false,
+                weapon: None,
+                armor: None,
+                ranged: Some(RangedProfile {
+                    to_hit: 2,
+                    // Stab-heavy; the arrow itself does the work.
+                    damage_die: DamageTriplet { bash: 0, cut: 1, stab: 10 },
+                    move_cost: 130,
+                    max_range: 10,
+                    ammo_kind: "arrow",
+                }),
+            },
+            ItemKind::Arrow => ItemDef {
+                save_key: "arrow",
+                name: "arrow",
+                is_fungible: true,
+                glyph: b'-',
+                color: [180, 150, 100],
+                default_weight_g: 40,
+                blends_with_terrain: false,
+                weapon: None,
+                armor: None,
+                ranged: None,
+            },
+            // ---- Phase 8 Sergeant + Knight items ----
+            ItemKind::ArmingSword => ItemDef {
+                save_key: "arming_sword",
+                name: "arming sword",
+                is_fungible: false,
+                glyph: b'(',
+                color: [210, 210, 225],
+                default_weight_g: 1_200,
+                blends_with_terrain: false,
+                weapon: Some(WeaponProfile {
+                    to_hit: 2,
+                    damage_die: DamageTriplet { bash: 1, cut: 7, stab: 7 },
+                    move_cost: 90,
+                    reach: 1,
+                }),
+                armor: None,
+                ranged: None,
+            },
+            ItemKind::Lance => ItemDef {
+                save_key: "lance",
+                name: "lance",
+                is_fungible: false,
+                glyph: b'|',
+                color: [180, 150, 100],
+                default_weight_g: 2_400,
+                blends_with_terrain: false,
+                weapon: Some(WeaponProfile {
+                    to_hit: 2,
+                    damage_die: DamageTriplet { bash: 2, cut: 1, stab: 12 },
+                    move_cost: 130,
+                    reach: 2,
+                }),
+                armor: None,
+                ranged: None,
+            },
+            ItemKind::Hauberk => ItemDef {
+                save_key: "hauberk",
+                name: "mail hauberk",
+                is_fungible: false,
+                glyph: b'[',
+                color: [160, 165, 180],
+                default_weight_g: 11_000,
+                blends_with_terrain: false,
+                weapon: None,
+                armor: Some(ArmorStats {
+                    regions: &[BodyPart::Torso, BodyPart::LArm, BodyPart::RArm],
+                    coverage_pct: 90,
+                    // Mail: low bash, high cut, medium stab.
+                    dr: ArmorDr { bash: 2, cut: 8, stab: 4 },
+                    encumbrance: 2,
+                }),
+                ranged: None,
+            },
+            ItemKind::MailChausses => ItemDef {
+                save_key: "mail_chausses",
+                name: "mail chausses",
+                is_fungible: false,
+                glyph: b'[',
+                color: [155, 160, 175],
+                default_weight_g: 5_500,
+                blends_with_terrain: false,
+                weapon: None,
+                armor: Some(ArmorStats {
+                    regions: &[BodyPart::LLeg, BodyPart::RLeg],
+                    coverage_pct: 85,
+                    dr: ArmorDr { bash: 2, cut: 7, stab: 3 },
+                    encumbrance: 2,
+                }),
+                ranged: None,
+            },
+            ItemKind::MailCoif => ItemDef {
+                save_key: "mail_coif",
+                name: "mail coif",
+                is_fungible: false,
+                glyph: b'^',
+                color: [150, 155, 170],
+                default_weight_g: 1_400,
+                blends_with_terrain: false,
+                weapon: None,
+                armor: Some(ArmorStats {
+                    regions: &[BodyPart::Head],
+                    coverage_pct: 80,
+                    dr: ArmorDr { bash: 2, cut: 7, stab: 3 },
+                    encumbrance: 1,
+                }),
+                ranged: None,
+            },
+            ItemKind::KettleHat => ItemDef {
+                save_key: "kettle_hat",
+                name: "kettle hat",
+                is_fungible: false,
+                glyph: b'^',
+                color: [170, 170, 180],
+                default_weight_g: 1_500,
+                blends_with_terrain: false,
+                weapon: None,
+                armor: Some(ArmorStats {
+                    regions: &[BodyPart::Head],
+                    coverage_pct: 75,
+                    dr: ArmorDr { bash: 5, cut: 5, stab: 4 },
+                    encumbrance: 1,
+                }),
+                ranged: None,
+            },
+            ItemKind::GreatHelm => ItemDef {
+                save_key: "great_helm",
+                name: "great helm",
+                is_fungible: false,
+                glyph: b'^',
+                color: [200, 200, 210],
+                default_weight_g: 3_200,
+                blends_with_terrain: false,
+                weapon: None,
+                armor: Some(ArmorStats {
+                    regions: &[BodyPart::Head],
+                    coverage_pct: 90,
+                    dr: ArmorDr { bash: 7, cut: 7, stab: 7 },
+                    encumbrance: 3,
+                }),
+                ranged: None,
+            },
+            ItemKind::CoatOfPlates => ItemDef {
+                save_key: "coat_of_plates",
+                name: "coat-of-plates",
+                is_fungible: false,
+                glyph: b'[',
+                color: [180, 175, 165],
+                default_weight_g: 8_500,
+                blends_with_terrain: false,
+                weapon: None,
+                armor: Some(ArmorStats {
+                    regions: &[BodyPart::Torso],
+                    coverage_pct: 95,
+                    // Plate: high all three; heavy enc.
+                    dr: ArmorDr { bash: 7, cut: 8, stab: 7 },
+                    encumbrance: 3,
+                }),
+                ranged: None,
+            },
+            ItemKind::LargeShield => ItemDef {
+                save_key: "large_shield",
+                name: "large shield",
+                is_fungible: false,
+                glyph: b'O',
+                color: [130, 80, 50],
+                default_weight_g: 4_000,
+                blends_with_terrain: false,
+                weapon: None,
+                armor: None,
+                ranged: None,
             },
         }
     }

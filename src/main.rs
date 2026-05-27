@@ -1,6 +1,7 @@
 mod action;
 mod calendar;
 mod chunkgen;
+mod combat;
 mod cornwall;
 mod crafting;
 #[cfg(not(target_arch = "arm"))]
@@ -133,6 +134,7 @@ enum DeathCause {
     Hunger,
     Cold,
     Exhaustion,
+    Combat,
 }
 
 impl DeathCause {
@@ -156,6 +158,7 @@ impl DeathCause {
             Self::Hunger => "You died of starvation.",
             Self::Cold => "You froze to death.",
             Self::Exhaustion => "You died of exhaustion.",
+            Self::Combat => "Slain by a bandit.",
         }
     }
 }
@@ -194,6 +197,38 @@ struct InfoMenuState {
     /// Cursor row within the currently-active tab. Reset to 0 when the
     /// tab changes.
     selected: usize,
+}
+
+/// Ranged targeting cursor — modal input state opened by the `Aim`
+/// verb. Dpad moves the cursor; A commits the shot; B cancels. The
+/// cursor lives in world coords so it lines up with the bandit's
+/// rendered glyph regardless of camera scroll.
+struct TargetCursor {
+    pos: world::Position,
+    max_range: u8,
+}
+
+impl TargetCursor {
+    /// Open the cursor; snap onto the nearest visible hostile within
+    /// the wielded bow's max range. Falls back to the player's tile.
+    fn open(world: &World) -> Self {
+        let player = world.player_pos();
+        // Look up the wielded bow's range.
+        let max_range = world
+            .player_main_hand_kind()
+            .and_then(|k| k.def().ranged.map(|r| r.max_range))
+            .unwrap_or(10);
+        let pos = world
+            .nearest_visible_hostile(player, max_range)
+            .and_then(|e| world.position_of(e))
+            .unwrap_or(player);
+        Self { pos, max_range }
+    }
+
+    fn move_by(&mut self, dx: i32, dy: i32) {
+        self.pos.x = self.pos.x.saturating_add(dx);
+        self.pos.y = self.pos.y.saturating_add(dy);
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -397,13 +432,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 Skills::starting().foraging
             };
+            let conv = |s: save::SkillSave| Skill { value: s.value, daily_xp: s.daily_xp };
             world.set_player_skills(Skills {
                 fire_making: Skill {
                     value: saved_fm.value,
                     daily_xp: saved_fm.daily_xp,
                 },
                 foraging,
+                melee: conv(run.skills.melee),
+                ranged: conv(run.skills.ranged),
+                dodge: conv(run.skills.dodge),
             });
+            // Re-sync combat stats from the loaded URW skill values so
+            // the player's in-fight bonuses reflect their long-run
+            // training right after load.
+            world.sync_combat_skills_from_skills();
         }
         if run.rng_state != 0 {
             world.rng = Rng::from_state(run.rng_state);
@@ -412,6 +455,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // field existed default to BASELINE via #[serde(default)], so
         // loading is a one-liner — no zero-guard needed.
         world.set_player_speed(run.speed);
+        // Schema v3 combat: restore player + hostiles. A v2 save has
+        // both fields default and the World::new defaults stand. v3+
+        // saves may carry either the legacy single-pool `player_health`
+        // (no-op now — phase 2 ignores it) or the new body-part split.
+        if let Some(bp) = run.player_body_parts.as_ref() {
+            world.set_player_body(save_bp_to_world(bp));
+        }
+        if let Some(eq) = run.player_equipment.as_ref() {
+            world.set_player_equipment(save_equipment_to_world(eq));
+        }
+        if !run.hostiles.is_empty() {
+            // Cornish-bandit literal is the only flavor we restore as
+            // of phase 3. Unknown flavors fall through the default in
+            // `restore_hostiles`.
+            let static_flavor = |s: &str| -> &'static str {
+                match s {
+                    "cornish_bandit" => "cornish_bandit",
+                    _ => "unknown",
+                }
+            };
+            let restored: Vec<world::HostileSnapshot> = run
+                .hostiles
+                .iter()
+                .map(|h| {
+                    let main_hand = if h.wielded_kind.is_empty() {
+                        None
+                    } else {
+                        items::ItemKind::from_save_key(&h.wielded_kind)
+                    };
+                    let off_hand = if h.off_hand_kind.is_empty() {
+                        None
+                    } else {
+                        items::ItemKind::from_save_key(&h.off_hand_kind)
+                    };
+                    let worn_kinds: Vec<items::ItemKind> = h
+                        .worn_kinds
+                        .iter()
+                        .filter_map(|s| items::ItemKind::from_save_key(s))
+                        .collect();
+                    let body = match h.body_parts.as_ref() {
+                        Some(bp) => save_bp_to_world(bp),
+                        None => world::BodyParts::starting_human(),
+                    };
+                    world::HostileSnapshot {
+                        pos: world::Position { x: h.x, y: h.y },
+                        body,
+                        main_hand,
+                        off_hand,
+                        worn_kinds,
+                        flavor: static_flavor(&h.flavor),
+                    }
+                })
+                .collect();
+            world.restore_hostiles(restored);
+        }
         // Phase-11b: restore terrain mutations (chopped trees, etc.)
         // after chunkgen has produced the chunk defaults.
         if !run.terrain_mutations.is_empty() {
@@ -460,6 +558,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         world.recompute_fov();
     }
 
+    // First-encounter bandit. Drops in on a fresh run AND on v2 saves
+    // that predate the hostile-save field — both leave `has_any_hostile`
+    // false. v3+ saves with hostiles restored skip this.
+    if !world.has_any_hostile() {
+        world.spawn_starter_bandit();
+    }
+
     // Track dawn crossings for auto-save-on-dawn. Init from the (possibly
     // loaded) clock so a loaded save mid-day doesn't immediately re-save.
     let mut last_dawn_idx = dawns_elapsed(world.clock_seconds);
@@ -502,6 +607,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // so we can pick replacements for the items.rs / world.rs glyph
     // fields.
     let mut glyph_palette: Option<u8> = None;
+
+    // Ranged-targeting cursor. Opened by the `Aim` verb (via
+    // `ExecuteOutcome::OpenAim`); A commits the shot, B cancels.
+    // Sits between command_menu and pause priority — see input loop
+    // below.
+    let mut target_cursor: Option<TargetCursor> = None;
 
     // Overmap mode. `M` (desktop) toggles it. Cursor lives on the mode
     // struct; `last_overmap_destination` survives close/reopen so the
@@ -628,9 +739,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     {
                         match action::evaluate(&world, *id) {
                             action::Availability::Available { .. } => {
-                                let action::ExecuteOutcome::Done(msg) =
-                                    action::execute(&mut world, *id);
-                                log_info!("[radial] {}", msg);
+                                match action::execute(&mut world, *id) {
+                                    action::ExecuteOutcome::Done(msg) => {
+                                        log_info!("[radial] {}", msg);
+                                    }
+                                    action::ExecuteOutcome::OpenAim => {
+                                        target_cursor = Some(TargetCursor::open(&world));
+                                    }
+                                }
                             }
                             action::Availability::Unavailable { reason } => {
                                 log_info!("[radial] can't '{}': {}", name, reason);
@@ -652,6 +768,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Action::A => {
                         let _ = std::fs::remove_file(save_dir.join(RUN_FILE));
                         world = World::new(WORLD_W, WORLD_H);
+                        world.spawn_starter_bandit();
                         prev_run_header = None;
                         last_dawn_idx = dawns_elapsed(world.clock_seconds);
                         command_menu = None;
@@ -697,6 +814,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let _ = std::fs::remove_file(save_dir.join(META_FILE));
                                 let _ = std::fs::remove_file(save_dir.join(RUN_FILE));
                                 world = World::new(WORLD_W, WORLD_H);
+                                world.spawn_starter_bandit();
                                 meta = MetaSave::empty(SaveHeader::fresh(None));
                                 prev_meta_header = meta.header.clone();
                                 prev_run_header = None;
@@ -713,6 +831,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Action::B | Action::Start => {
                         pause_menu = None;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            // Ranged-targeting cursor. Modal: dpad moves the cursor,
+            // A commits the shot via World::perform_ranged_attack,
+            // B cancels. Closes on commit OR cancel.
+            if let Some(ref mut tc) = target_cursor {
+                match input_action {
+                    Action::Up => tc.move_by(0, -1),
+                    Action::Down => tc.move_by(0, 1),
+                    Action::Left => tc.move_by(-1, 0),
+                    Action::Right => tc.move_by(1, 0),
+                    Action::A => {
+                        if let Some(target) = world.hostile_at(tc.pos.x, tc.pos.y) {
+                            world.perform_ranged_attack(world.player, target);
+                            // Hostile turn after the shot, matching the
+                            // melee bump flow.
+                            world.tick_hostiles();
+                        } else {
+                            world.push_message("No target there.".to_string());
+                        }
+                        target_cursor = None;
+                    }
+                    Action::B => {
+                        target_cursor = None;
                     }
                     _ => {}
                 }
@@ -820,26 +966,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     Action::A => {
-                        // Only the Crafting tab consumes A (queues a
-                        // recipe); Inventory and Skills are read-only.
-                        if state.tab == InfoTab::Crafting {
-                            if let Some(recipe) = crafting::RECIPES.get(state.selected) {
-                                match action::evaluate(&world, recipe.action) {
-                                    action::Availability::Available { .. } => {
-                                        let action::ExecuteOutcome::Done(msg) =
-                                            action::execute(&mut world, recipe.action);
-                                        log_info!("[craft] {}", msg);
-                                        info_menu = None;
-                                    }
-                                    action::Availability::Unavailable { reason } => {
-                                        log_info!(
-                                            "[craft] can't '{}': {}",
-                                            recipe.name,
-                                            reason
-                                        );
+                        match state.tab {
+                            InfoTab::Crafting => {
+                                if let Some(recipe) = crafting::RECIPES.get(state.selected) {
+                                    match action::evaluate(&world, recipe.action) {
+                                        action::Availability::Available { .. } => {
+                                            match action::execute(&mut world, recipe.action) {
+                                                action::ExecuteOutcome::Done(msg) => {
+                                                    log_info!("[craft] {}", msg);
+                                                    info_menu = None;
+                                                }
+                                                action::ExecuteOutcome::OpenAim => {
+                                                    // Crafting recipes never open the aim
+                                                    // cursor, but match exhaustively to keep
+                                                    // the variant disciplined.
+                                                    info_menu = None;
+                                                }
+                                            }
+                                        }
+                                        action::Availability::Unavailable { reason } => {
+                                            log_info!(
+                                                "[craft] can't '{}': {}",
+                                                recipe.name,
+                                                reason
+                                            );
+                                        }
                                     }
                                 }
                             }
+                            InfoTab::Inventory => {
+                                // Equip / unequip toggles per the row
+                                // category. The world helpers handle
+                                // pack ↔ slot bouncing and the derived
+                                // Wielded / Worn / OffHand sync.
+                                match inventory_row_at(&world, state.selected) {
+                                    Some(InventoryRow::EquipSlot(slot)) => {
+                                        let msg = world.unequip_to_pack(slot);
+                                        world.push_message(msg);
+                                    }
+                                    Some(InventoryRow::PackItem(kind)) => {
+                                        let msg = world.equip_from_pack(kind);
+                                        world.push_message(msg);
+                                    }
+                                    None => {}
+                                }
+                            }
+                            InfoTab::Skills => {}
                         }
                     }
                     Action::B | Action::Select => {
@@ -897,10 +1069,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let id = action::ALL_ACTIONS[selected].id;
                         match action::evaluate(&world, id) {
                             action::Availability::Available { .. } => {
-                                let action::ExecuteOutcome::Done(msg) =
-                                    action::execute(&mut world, id);
-                                log_info!("[menu] {}", msg);
-                                command_menu = None;
+                                match action::execute(&mut world, id) {
+                                    action::ExecuteOutcome::Done(msg) => {
+                                        log_info!("[menu] {}", msg);
+                                        command_menu = None;
+                                    }
+                                    action::ExecuteOutcome::OpenAim => {
+                                        target_cursor = Some(TargetCursor::open(&world));
+                                        command_menu = None;
+                                    }
+                                }
                             }
                             action::Availability::Unavailable { reason } => {
                                 // Stay open so the player can pick another.
@@ -931,10 +1109,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Action::A => {
                     // Route through the same dispatcher the command
                     // menu uses so Pickup's cost + side-effects stay
-                    // in one place (action.rs).
-                    let action::ExecuteOutcome::Done(msg) =
-                        action::execute(&mut world, action::ActionId::Pickup);
-                    log_debug!("{}", msg);
+                    // in one place (action.rs). Pickup never returns
+                    // OpenAim, but match exhaustively for discipline.
+                    match action::execute(&mut world, action::ActionId::Pickup) {
+                        action::ExecuteOutcome::Done(msg) => log_debug!("{}", msg),
+                        action::ExecuteOutcome::OpenAim => {}
+                    }
                 }
                 Action::Start => {
                     pause_menu = Some(0);
@@ -1024,6 +1204,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = std::fs::remove_file(save_dir.join(RUN_FILE));
                 world = World::with_seed(WORLD_W, WORLD_H, new_seed);
                 world.ensure_player_ring();
+                world.spawn_starter_bandit();
                 world.recompute_fov();
                 prev_run_header = None;
                 command_menu = None;
@@ -1041,16 +1222,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // pitch-tent banner.
         if dead.is_none() {
             let needs_now = world.player_needs();
-            if needs_now.is_dead() {
-                if let Some(cause) = DeathCause::from_needs(&needs_now) {
-                    if world.active_action.is_some() {
-                        world.cancel_multi_turn();
-                    }
-                    command_menu = None;
-                    info_menu = None;
-                    log_info!("[death] {:?}", cause);
-                    dead = Some(cause);
+            let combat_kill = world.player_killed_by_combat;
+            let needs_cause = if needs_now.is_dead() {
+                DeathCause::from_needs(&needs_now)
+            } else {
+                None
+            };
+            // Combat kill takes priority over needs decay so the right
+            // epitaph shows when a bandit finishes a thirsty player.
+            let cause = if combat_kill {
+                Some(DeathCause::Combat)
+            } else {
+                needs_cause
+            };
+            if let Some(cause) = cause {
+                if world.active_action.is_some() {
+                    world.cancel_multi_turn();
                 }
+                command_menu = None;
+                info_menu = None;
+                log_info!("[death] {:?}", cause);
+                dead = Some(cause);
             }
         }
 
@@ -1114,6 +1306,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let tint = brightness_at(world.clock_seconds);
         let player_skills = world.player_skills();
         let calendar_day = world.calendar_day;
+        let player_body = world.player_body();
+        let player_stamina = world.player_stamina();
         let mut ui_cells = build_ui_cells(
             &palette,
             needs,
@@ -1123,8 +1317,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             is_night,
             player_skills,
             calendar_day,
+            player_body,
+            player_stamina,
         );
+        if target_cursor.is_none() {
+            draw_message_line(&mut ui_cells, &world, &palette);
+        }
         draw_here_line(&mut ui_cells, &world, &palette);
+        if let Some(ref tc) = target_cursor {
+            draw_target_cursor(&mut ui_cells, &world, tc, cam_x, cam_y, &palette);
+        }
         if let Some(active) = world.active_action.as_ref() {
             draw_multi_turn_banner(&mut ui_cells, active, &palette);
         }
@@ -1290,6 +1492,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Color::RGB(r, gn, b)
                         };
                     }
+                    // Non-player entities (bandits etc.) render above
+                    // ground items but below the player @ — so a bandit
+                    // standing on a dropped spear shows the bandit, but
+                    // if the player and a bandit ever overlap (death
+                    // tile) the @ wins.
+                    if let Some((g, ec)) = world::entity_glyph_at(&world, wx as i32, wy as i32) {
+                        glyph = g;
+                        fg = Color::RGB(ec[0], ec[1], ec[2]);
+                    }
                     if wx == pwx && wy == pwy {
                         glyph = b'@';
                         fg = palette.player_fg;
@@ -1423,6 +1634,71 @@ fn fresh_world_seed() -> u64 {
     z ^ (z >> 31)
 }
 
+/// Convert in-memory body-part HP into the save struct.
+fn world_bp_to_save(bp: &world::BodyParts) -> save::BodyPartsSave {
+    let c = |p: world::BodyPartHp| save::BodyPartSaveCell { hp: p.hp, max: p.max };
+    save::BodyPartsSave {
+        head: c(bp.head),
+        torso: c(bp.torso),
+        l_arm: c(bp.l_arm),
+        r_arm: c(bp.r_arm),
+        l_leg: c(bp.l_leg),
+        r_leg: c(bp.r_leg),
+    }
+}
+
+/// Convert in-memory `Equipment` into save bytes. Empty slots become
+/// the empty string (forward-compat default).
+fn world_equipment_to_save(eq: &world::Equipment) -> save::EquipmentSave {
+    let s = |k: Option<items::ItemKind>| k.map(|x| x.save_key().to_string()).unwrap_or_default();
+    save::EquipmentSave {
+        main_hand: s(eq.main_hand),
+        off_hand: s(eq.off_hand),
+        head: s(eq.head),
+        torso: s(eq.torso),
+        l_arm: s(eq.l_arm),
+        r_arm: s(eq.r_arm),
+        l_leg: s(eq.l_leg),
+        r_leg: s(eq.r_leg),
+    }
+}
+
+fn save_equipment_to_world(eq: &save::EquipmentSave) -> world::Equipment {
+    let p = |s: &str| items::ItemKind::from_save_key(s);
+    world::Equipment {
+        main_hand: p(&eq.main_hand),
+        off_hand: p(&eq.off_hand),
+        head: p(&eq.head),
+        torso: p(&eq.torso),
+        l_arm: p(&eq.l_arm),
+        r_arm: p(&eq.r_arm),
+        l_leg: p(&eq.l_leg),
+        r_leg: p(&eq.r_leg),
+    }
+}
+
+/// Reverse of `world_bp_to_save`. Defaults a zero-max cell to the
+/// canonical starting maxes so a partial save (e.g. only torso written)
+/// still loads into a sane body.
+fn save_bp_to_world(bp: &save::BodyPartsSave) -> world::BodyParts {
+    let starting = world::BodyParts::starting_human();
+    let cell = |saved: save::BodyPartSaveCell, fallback: world::BodyPartHp| {
+        if saved.max <= 0 {
+            fallback
+        } else {
+            world::BodyPartHp { hp: saved.hp, max: saved.max }
+        }
+    };
+    world::BodyParts {
+        head: cell(bp.head, starting.head),
+        torso: cell(bp.torso, starting.torso),
+        l_arm: cell(bp.l_arm, starting.l_arm),
+        r_arm: cell(bp.r_arm, starting.r_arm),
+        l_leg: cell(bp.l_leg, starting.l_leg),
+        r_leg: cell(bp.r_leg, starting.r_leg),
+    }
+}
+
 fn save_game(
     save_dir: &std::path::Path,
     meta: &mut MetaSave,
@@ -1480,6 +1756,18 @@ fn save_game(
             value: player_skills.foraging.value,
             daily_xp: player_skills.foraging.daily_xp,
         },
+        melee: SkillSave {
+            value: player_skills.melee.value,
+            daily_xp: player_skills.melee.daily_xp,
+        },
+        ranged: SkillSave {
+            value: player_skills.ranged.value,
+            daily_xp: player_skills.ranged.daily_xp,
+        },
+        dodge: SkillSave {
+            value: player_skills.dodge.value,
+            daily_xp: player_skills.dodge.daily_xp,
+        },
     };
     run.rng_state = world.rng.state;
     run.seed = world.seed;
@@ -1509,6 +1797,32 @@ fn save_game(
             x,
             y,
             decoration: d,
+        })
+        .collect();
+    let player_body = world.player_body();
+    run.player_body_parts = Some(world_bp_to_save(&player_body));
+    let player_eq = world.player_equipment();
+    run.player_equipment = Some(world_equipment_to_save(&player_eq));
+    // Leave the legacy single-pool field empty; phase 2 + later writes
+    // route through body_parts. A v3 player_health field still loads
+    // cleanly via serde but is never written.
+    run.player_health = None;
+    run.hostiles = world
+        .snapshot_hostiles()
+        .into_iter()
+        .map(|snap| save::HostileSave {
+            x: snap.pos.x,
+            y: snap.pos.y,
+            // hp + max_hp stay populated for any older binary that
+            // wants to read the file — surface the torso pool as the
+            // closest single-pool analog.
+            hp: snap.body.torso.hp,
+            max_hp: snap.body.torso.max,
+            wielded_kind: snap.main_hand.map(|k| k.save_key().to_string()).unwrap_or_default(),
+            flavor: snap.flavor.to_string(),
+            body_parts: Some(world_bp_to_save(&snap.body)),
+            off_hand_kind: snap.off_hand.map(|k| k.save_key().to_string()).unwrap_or_default(),
+            worn_kinds: snap.worn_kinds.iter().map(|k| k.save_key().to_string()).collect(),
         })
         .collect();
     run.active_action = world.active_action.as_ref().map(|active| ActiveActionSave {
@@ -1561,6 +1875,8 @@ fn build_ui_cells(
     is_night: bool,
     skills: Skills,
     calendar_day: u32,
+    body: world::BodyParts,
+    stamina: (i16, i16),
 ) -> Vec<Option<Cell>> {
     let mut cells = vec![None; (WORLD_W * WORLD_H) as usize];
 
@@ -1634,10 +1950,64 @@ fn build_ui_cells(
         }
     }
 
-    // Row 2 left: Fire Making skill readout. Single-skill HUD for slice 1.
-    let fm = skills.get(SkillKind::FireMaking);
-    let line = format!("{} {}%", SkillKind::FireMaking.display_name(), fm.value);
-    put_text(&mut cells, 1, 2, &line, palette.hud_fg, palette.hud_bg);
+    // Row 2 left: vital-HP readout. With per-body-part HP, the single
+    // number that answers "am I about to die?" is the worst of the two
+    // vitals — head and torso. Limbs can cripple but won't kill. Show
+    // head + torso explicitly so the player sees both, color the line
+    // by the worst-percent of the two.
+    let head_pct = body.head.hp.max(0) as i32 * 100 / body.head.max.max(1) as i32;
+    let torso_pct = body.torso.hp.max(0) as i32 * 100 / body.torso.max.max(1) as i32;
+    let worst = head_pct.min(torso_pct);
+    let hp_fg = if worst <= 25 {
+        palette.need_critical_fg
+    } else if worst <= 50 {
+        Color::RGB(230, 200, 90)
+    } else {
+        palette.hud_fg
+    };
+    let hp_line = format!("HP H{} T{}", body.head.hp.max(0), body.torso.hp.max(0));
+    put_text(&mut cells, 1, 2, &hp_line, hp_fg, palette.hud_bg);
+
+    // Stamina readout right after HP. Mirror of HP coloring: dims to
+    // critical at low stamina. Only shown when stamina is meaningful
+    // (max > 0).
+    let (stam_cur, stam_max) = stamina;
+    if stam_max > 0 {
+        let stam_pct = stam_cur.max(0) as i32 * 100 / stam_max as i32;
+        let stam_fg = if stam_pct <= 15 {
+            palette.need_critical_fg
+        } else if stam_pct <= 35 {
+            Color::RGB(230, 200, 90)
+        } else {
+            palette.hud_fg
+        };
+        let stam_line = format!(" SP {}", stam_cur.max(0));
+        let after_hp_x = 1 + hp_line.len() as i32;
+        put_text(&mut cells, after_hp_x, 2, &stam_line, stam_fg, palette.hud_bg);
+    }
+
+    // Crippled-status badge after stamina. Reads functionally rather
+    // than anatomically — what the player can't do matters more than
+    // which limb. Phase 2 rules: any arm crippled → can't wield (any
+    // wielded weapon drops); any leg crippled → effective speed halved.
+    let arm_out = body.l_arm.is_crippled() || body.r_arm.is_crippled();
+    let leg_out = body.l_leg.is_crippled() || body.r_leg.is_crippled();
+    if arm_out || leg_out {
+        let after_x = 1 + hp_line.len() as i32 + 1 + format!(" SP {}", stam_cur.max(0)).len() as i32 + 1;
+        let tag = match (arm_out, leg_out) {
+            (true, true) => "[no weapon / lame]",
+            (true, false) => "[no weapon]",
+            (false, true) => "[lame]",
+            (false, false) => "",
+        };
+        put_text(&mut cells, after_x, 2, tag, palette.need_critical_fg, palette.hud_bg);
+    }
+
+    // Per-skill readouts live in the Select info menu's Skills tab —
+    // base HUD reserves row 2 for vitals (HP + crippled status) so
+    // combat-relevant info reads cleanly at a glance. `skills` stays
+    // in the signature for future right-of-HP indicators.
+    let _ = skills;
 
     cells
 }
@@ -1762,6 +2132,94 @@ fn grass_dot_visible(x: i32, y: i32, seed: u64) -> bool {
 ///
 /// Width budget: starts at col 1, ends before col 39. Truncates with
 /// `...` if the join overflows.
+/// Surface the two most recent log entries on consecutive rows above
+/// the here-line. Two rows are enough that a single combat exchange
+/// (player swing + bandit reply) is fully visible without the second
+/// message swallowing the first. Older entries scroll off; a full
+/// scroll-back panel is a follow-up.
+fn draw_message_line(cells: &mut [Option<Cell>], world: &World, palette: &Palette) {
+    let count = world.message_log.len();
+    if count == 0 {
+        return;
+    }
+    let max = (WORLD_W as usize).saturating_sub(2);
+    let truncate = |s: &str| {
+        if s.len() <= max {
+            s.to_string()
+        } else {
+            let mut t = s.to_string();
+            t.truncate(max.saturating_sub(3));
+            t.push_str("...");
+            t
+        }
+    };
+    // Bottom row (just above the here-line) is the *newest* entry; the
+    // row above it is the previous entry (dimmed so the eye glides to
+    // the newest first). Reads top→bottom as "earlier, then now."
+    let newest = world.message_log.back().expect("count > 0");
+    let newest_row = WORLD_H as i32 - 2;
+    put_text(cells, 1, newest_row, &truncate(newest), palette.hud_fg, palette.hud_bg);
+    if count >= 2 {
+        let prev = &world.message_log[count - 2];
+        let prev_row = WORLD_H as i32 - 3;
+        put_text(cells, 1, prev_row, &truncate(prev), palette.panel_dim_fg, palette.hud_bg);
+    }
+}
+
+/// Paint the ranged-targeting cursor overlay: yellow '+' on the cursor
+/// cell and a HUD line above the here-line showing range / to-hit% /
+/// target info. The cursor sits on top of whatever's in the cell;
+/// we don't blank the underlying glyph so the player still sees the
+/// bandit through the crosshair.
+fn draw_target_cursor(
+    cells: &mut [Option<Cell>],
+    world: &World,
+    cursor: &TargetCursor,
+    cam_x: i64,
+    cam_y: i64,
+    palette: &Palette,
+) {
+    let vx = (cursor.pos.x as i64 - cam_x) as i32;
+    let vy = (cursor.pos.y as i64 - cam_y) as i32;
+    if vx >= 0 && vy >= 0 && (vx as u32) < WORLD_W && (vy as u32) < WORLD_H {
+        let cursor_fg = Color::RGB(240, 220, 60);
+        // Underlying cell's bg is preserved by reading prev_cells via
+        // put_cell-on-top — for simplicity, paint a '+' over whatever
+        // bg is at that index.
+        let idx = (vy as u32 * WORLD_W + vx as u32) as usize;
+        let bg = cells[idx].map(|c| c.bg).unwrap_or(palette.hud_bg);
+        cells[idx] = Some(Cell { glyph: b'+', fg: cursor_fg, bg });
+    }
+    // HUD line above the here-line: "Aim: chest  hit 65%  rng 4/10".
+    let player_pos = world.player_pos();
+    let dx = cursor.pos.x - player_pos.x;
+    let dy = cursor.pos.y - player_pos.y;
+    let range = dx.abs().max(dy.abs()) as u8;
+    let target = world.hostile_at(cursor.pos.x, cursor.pos.y);
+    let los = world.player_has_los_to(cursor.pos);
+    let row = WORLD_H as i32 - 2;
+    let line = match target {
+        Some(t) => {
+            let pct = world.estimate_ranged_hit_pct(t);
+            if range > cursor.max_range {
+                format!("Aim: out of range  rng {}/{}", range, cursor.max_range)
+            } else if !los {
+                format!("Aim: no LoS  rng {}/{}", range, cursor.max_range)
+            } else {
+                format!("Aim: target  hit {}%  rng {}/{}", pct, range, cursor.max_range)
+            }
+        }
+        None => format!("Aim: empty  rng {}/{}", range, cursor.max_range),
+    };
+    let max = (WORLD_W as usize).saturating_sub(2);
+    let mut s = line;
+    if s.len() > max {
+        s.truncate(max.saturating_sub(3));
+        s.push_str("...");
+    }
+    put_text(cells, 1, row, &s, palette.hud_fg, palette.hud_bg);
+}
+
 fn draw_here_line(cells: &mut [Option<Cell>], world: &World, palette: &Palette) {
     let row = WORLD_H as i32 - 1;
     // Godmode badge — render flush-right so it doesn't collide with
@@ -1998,10 +2456,33 @@ fn draw_glyph_palette(cells: &mut [Option<Cell>], cursor: u8, palette: &Palette)
 
 fn info_tab_row_count(world: &World, tab: InfoTab) -> usize {
     match tab {
-        InfoTab::Inventory => world.player_pack().contents.len(),
+        // Inventory shows every equip slot (8) on top, then every pack
+        // item. A on a slot row unequips; A on a pack row equips.
+        InfoTab::Inventory => world::EquipSlot::ALL.len() + world.player_pack().contents.len(),
         InfoTab::Crafting => crafting::RECIPES.len(),
-        InfoTab::Skills => 1, // Fire Making; slice-2 adds more skills
+        // Fire Making, Foraging, Melee, Ranged, Dodge.
+        InfoTab::Skills => 5,
     }
+}
+
+/// Map an inventory-tab row index to the action it should trigger when
+/// A is pressed. `None` means the row is informational only.
+enum InventoryRow {
+    EquipSlot(world::EquipSlot),
+    PackItem(items::ItemKind),
+}
+
+fn inventory_row_at(world: &World, selected: usize) -> Option<InventoryRow> {
+    let slot_count = world::EquipSlot::ALL.len();
+    if selected < slot_count {
+        return Some(InventoryRow::EquipSlot(world::EquipSlot::ALL[selected]));
+    }
+    let pack_idx = selected - slot_count;
+    world
+        .player_pack()
+        .contents
+        .get(pack_idx)
+        .map(|i| InventoryRow::PackItem(i.kind))
 }
 
 fn draw_info_menu(
@@ -2106,35 +2587,69 @@ fn draw_info_inventory(
     palette: &Palette,
 ) {
     let pack = world.player_pack();
-    if pack.contents.is_empty() {
-        put_text(
-            cells,
-            layout.inner_x(),
-            layout.first_row_y(),
-            "(pack empty)",
-            palette.panel_dim_fg,
-            palette.panel_bg,
-        );
-        return;
-    }
+    let equipment = world.player_equipment();
 
     let max_rows = (layout.footer_y() - layout.first_row_y() - 1).max(1) as usize;
-    let visible = pack.contents.iter().take(max_rows);
-    for (i, item) in visible.enumerate() {
-        let row_y = layout.first_row_y() + i as i32;
-        let is_selected = i == selected;
-        let label = item.display_label();
-        let weight = fmt_weight(item.total_weight_g());
+    let mut row_idx = 0usize;
+
+    // Equipment slots first: one row per slot, labelled "[slot] item" or
+    // "[slot] —". Selecting one and pressing A unequips the slot.
+    for &slot in &world::EquipSlot::ALL {
+        if row_idx >= max_rows {
+            break;
+        }
+        let row_y = layout.first_row_y() + row_idx as i32;
+        let is_selected = row_idx == selected;
+        let label = match equipment.get(slot) {
+            Some(kind) => format!("[{}] {}", slot.label(), kind.name()),
+            None => format!("[{}] —", slot.label()),
+        };
         draw_menu_row(
             cells,
             layout,
             row_y,
             is_selected,
             &label,
-            palette.panel_fg,
-            Some((&weight, palette.panel_dim_fg)),
+            palette.panel_dim_fg,
+            None,
             palette,
         );
+        row_idx += 1;
+    }
+
+    // Pack rows below. Skip the empty hint if we have equipment lines
+    // above — the player still sees the slot list when the pack is empty.
+    if pack.contents.is_empty() && row_idx < max_rows {
+        let row_y = layout.first_row_y() + row_idx as i32;
+        put_text(
+            cells,
+            layout.inner_x(),
+            row_y,
+            "(pack empty)",
+            palette.panel_dim_fg,
+            palette.panel_bg,
+        );
+    } else {
+        for item in pack.contents.iter() {
+            if row_idx >= max_rows {
+                break;
+            }
+            let row_y = layout.first_row_y() + row_idx as i32;
+            let is_selected = row_idx == selected;
+            let label = item.display_label();
+            let weight = fmt_weight(item.total_weight_g());
+            draw_menu_row(
+                cells,
+                layout,
+                row_y,
+                is_selected,
+                &label,
+                palette.panel_fg,
+                Some((&weight, palette.panel_dim_fg)),
+                palette,
+            );
+            row_idx += 1;
+        }
     }
 
     // Pack-total summary on the row just above the footer.
@@ -2159,18 +2674,22 @@ fn draw_info_skills(
     palette: &Palette,
 ) {
     let skills = world.player_skills();
-    // Slice-1 has just Fire Making; slice-2 extends the iter() chain
-    // with Cookery/Foraging/Fishing/etc.
-    let rows: Vec<(SkillKind, &skill::Skill)> = vec![(
-        SkillKind::FireMaking,
-        skills.get(SkillKind::FireMaking),
-    )];
+    let rows: [(SkillKind, &skill::Skill); 5] = [
+        (SkillKind::FireMaking, skills.get(SkillKind::FireMaking)),
+        (SkillKind::Foraging, skills.get(SkillKind::Foraging)),
+        (SkillKind::Melee, skills.get(SkillKind::Melee)),
+        (SkillKind::Ranged, skills.get(SkillKind::Ranged)),
+        (SkillKind::Dodge, skills.get(SkillKind::Dodge)),
+    ];
 
     for (i, (kind, s)) in rows.into_iter().enumerate() {
         let row_y = layout.first_row_y() + i as i32;
         let is_selected = i == selected;
         let label = kind.display_name();
-        let value = format!("{}%", s.value);
+        // Single row per skill: value % + daily XP banked toward next
+        // level. Drops the multi-line sub-row pattern so all five fit
+        // in the 22-cell panel without scrolling.
+        let value = format!("{}% (+{}xp)", s.value, s.daily_xp);
         draw_menu_row(
             cells,
             layout,
@@ -2180,16 +2699,6 @@ fn draw_info_skills(
             palette.panel_fg,
             Some((&value, palette.panel_dim_fg)),
             palette,
-        );
-        // Sub-line: daily XP toward next level.
-        let xp_line = format!("  daily XP {}", s.daily_xp);
-        put_text(
-            cells,
-            layout.inner_x(),
-            row_y + 1,
-            &xp_line,
-            palette.panel_dim_fg,
-            palette.panel_bg,
         );
     }
 }
