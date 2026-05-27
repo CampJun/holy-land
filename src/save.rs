@@ -180,6 +180,11 @@ pub struct RunSave {
     // string ("creep"/"walk"/"jog"). Empty / unknown → `Walk` default.
     #[serde(default)]
     pub player_stride: String,
+    // PR B Drag card (additive, no schema bump): true while the player
+    // is mid-drag with a Log on their cell. Older saves load with the
+    // flag clear (no drag in progress).
+    #[serde(default)]
+    pub player_dragging: bool,
 }
 
 /// PR B Attributes save block. Five attribute scores + per-attribute
@@ -456,6 +461,7 @@ impl RunSave {
             player_equipment: None,
             player_attributes: None,
             player_stride: String::new(),
+            player_dragging: false,
         }
     }
 }
@@ -778,6 +784,7 @@ mod tests {
             player_equipment: None,
             player_attributes: None,
             player_stride: String::new(),
+            player_dragging: false,
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
@@ -883,6 +890,7 @@ mod tests {
             player_equipment: None,
             player_attributes: None,
             player_stride: String::new(),
+            player_dragging: false,
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();

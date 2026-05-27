@@ -102,6 +102,11 @@ pub enum ItemKind {
     CoatOfPlates,
     /// Large kite/round shield — Knight off-hand.
     LargeShield,
+    /// PR B Drag card: a whole felled log. Too heavy to fit in any pack
+    /// — handled exclusively via the Drag verb. `ChopLog` at the
+    /// destination converts one log into 3-6 firewood. 200 kg per the
+    /// card spec (`Felled tree weight: ~200 kg`).
+    Log,
 }
 
 /// All per-kind metadata in one place. Adding a new `ItemKind` variant is
@@ -201,6 +206,7 @@ const ALL_KINDS: &[ItemKind] = &[
     ItemKind::GreatHelm,
     ItemKind::CoatOfPlates,
     ItemKind::LargeShield,
+    ItemKind::Log,
 ];
 
 impl ItemKind {
@@ -872,6 +878,21 @@ impl ItemKind {
                 glyph: b'O',
                 color: [130, 80, 50],
                 default_weight_g: 4_000,
+                blends_with_terrain: false,
+                weapon: None,
+                armor: None,
+                ranged: None,
+            },
+            ItemKind::Log => ItemDef {
+                save_key: "log",
+                name: "log",
+                // Fungible so multiple logs stacked on the same cell
+                // collapse to one entry — they're whole-felled trunks,
+                // indistinguishable from each other for v1.
+                is_fungible: true,
+                glyph: b'L',
+                color: [120, 80, 50],
+                default_weight_g: 200_000,
                 blends_with_terrain: false,
                 weapon: None,
                 armor: None,

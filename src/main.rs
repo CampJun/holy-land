@@ -489,6 +489,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(stride) = world::StrideMode::from_save_key(&run.player_stride) {
             world.player_stride = stride;
         }
+        world.player_dragging = run.player_dragging;
         if !run.hostiles.is_empty() {
             // Cornish-bandit literal is the only flavor we restore as
             // of phase 3. Unknown flavors fall through the default in
@@ -1895,6 +1896,7 @@ fn save_game(
         attribute_xp: attrs.attribute_xp,
     });
     run.player_stride = world.player_stride.save_key().to_string();
+    run.player_dragging = world.player_dragging;
     // Leave the legacy single-pool field empty; phase 2 + later writes
     // route through body_parts. A v3 player_health field still loads
     // cleanly via serde but is never written.

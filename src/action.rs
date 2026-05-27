@@ -106,6 +106,18 @@ pub enum ActionId {
     /// `spend_action_time` chain. Cost = `MOVE_COST_TILE` (one tile-step
     /// of time, regardless of stride).
     Wait,
+    /// PR B Drag card: grab the adjacent Log and start dragging it. The
+    /// log slides onto the player's cell; subsequent moves drag it
+    /// along (with 2× movement cost) via `World::slide_dragged_log`.
+    /// Costs 200 moves (~2 sec) to represent grabbing the log.
+    DragStart,
+    /// PR B Drag card: release the dragged log on the player's current
+    /// cell. Free (0 moves) — letting go has no in-fiction cost.
+    DragEnd,
+    /// PR B Drag card: chop a Log on the player's cell into 3-6
+    /// firewood. Requires an axe in pack. 60 game-seconds = 6000 moves
+    /// per the card's spec.
+    ChopLog,
 }
 
 impl ActionId {
@@ -168,6 +180,9 @@ impl ActionId {
             ActionId::Disarm => 150,
             ActionId::CycleStride => 0,
             ActionId::Wait => crate::world::MOVE_COST_TILE,
+            ActionId::DragStart => 200,
+            ActionId::DragEnd => 0,
+            ActionId::ChopLog => 6_000,
         }
     }
 
@@ -207,6 +222,9 @@ impl ActionId {
             ActionId::Disarm => "disarm",
             ActionId::CycleStride => "cycle_stride",
             ActionId::Wait => "wait",
+            ActionId::DragStart => "drag_start",
+            ActionId::DragEnd => "drag_end",
+            ActionId::ChopLog => "chop_log",
         }
     }
 
@@ -243,6 +261,9 @@ impl ActionId {
             "disarm" => ActionId::Disarm,
             "cycle_stride" => ActionId::CycleStride,
             "wait" => ActionId::Wait,
+            "drag_start" => ActionId::DragStart,
+            "drag_end" => ActionId::DragEnd,
+            "chop_log" => ActionId::ChopLog,
             _ => return None,
         })
     }
@@ -388,6 +409,21 @@ pub const ALL_ACTIONS: &[ContextAction] = &[
         name: "Wait",
         description: "Pass one tile-step of time without moving.",
     },
+    ContextAction {
+        id: ActionId::DragStart,
+        name: "Drag log",
+        description: "Grab an adjacent log to drag with you.",
+    },
+    ContextAction {
+        id: ActionId::DragEnd,
+        name: "Release log",
+        description: "Stop dragging the log on your current cell.",
+    },
+    ContextAction {
+        id: ActionId::ChopLog,
+        name: "Chop log",
+        description: "Split a log on this cell into 3-6 firewood (axe).",
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -496,7 +532,62 @@ pub fn evaluate(world: &World, id: ActionId) -> Availability {
         ActionId::Throw => eval_throw(world),
         ActionId::CycleStride => Availability::Available { cost_game_seconds: 0 },
         ActionId::Wait => Availability::Available { cost_game_seconds: cost },
+        ActionId::DragStart => eval_drag_start(world, cost),
+        ActionId::DragEnd => {
+            if world.player_dragging {
+                Availability::Available { cost_game_seconds: 0 }
+            } else {
+                Availability::Unavailable { reason: "not dragging anything" }
+            }
+        }
+        ActionId::ChopLog => eval_chop_log(world, cost),
     }
+}
+
+fn eval_drag_start(world: &World, cost: u32) -> Availability {
+    if world.player_dragging {
+        return Availability::Unavailable { reason: "already dragging" };
+    }
+    if find_adjacent_log(world).is_some() {
+        Availability::Available { cost_game_seconds: cost }
+    } else {
+        Availability::Unavailable { reason: "no log adjacent" }
+    }
+}
+
+fn eval_chop_log(world: &World, cost: u32) -> Availability {
+    if !world.player_pack().has_stack(ItemKind::Axe) {
+        return Availability::Unavailable { reason: "need an axe" };
+    }
+    let pos = world.player_pos();
+    let cell = world
+        .cell_at(pos.x as i64, pos.y as i64)
+        .filter(|c| c.items.iter().any(|i| i.kind == ItemKind::Log));
+    if cell.is_some() {
+        Availability::Available { cost_game_seconds: cost }
+    } else {
+        Availability::Unavailable { reason: "no log on this cell" }
+    }
+}
+
+fn find_adjacent_log(world: &World) -> Option<(i32, i32)> {
+    let p = world.player_pos();
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            let wx = p.x + dx;
+            let wy = p.y + dy;
+            let cell = world.cell_at(wx as i64, wy as i64);
+            if let Some(c) = cell {
+                if c.items.iter().any(|i| i.kind == ItemKind::Log) {
+                    return Some((wx, wy));
+                }
+            }
+        }
+    }
+    None
 }
 
 fn eval_grapple_or_disarm(world: &World, require_wielded: bool) -> Availability {
@@ -792,7 +883,90 @@ pub fn execute(world: &mut World, id: ActionId) -> ExecuteOutcome {
             world.tick_hostiles();
             ExecuteOutcome::Done("you wait.".to_string())
         }
+        ActionId::DragStart => execute_drag_start(world),
+        ActionId::DragEnd => {
+            world.player_dragging = false;
+            ExecuteOutcome::Done("you release the log.".to_string())
+        }
+        ActionId::ChopLog => execute_chop_log(world),
     }
+}
+
+fn execute_drag_start(world: &mut World) -> ExecuteOutcome {
+    let Some((wx, wy)) = find_adjacent_log(world) else {
+        return ExecuteOutcome::Done("no log adjacent".to_string());
+    };
+    // Lift exactly one Log from the source cell.
+    let log = {
+        let cell = match world.cell_at_mut(wx as i64, wy as i64) {
+            Some(c) => c,
+            None => return ExecuteOutcome::Done("no log adjacent".to_string()),
+        };
+        let idx = match cell.items.iter().position(|i| i.kind == ItemKind::Log) {
+            Some(i) => i,
+            None => return ExecuteOutcome::Done("no log adjacent".to_string()),
+        };
+        // Logs are fungible: split off a single unit and leave the rest
+        // on the source cell.
+        let item = &mut cell.items[idx];
+        if item.count > 1 {
+            let mut one = item.clone();
+            one.count = 1;
+            item.count -= 1;
+            one
+        } else {
+            cell.items.remove(idx)
+        }
+    };
+    world.try_drop_to_cell(log);
+    world.player_dragging = true;
+    world.spend_moves(ActionId::DragStart.move_cost());
+    ExecuteOutcome::Done("you grab the log.".to_string())
+}
+
+fn execute_chop_log(world: &mut World) -> ExecuteOutcome {
+    if !world.player_pack().has_stack(ItemKind::Axe) {
+        return ExecuteOutcome::Done("need an axe".to_string());
+    }
+    let pos = world.player_pos();
+    let (wx, wy) = (pos.x as i64, pos.y as i64);
+    // Remove one Log; if none, abort without spending time.
+    {
+        let cell = match world.cell_at_mut(wx, wy) {
+            Some(c) => c,
+            None => return ExecuteOutcome::Done("no log here".to_string()),
+        };
+        let idx = match cell.items.iter().position(|i| i.kind == ItemKind::Log) {
+            Some(i) => i,
+            None => return ExecuteOutcome::Done("no log here".to_string()),
+        };
+        let item = &mut cell.items[idx];
+        if item.count > 1 {
+            item.count -= 1;
+        } else {
+            cell.items.remove(idx);
+        }
+    }
+    let span = (FELLED_FIREWOOD_MAX - FELLED_FIREWOOD_MIN + 1) as u32;
+    let count = FELLED_FIREWOOD_MIN as u16 + (world.rng.next_u32() % span) as u16;
+    world.try_drop_to_cell(ItemInstance::stack(
+        ItemKind::Firewood,
+        count,
+        500,
+        None,
+        ItemMetadata::None,
+    ));
+    // If the chopped log WAS the one being dragged and no logs remain
+    // on this cell, the drag chain breaks — release the flag.
+    let still_has_log = world
+        .cell_at(wx, wy)
+        .map(|c| c.items.iter().any(|i| i.kind == ItemKind::Log))
+        .unwrap_or(false);
+    if !still_has_log {
+        world.player_dragging = false;
+    }
+    world.spend_moves(ActionId::ChopLog.move_cost());
+    ExecuteOutcome::Done(format!("split the log (+{} firewood)", count))
 }
 
 fn execute_grapple(world: &mut World) -> ExecuteOutcome {

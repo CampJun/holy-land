@@ -1529,6 +1529,14 @@ pub struct World {
     /// don't have a stride — bandit speed is the `Speed` ECS component
     /// for now.
     pub player_stride: StrideMode,
+    /// PR B Drag card: the player is currently dragging a `Log`. Set
+    /// via `ActionId::DragStart`, cleared via `DragEnd`. While true:
+    /// tile-step cost in `spend_player_tile_step` doubles per the
+    /// card's "2× movement cost while dragging" rule, and
+    /// `try_move_player` slides a `Log` ItemKind from the player's
+    /// old cell to the new cell as the player walks. The drag breaks
+    /// silently if the log is gone (e.g. the player chopped it up).
+    pub player_dragging: bool,
 }
 
 /// Outcome of one `tick_fast_travel` call. The main loop matches on
@@ -1680,6 +1688,7 @@ impl World {
             message_log: VecDeque::new(),
             player_killed_by_combat: false,
             player_stride: StrideMode::default(),
+            player_dragging: false,
         };
         // First-frame FOV so the renderer doesn't draw a black screen on
         // the very first paint.
@@ -2038,7 +2047,16 @@ impl World {
         // chunk's bounds) — ensure_chunk_ring above already loaded the
         // target ring, so any in-world cell is now reachable.
         if self.godmode || self.cell_walkable_at(nx as i64, ny as i64) {
+            // Capture player's pre-move cell so a dragged log slides
+            // from there onto the new player cell. Done before
+            // `set_player_pos` so the source cell is still authoritative.
+            let dragging = self.player_dragging;
+            let from_x = pos.x as i64;
+            let from_y = pos.y as i64;
             self.set_player_pos(Position { x: nx, y: ny });
+            if dragging {
+                self.slide_dragged_log(from_x, from_y, nx as i64, ny as i64);
+            }
             self.spend_player_tile_step();
             self.recompute_fov();
             // After the player moves, any hostile in the chunk gets a
@@ -2047,6 +2065,51 @@ impl World {
             // proper CDDA speed-based interleaving.
             self.tick_hostiles();
         }
+    }
+
+    /// PR B Drag card: slide one `Log` ItemKind from `(from_x, from_y)`
+    /// to `(to_x, to_y)`, merging into any existing log stack on the
+    /// destination. If no log exists on the source cell (the player
+    /// chopped or dropped it elsewhere), silently clears the dragging
+    /// flag — the chain breaks invisibly rather than leaving the
+    /// player perpetually "dragging" nothing.
+    fn slide_dragged_log(&mut self, from_x: i64, from_y: i64, to_x: i64, to_y: i64) {
+        let log = match self.cell_at_mut(from_x, from_y) {
+            Some(cell) => match cell.items.iter().position(|i| i.kind == crate::items::ItemKind::Log) {
+                Some(idx) => Some(cell.items.remove(idx)),
+                None => None,
+            },
+            None => None,
+        };
+        let Some(log) = log else {
+            self.player_dragging = false;
+            return;
+        };
+        self.try_drop_to_cell_at(to_x, to_y, log);
+    }
+
+    /// Place an `ItemInstance` on an arbitrary cell, merging same-kind
+    /// fungibles per `try_drop_to_cell`. Used by the drag-slide path
+    /// when the destination isn't the player's current cell.
+    pub fn try_drop_to_cell_at(&mut self, wx: i64, wy: i64, item: crate::items::ItemInstance) {
+        let Some(cell) = self.cell_at_mut(wx, wy) else {
+            return;
+        };
+        if item.kind.is_fungible()
+            && matches!(item.metadata, crate::items::ItemMetadata::None)
+            && item.charges.is_none()
+        {
+            if let Some(existing) = cell.items.iter_mut().find(|i| {
+                i.kind == item.kind
+                    && matches!(i.metadata, crate::items::ItemMetadata::None)
+                    && i.charges.is_none()
+                    && i.weight_g_each == item.weight_g_each
+            }) {
+                existing.count = existing.count.saturating_add(item.count);
+                return;
+            }
+        }
+        cell.items.push(item);
     }
 
     /// Pay the player's stride-adjusted tile-step cost: charges
@@ -2066,7 +2129,11 @@ impl World {
             }
         }
         let stride = self.player_stride;
-        self.spend_moves(stride.tile_cost());
+        // PR B Drag card: 2× movement cost while dragging a log.
+        // Composes with stride — a Jog drag is 2× of Jog's already-
+        // fast 0.5 sec/tile = 1.0 sec/tile, etc.
+        let drag_mul: u32 = if self.player_dragging { 2 } else { 1 };
+        self.spend_moves(stride.tile_cost() * drag_mul);
         let drain = stride.stamina_per_tile();
         if drain > 0 {
             self.spend_stamina(self.player, drain);
@@ -3111,28 +3178,7 @@ impl World {
     /// drop ↔ pickup round-trip doesn't fragment stacks.
     pub fn try_drop_to_cell(&mut self, item: crate::items::ItemInstance) {
         let pos = self.player_pos();
-        let wx = pos.x as i64;
-        let wy = pos.y as i64;
-        let Some(cell) = self.cell_at_mut(wx, wy) else {
-            return;
-        };
-        // Only None-metadata fungibles merge; uniques / cooked / cookware
-        // carry per-instance state that must stay separated.
-        if item.kind.is_fungible()
-            && matches!(item.metadata, crate::items::ItemMetadata::None)
-            && item.charges.is_none()
-        {
-            if let Some(existing) = cell.items.iter_mut().find(|i| {
-                i.kind == item.kind
-                    && matches!(i.metadata, crate::items::ItemMetadata::None)
-                    && i.charges.is_none()
-                    && i.weight_g_each == item.weight_g_each
-            }) {
-                existing.count = existing.count.saturating_add(item.count);
-                return;
-            }
-        }
-        cell.items.push(item);
+        self.try_drop_to_cell_at(pos.x as i64, pos.y as i64, item);
     }
 
     /// PR B Drop card: drop `count` units from `pack_idx` of the player's
@@ -5837,6 +5883,95 @@ mod tests {
         // STR 10 → 113 kg (momentary lift); STR 20 → 453.2 kg.
         assert_eq!(crate::items::derived_pack_cap_g(10), 100 * 1133);
         assert_eq!(crate::items::derived_pack_cap_g(20), 400 * 1133);
+    }
+
+    #[test]
+    fn drag_start_lifts_log_onto_player_cell_and_sets_flag() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let pos = world.player_pos();
+        // Spawn a Log on the cell east of the player.
+        let east_x = (pos.x + 1) as i64;
+        let east_y = pos.y as i64;
+        if let Some(c) = world.cell_at_mut(east_x, east_y) {
+            c.items.clear();
+            c.items.push(ItemInstance::stack(ItemKind::Log, 1, 200_000, None, ItemMetadata::None));
+        }
+        match crate::action::execute(&mut world, crate::action::ActionId::DragStart) {
+            crate::action::ExecuteOutcome::Done(_) => {}
+            other => panic!("expected Done, got {:?}", other),
+        }
+        assert!(world.player_dragging, "drag flag should be set");
+        // Log moved off the east cell, onto the player cell.
+        let east_after = world.cell_at(east_x, east_y).unwrap();
+        assert!(east_after.items.iter().all(|i| i.kind != ItemKind::Log));
+        let here = world.cell_at(pos.x as i64, pos.y as i64).unwrap();
+        assert!(here.items.iter().any(|i| i.kind == ItemKind::Log));
+    }
+
+    #[test]
+    fn dragging_a_log_slides_it_along_with_player_moves() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let pos = world.player_pos();
+        // Seed Log on player cell + set flag directly (skipping
+        // DragStart eval so the test stays focused on slide_dragged_log).
+        if let Some(c) = world.cell_at_mut(pos.x as i64, pos.y as i64) {
+            c.items.push(ItemInstance::stack(ItemKind::Log, 1, 200_000, None, ItemMetadata::None));
+        }
+        world.player_dragging = true;
+        world.try_move_player(1, 0);
+        let new_pos = world.player_pos();
+        // Log is on the new pos, not the old.
+        let new_cell = world.cell_at(new_pos.x as i64, new_pos.y as i64).unwrap();
+        assert!(new_cell.items.iter().any(|i| i.kind == ItemKind::Log));
+        let old_cell = world.cell_at(pos.x as i64, pos.y as i64).unwrap();
+        assert!(old_cell.items.iter().all(|i| i.kind != ItemKind::Log));
+        assert!(world.player_dragging, "drag continues across moves");
+    }
+
+    #[test]
+    fn dragging_doubles_tile_step_cost() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Stride Creep = 500 moves/tile = 5 game-sec.
+        world.player_stride = StrideMode::Creep;
+        // Baseline: one tile-step advances 5 game-sec.
+        let before = world.clock_seconds;
+        world.spend_player_tile_step();
+        let baseline_delta = world.clock_seconds - before;
+        // Now with drag on: same call advances 10 game-sec (2× cost).
+        world.player_dragging = true;
+        let before2 = world.clock_seconds;
+        world.spend_player_tile_step();
+        let drag_delta = world.clock_seconds - before2;
+        assert_eq!(drag_delta, baseline_delta * 2);
+    }
+
+    #[test]
+    fn chop_log_consumes_log_and_drops_firewood() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let pos = world.player_pos();
+        // Place a Log on the player cell. Player already has an axe.
+        if let Some(c) = world.cell_at_mut(pos.x as i64, pos.y as i64) {
+            c.items.push(ItemInstance::stack(ItemKind::Log, 1, 200_000, None, ItemMetadata::None));
+        }
+        match crate::action::execute(&mut world, crate::action::ActionId::ChopLog) {
+            crate::action::ExecuteOutcome::Done(msg) => {
+                assert!(msg.contains("firewood"), "got {:?}", msg);
+            }
+            other => panic!("expected Done, got {:?}", other),
+        }
+        let here = world.cell_at(pos.x as i64, pos.y as i64).unwrap();
+        assert!(here.items.iter().all(|i| i.kind != ItemKind::Log), "log was consumed");
+        let firewood: u16 = here
+            .items
+            .iter()
+            .filter(|i| i.kind == ItemKind::Firewood)
+            .map(|i| i.count)
+            .sum();
+        assert!(
+            (3..=6).contains(&firewood),
+            "expected 3-6 firewood, got {}",
+            firewood
+        );
     }
 
     #[test]
