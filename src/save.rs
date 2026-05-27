@@ -24,6 +24,12 @@
 // ground_cover (additive, ride this same bump). v1 saves are
 // friendly-rejected — no data migration. Players returning to the Holy
 // Land design check out the `holy-land-archive` git tag.
+//
+// Schema v3 (combat foundation): adds `player_health: Option<HealthSave>`
+// and `hostiles: Vec<HostileSave>` to RunSave. Both are additive with
+// `#[serde(default)]`; v2→v3 needs no migration code, just the header
+// version accepts both in `check_schema`. Older saves load with a
+// freshly-spawned bandit and the player at full HP.
 
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -33,7 +39,7 @@ use uuid::Uuid;
 
 use crate::calendar;
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SaveHeader {
@@ -173,6 +179,127 @@ pub struct RunSave {
     /// onto the same wilderness layout.
     #[serde(default = "default_world_seed")]
     pub seed: u64,
+    // Schema v3 (combat foundation): player HP + hostile entities.
+    // Both additive with serde defaults — v2 saves load with the
+    // player at full HP and the world's fresh-spawn bandit intact.
+    #[serde(default)]
+    pub player_health: Option<HealthSave>,
+    #[serde(default)]
+    pub hostiles: Vec<HostileSave>,
+    // Phase 2 (combat body parts): split single-pool HP into six body
+    // parts per `Armor model.md`. Additive — v3 saves with only
+    // player_health load with a defaulted (full-HP) BodyParts and
+    // the previous single pool is ignored. Phase 2 stops writing
+    // player_health for new saves.
+    #[serde(default)]
+    pub player_body_parts: Option<BodyPartsSave>,
+    // Phase 3 (equip slots): per-slot `ItemKind::save_key` strings.
+    // Additive — v3 saves without this field load with the Rabble-
+    // tier starting equipment (knife in main hand).
+    #[serde(default)]
+    pub player_equipment: Option<EquipmentSave>,
+}
+
+/// Per-slot equipment round-trip. Each field is a save_key string; an
+/// empty string means the slot is unoccupied. Unknown kinds load as
+/// empty (forward-compat).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct EquipmentSave {
+    #[serde(default)]
+    pub main_hand: String,
+    #[serde(default)]
+    pub off_hand: String,
+    #[serde(default)]
+    pub head: String,
+    #[serde(default)]
+    pub torso: String,
+    #[serde(default)]
+    pub l_arm: String,
+    #[serde(default)]
+    pub r_arm: String,
+    #[serde(default)]
+    pub l_leg: String,
+    #[serde(default)]
+    pub r_leg: String,
+}
+
+/// Single-pool combat health (phase 1). Phase 2's body-part split
+/// retired this in favor of `BodyPartsSave`; the struct stays so v3
+/// saves still parse cleanly.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct HealthSave {
+    #[serde(default)]
+    pub hp: i16,
+    #[serde(default)]
+    pub max: i16,
+}
+
+/// Per-body-part HP round-trip (phase 2). Each part carries its own
+/// `(hp, max)`; serde defaults round-trip a fresh-spawn human (40/80/
+/// 60/60/60/60). Additive — older v3 saves load via `#[serde(default)]`.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct BodyPartSaveCell {
+    #[serde(default)]
+    pub hp: i16,
+    #[serde(default)]
+    pub max: i16,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct BodyPartsSave {
+    #[serde(default)]
+    pub head: BodyPartSaveCell,
+    #[serde(default)]
+    pub torso: BodyPartSaveCell,
+    #[serde(default)]
+    pub l_arm: BodyPartSaveCell,
+    #[serde(default)]
+    pub r_arm: BodyPartSaveCell,
+    #[serde(default)]
+    pub l_leg: BodyPartSaveCell,
+    #[serde(default)]
+    pub r_leg: BodyPartSaveCell,
+}
+
+/// One hostile entity round-trip. `wielded_kind` is an `ItemKind`
+/// save_key string for forward-compat; unknown values drop the
+/// wielded weapon on load. `flavor` distinguishes future hostile types
+/// from the phase-1 Cornish bandit; unknown flavors load as bandit.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct HostileSave {
+    #[serde(default)]
+    pub x: i32,
+    #[serde(default)]
+    pub y: i32,
+    /// Phase-1 single-pool HP; phase 2 surfaces the torso pool here as
+    /// the closest analog so older binaries reading the file get a
+    /// plausible total. Authoritative HP lives in `body_parts`.
+    #[serde(default)]
+    pub hp: i16,
+    #[serde(default)]
+    pub max_hp: i16,
+    /// `ItemKind::save_key` string for the entity's wielded weapon.
+    /// Empty means unarmed.
+    #[serde(default)]
+    pub wielded_kind: String,
+    /// Flavor key, e.g. "cornish_bandit". Defaults to bandit on
+    /// unknown values (forward-compat).
+    #[serde(default)]
+    pub flavor: String,
+    /// Phase-2 body-part HP split. Additive — v3 saves without this
+    /// field load with a defaulted full-HP body.
+    #[serde(default)]
+    pub body_parts: Option<BodyPartsSave>,
+    /// Phase-3 off-hand `ItemKind::save_key`. Empty means no off-hand.
+    /// Additive — older saves load with no off-hand.
+    #[serde(default)]
+    pub off_hand_kind: String,
+    /// Phase-3 worn armor pieces — list of `ItemKind::save_key` strings.
+    /// Restore rebuilds the `Worn` component by looking up each kind's
+    /// `ItemDef.armor` stats. Unknown / non-wearable keys are skipped
+    /// (forward-compat).
+    #[serde(default)]
+    pub worn_kinds: Vec<String>,
 }
 
 /// Backwards-compat seed value matching `world::DEFAULT_SEED`. Used by
@@ -244,6 +371,14 @@ pub struct SkillsSave {
     // skill to 0 by accident.
     #[serde(default)]
     pub foraging: SkillSave,
+    // Phase-9 combat skills. Additive — older saves load with all
+    // three at 0 (matches Rabble-tier starting values).
+    #[serde(default)]
+    pub melee: SkillSave,
+    #[serde(default)]
+    pub ranged: SkillSave,
+    #[serde(default)]
+    pub dodge: SkillSave,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -315,6 +450,10 @@ impl RunSave {
             tree_species_mutations: Vec::new(),
             decoration_mutations: Vec::new(),
             seed: DEFAULT_WORLD_SEED,
+            player_health: None,
+            hostiles: Vec::new(),
+            player_body_parts: None,
+            player_equipment: None,
         }
     }
 }
@@ -438,7 +577,10 @@ const V1_FRIENDLY_REJECT_MSG: &str =
 
 fn check_schema(header: &SaveHeader) -> io::Result<()> {
     match header.schema_version {
-        SCHEMA_VERSION => Ok(()),
+        // v2 → v3 is purely additive (player_health + hostiles default
+        // via serde). Accept both; the next save re-headers the file to
+        // SCHEMA_VERSION so the v2 footprint vanishes over time.
+        2 | 3 => Ok(()),
         1 => Err(io::Error::new(io::ErrorKind::Other, V1_FRIENDLY_REJECT_MSG)),
         v if v < SCHEMA_VERSION => Err(io::Error::new(
             io::ErrorKind::Other,
@@ -616,6 +758,39 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_run_with_combat_state() {
+        let dir = std::env::temp_dir().join(format!("survival-combat-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("run.cbor");
+
+        let header = SaveHeader::fresh(None);
+        let mut run = RunSave::empty(header);
+        run.player_health = Some(HealthSave { hp: 42, max: 80 });
+        run.hostiles = vec![HostileSave {
+            x: 10,
+            y: 12,
+            hp: 65,
+            max_hp: 80,
+            wielded_kind: "spear".to_string(),
+            flavor: "cornish_bandit".to_string(),
+            body_parts: None,
+            off_hand_kind: String::new(),
+            worn_kinds: Vec::new(),
+        }];
+        save_atomic(&path, &run).unwrap();
+
+        let loaded = load_run(&path).unwrap();
+        assert_eq!(loaded.player_health.map(|h| (h.hp, h.max)), Some((42, 80)));
+        assert_eq!(loaded.hostiles.len(), 1);
+        assert_eq!(loaded.hostiles[0].x, 10);
+        assert_eq!(loaded.hostiles[0].hp, 65);
+        assert_eq!(loaded.hostiles[0].wielded_kind, "spear");
+        assert_eq!(loaded.hostiles[0].flavor, "cornish_bandit");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn round_trip_run() {
         let dir = std::env::temp_dir().join(format!("survival-run-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
@@ -649,6 +824,10 @@ mod tests {
             tree_species_mutations: Vec::new(),
             decoration_mutations: Vec::new(),
             seed: 0xABCD_1234_5678_9ABC,
+            player_health: None,
+            hostiles: Vec::new(),
+            player_body_parts: None,
+            player_equipment: None,
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
@@ -733,6 +912,9 @@ mod tests {
                     daily_xp: 6,
                 },
                 foraging: SkillSave::default(),
+                melee: SkillSave::default(),
+                ranged: SkillSave::default(),
+                dodge: SkillSave::default(),
             },
             rng_state: 0xC0FFEE,
             terrain_mutations: vec![TerrainMutationSave {
@@ -745,6 +927,10 @@ mod tests {
             tree_species_mutations: Vec::new(),
             decoration_mutations: Vec::new(),
             seed: DEFAULT_WORLD_SEED,
+            player_health: None,
+            hostiles: Vec::new(),
+            player_body_parts: None,
+            player_equipment: None,
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();

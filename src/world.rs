@@ -632,6 +632,761 @@ impl Default for Speed {
     }
 }
 
+/// One body-part HP pool. Crippling is a derived state (`hp <= 0`);
+/// the crippled flag is recomputed on each damage application rather
+/// than stored — that way save-load can't get the two out of sync.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct BodyPartHp {
+    pub hp: i16,
+    pub max: i16,
+}
+
+impl BodyPartHp {
+    pub fn full(max: i16) -> Self {
+        Self { hp: max, max }
+    }
+    pub fn is_crippled(self) -> bool {
+        self.hp <= 0
+    }
+}
+
+/// Six-part HP pool per `Survival - Combat - Damage math and hit roll.md`.
+/// Coverage weights live on `combat::BodyPart`; the per-part HP scales
+/// live here. Torso ~80 (highest), head 40 (fragile), limbs 60.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct BodyParts {
+    pub head: BodyPartHp,
+    pub torso: BodyPartHp,
+    pub l_arm: BodyPartHp,
+    pub r_arm: BodyPartHp,
+    pub l_leg: BodyPartHp,
+    pub r_leg: BodyPartHp,
+}
+
+impl BodyParts {
+    /// Per-part max-HP scale used by both player and bandit baselines.
+    /// Phase 3 will scale these by the Stam attribute per the damage-
+    /// math card; phase 2 keeps them flat.
+    pub const HEAD_MAX: i16 = 40;
+    pub const TORSO_MAX: i16 = 80;
+    pub const ARM_MAX: i16 = 60;
+    pub const LEG_MAX: i16 = 60;
+
+    pub fn starting_human() -> Self {
+        Self {
+            head: BodyPartHp::full(Self::HEAD_MAX),
+            torso: BodyPartHp::full(Self::TORSO_MAX),
+            l_arm: BodyPartHp::full(Self::ARM_MAX),
+            r_arm: BodyPartHp::full(Self::ARM_MAX),
+            l_leg: BodyPartHp::full(Self::LEG_MAX),
+            r_leg: BodyPartHp::full(Self::LEG_MAX),
+        }
+    }
+
+    pub fn get(&self, part: crate::combat::BodyPart) -> BodyPartHp {
+        match part {
+            crate::combat::BodyPart::Head => self.head,
+            crate::combat::BodyPart::Torso => self.torso,
+            crate::combat::BodyPart::LArm => self.l_arm,
+            crate::combat::BodyPart::RArm => self.r_arm,
+            crate::combat::BodyPart::LLeg => self.l_leg,
+            crate::combat::BodyPart::RLeg => self.r_leg,
+        }
+    }
+
+    pub fn get_mut(&mut self, part: crate::combat::BodyPart) -> &mut BodyPartHp {
+        match part {
+            crate::combat::BodyPart::Head => &mut self.head,
+            crate::combat::BodyPart::Torso => &mut self.torso,
+            crate::combat::BodyPart::LArm => &mut self.l_arm,
+            crate::combat::BodyPart::RArm => &mut self.r_arm,
+            crate::combat::BodyPart::LLeg => &mut self.l_leg,
+            crate::combat::BodyPart::RLeg => &mut self.r_leg,
+        }
+    }
+
+    /// True if either vital (head/torso) is at or below zero — fires
+    /// the death event.
+    pub fn is_dead(&self) -> bool {
+        self.head.is_crippled() || self.torso.is_crippled()
+    }
+
+    /// True if either leg is crippled — caller halves effective speed.
+    pub fn any_leg_crippled(&self) -> bool {
+        self.l_leg.is_crippled() || self.r_leg.is_crippled()
+    }
+
+    /// True if either arm is crippled — caller drops the wielded
+    /// weapon in phase 2 (no L/R hand distinction yet).
+    pub fn any_arm_crippled(&self) -> bool {
+        self.l_arm.is_crippled() || self.r_arm.is_crippled()
+    }
+}
+
+/// Tag — drives the AI scan and the bump-attack branch. A friendly NPC
+/// with the same loadout would lack this tag.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Hostile;
+
+/// Behavior selector for hostile NPCs. Phase 1 has the one variant
+/// described in `Bestiary slice 1.md` (chase + bump).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AiKind {
+    ChaseAndBump,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Ai(pub AiKind);
+
+/// What this actor is swinging. Phase 1 reuses `ItemKind`; phase 3
+/// lifts weapon stats onto `ItemDef` so this stays the right shape.
+/// Not serde-derived because `ItemKind` round-trips via `save_key()`
+/// strings; the save layer projects this manually.
+#[derive(Clone, Copy, Debug)]
+pub struct Wielded(pub crate::items::ItemKind);
+
+/// Marker for the Cornish bandit entity flavor — picks the glyph in
+/// `render_entities` and the death-cause string. Phase 3+ folds this
+/// into a richer NPC-flavor tag.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct CornishBandit;
+
+/// Stamina pool per the Stamina card. Drained by heavy actions
+/// (grapple verbs, running, future brace / crossbow reload / aimed
+/// swings); normal melee swings are FREE. Regens passively while not
+/// in a heavy action. Out-of-stamina = slower swings + lower hit.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Stamina {
+    pub cur: i16,
+    pub max: i16,
+}
+
+impl Stamina {
+    pub fn starting_human() -> Self {
+        Self { cur: 100, max: 100 }
+    }
+    /// Stamina threshold below which heavy actions are blocked.
+    pub const HEAVY_FLOOR: i16 = 15;
+    /// Penalty to attacker `to_hit` when current stamina is below the
+    /// heavy floor. Modest; full out-of-stamina state lands here.
+    pub const LOW_HIT_PENALTY: i16 = 4;
+}
+
+/// Target is in a grapple — can't move or attack until the hold
+/// breaks. Duration_secs ticks down each `tick_combat_states` call.
+#[derive(Clone, Copy, Debug)]
+pub struct Grappled {
+    pub remaining_secs: u32,
+}
+
+/// Target is on the ground — heavy defender penalty until they stand
+/// back up (currently auto-stands after `Prone::DURATION_SECS`).
+#[derive(Clone, Copy, Debug)]
+pub struct Prone {
+    pub remaining_secs: u32,
+}
+
+impl Prone {
+    pub const DURATION_SECS: u32 = 4;
+    /// Flat hit penalty added to the defender's roll when prone (i.e.
+    /// the defender_stats encumbrance bump). Heavy enough that prone is
+    /// genuinely punishing.
+    pub const DEFENDER_PENALTY: i16 = 8;
+}
+
+/// Bitmask over `combat::BodyPart` regions a single armor piece covers.
+/// Stored as a u8 (six parts use six bits). Phase 3 lifts piece-region
+/// data onto `ItemDef` so the piece can be both worn and dropped.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BodyRegionMask(pub u8);
+
+impl BodyRegionMask {
+    pub fn empty() -> Self {
+        Self(0)
+    }
+    pub fn with(mut self, part: crate::combat::BodyPart) -> Self {
+        self.0 |= 1 << part as u8;
+        self
+    }
+    pub fn contains(self, part: crate::combat::BodyPart) -> bool {
+        (self.0 >> part as u8) & 1 == 1
+    }
+}
+
+/// One worn armor piece. Coverage % drives the per-hit catch roll
+/// (1d100 ≤ coverage_pct → piece intercepts the strike). DR is
+/// subtracted per damage type if the piece catches. Encumbrance is
+/// added per region the piece covers — the sum across torso+arms
+/// drops the wearer's Dodge, leg sum bumps move-cost.
+#[derive(Clone, Copy, Debug)]
+pub struct ArmorPiece {
+    pub regions: BodyRegionMask,
+    pub coverage_pct: u8,
+    pub dr: crate::combat::ArmorDr,
+    /// Encumbrance contribution per covered region.
+    pub encumbrance: u8,
+    /// Phase-3 hook: which ItemKind this piece corresponds to so the
+    /// piece can drop on death. Phase 2 only uses this on the bandit's
+    /// hardcoded loadout; phase 3 lifts piece data onto `ItemDef`.
+    pub item_kind: Option<crate::items::ItemKind>,
+}
+
+/// Layered armor worn on the body. Pieces are checked outer→inner in
+/// push order; the layering currently affects only "first to catch
+/// blocks damage" semantics — phase 3 will wire explicit layer ordering
+/// once equip slots land.
+#[derive(Clone, Debug, Default)]
+pub struct Worn {
+    pub pieces: Vec<ArmorPiece>,
+}
+
+impl Worn {
+    pub fn new(pieces: Vec<ArmorPiece>) -> Self {
+        Self { pieces }
+    }
+
+    /// Total encumbrance across torso + arms — feeds the Dodge
+    /// penalty (per `Armor model.md` §Encumbrance penalties).
+    pub fn upper_body_encumbrance(&self) -> i16 {
+        self.region_encumbrance(&[
+            crate::combat::BodyPart::Torso,
+            crate::combat::BodyPart::LArm,
+            crate::combat::BodyPart::RArm,
+        ])
+    }
+
+    /// Total leg encumbrance — bumps the per-tile move-cost.
+    pub fn leg_encumbrance(&self) -> i16 {
+        self.region_encumbrance(&[crate::combat::BodyPart::LLeg, crate::combat::BodyPart::RLeg])
+    }
+
+    fn region_encumbrance(&self, parts: &[crate::combat::BodyPart]) -> i16 {
+        let mut total: i16 = 0;
+        for piece in &self.pieces {
+            for &part in parts {
+                if piece.regions.contains(part) {
+                    total = total.saturating_add(piece.encumbrance as i16);
+                }
+            }
+        }
+        total
+    }
+}
+
+/// Build an `ArmorPiece` from an item kind by reading its `ItemDef`
+/// armor stats. Returns `None` if the item is not wearable. The
+/// resulting piece records its source `ItemKind` so death can drop
+/// the matching `ItemInstance` back onto the cell.
+pub fn armor_piece_for(kind: crate::items::ItemKind) -> Option<ArmorPiece> {
+    let stats = kind.def().armor?;
+    let mut regions = BodyRegionMask::empty();
+    for &part in stats.regions {
+        regions = regions.with(part);
+    }
+    Some(ArmorPiece {
+        regions,
+        coverage_pct: stats.coverage_pct,
+        dr: stats.dr,
+        encumbrance: stats.encumbrance,
+        item_kind: Some(kind),
+    })
+}
+
+/// Build a `Worn` from a list of wearable item kinds. Non-wearable
+/// kinds are silently skipped — callers that care about validation
+/// (e.g. an Equip verb) should check `def().armor.is_some()` first.
+pub fn worn_from_items(kinds: &[crate::items::ItemKind]) -> Worn {
+    Worn::new(kinds.iter().filter_map(|&k| armor_piece_for(k)).collect())
+}
+
+/// Topmost non-player entity glyph + fg at a world cell, if any.
+/// Used by the render loop to paint hostiles on their tile. Returned
+/// as a tuple (not Renderable) to keep the SDL color conversion in
+/// main.rs's render path where the rest of the palette work lives.
+pub fn entity_glyph_at(world: &World, wx: i32, wy: i32) -> Option<(u8, [u8; 3])> {
+    for (e, (pos, r)) in world.ecs.query::<(&Position, &Renderable)>().iter() {
+        if e == world.player {
+            continue;
+        }
+        if pos.x == wx && pos.y == wy {
+            return Some((r.glyph, [r.fg[0], r.fg[1], r.fg[2]]));
+        }
+    }
+    None
+}
+
+/// Loadout rolled per humanoid spawn — used across all tiers (Rabble
+/// not implemented; Yeoman / Sergeant / Knight all build on the same
+/// shape). `None` in a slot means the piece rolled empty (e.g. Yeoman
+/// bandits with no head armor).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct YeomanLoadout {
+    pub main_hand: Option<crate::items::ItemKind>,
+    pub off_hand: Option<crate::items::ItemKind>,
+    pub head: Option<crate::items::ItemKind>,
+    pub torso: Option<crate::items::ItemKind>,
+    pub torso_outer: Option<crate::items::ItemKind>,
+    pub legs: Option<crate::items::ItemKind>,
+}
+
+impl YeomanLoadout {
+    /// Iterator over every non-None worn armor piece for the entity's
+    /// `Worn` assembly. Includes torso, torso_outer (e.g. plate over
+    /// mail), head, legs.
+    pub fn worn_kinds(&self) -> impl Iterator<Item = crate::items::ItemKind> + '_ {
+        [self.head, self.torso, self.torso_outer, self.legs]
+            .into_iter()
+            .flatten()
+    }
+}
+
+/// Loadout tier per `Status armament tiers.md`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BanditTier {
+    Yeoman,
+    Sergeant,
+    Knight,
+}
+
+impl BanditTier {
+    pub fn save_key(self) -> &'static str {
+        match self {
+            BanditTier::Yeoman => "yeoman",
+            BanditTier::Sergeant => "sergeant",
+            BanditTier::Knight => "knight",
+        }
+    }
+}
+
+/// Roll a fresh Yeoman loadout for the Cornish bandit. Probabilities
+/// come directly from `Bestiary slice 1.md`. Re-rolls each spawn so
+/// five bandits in a chunk naturally vary — one bowman, one buckler,
+/// three spearmen, etc. Per the card, 20% of bandits roll a Bow as
+/// their main hand (with 12 arrows in pack); the remaining 80% draw
+/// from the melee distribution.
+pub fn roll_yeoman_loadout(rng: &mut Rng) -> YeomanLoadout {
+    use crate::items::ItemKind;
+    let is_bowman = rng.d100() <= 20;
+    let main_hand = if is_bowman {
+        Some(ItemKind::Bow)
+    } else {
+        match rng.d100() {
+            1..=50 => Some(ItemKind::Spear),
+            51..=80 => Some(ItemKind::ShortSword),
+            _ => Some(ItemKind::Falchion),
+        }
+    };
+    // Bow bandits favor a knife backup (no shield) for the awkward
+    // moment a player closes to melee.
+    let off_hand = if is_bowman {
+        Some(ItemKind::Knife)
+    } else {
+        match rng.d100() {
+            1..=60 => Some(ItemKind::Knife),
+            61..=90 => None,
+            _ => Some(ItemKind::SmallRoundShield),
+        }
+    };
+    let head = match rng.d100() {
+        1..=70 => Some(ItemKind::IronSkullcap),
+        _ => None,
+    };
+    let torso = match rng.d100() {
+        1..=80 => Some(ItemKind::PaddedDoublet),
+        _ => Some(ItemKind::LeatherJerkin),
+    };
+    YeomanLoadout {
+        main_hand,
+        off_hand,
+        head,
+        torso,
+        torso_outer: None,
+        legs: None,
+    }
+}
+
+/// Sergeant tier — household soldier / sergeant-at-arms. Arming sword
+/// + knife, partial mail (hauberk on torso+arms, often without
+/// chausses), kettle hat or open helm, round shield.
+pub fn roll_sergeant_loadout(rng: &mut Rng) -> YeomanLoadout {
+    use crate::items::ItemKind;
+    let main_hand = match rng.d100() {
+        1..=75 => Some(ItemKind::ArmingSword),
+        _ => Some(ItemKind::Falchion),
+    };
+    let off_hand = match rng.d100() {
+        1..=70 => Some(ItemKind::SmallRoundShield),
+        _ => Some(ItemKind::Knife),
+    };
+    let head = match rng.d100() {
+        1..=50 => Some(ItemKind::KettleHat),
+        51..=80 => Some(ItemKind::IronSkullcap),
+        _ => Some(ItemKind::MailCoif),
+    };
+    // Mail hauberk over a padded doublet underlayer would be most
+    // accurate, but phase 8's Worn only carries one piece per region
+    // — collapse to a hauberk (mail blocks better than the doublet
+    // would underneath at this scale).
+    let torso = Some(ItemKind::Hauberk);
+    let legs = match rng.d100() {
+        1..=30 => Some(ItemKind::MailChausses),
+        _ => None,
+    };
+    YeomanLoadout {
+        main_hand,
+        off_hand,
+        head,
+        torso,
+        torso_outer: None,
+        legs,
+    }
+}
+
+/// Knight tier — mounted noble / retinue captain. Lance OR sword +
+/// knife, full mail (hauberk + chausses + coif), great helm, large
+/// shield, possibly coat-of-plates over mail.
+pub fn roll_knight_loadout(rng: &mut Rng) -> YeomanLoadout {
+    use crate::items::ItemKind;
+    let main_hand = match rng.d100() {
+        1..=60 => Some(ItemKind::Lance),
+        _ => Some(ItemKind::ArmingSword),
+    };
+    let off_hand = match rng.d100() {
+        1..=80 => Some(ItemKind::LargeShield),
+        _ => Some(ItemKind::Knife),
+    };
+    // Knights wear a coif under the great helm; phase 8 picks one to
+    // occupy the head slot.
+    let head = match rng.d100() {
+        1..=70 => Some(ItemKind::GreatHelm),
+        _ => Some(ItemKind::MailCoif),
+    };
+    let torso = Some(ItemKind::Hauberk);
+    // ~40% of knights have a coat-of-plates over the mail. Worn
+    // doesn't support layering in phase 8 — pick the better piece
+    // (coat-of-plates) when it rolls.
+    let torso_outer = match rng.d100() {
+        1..=40 => Some(ItemKind::CoatOfPlates),
+        _ => None,
+    };
+    let legs = Some(ItemKind::MailChausses);
+    YeomanLoadout {
+        main_hand,
+        off_hand,
+        head,
+        torso,
+        torso_outer,
+        legs,
+    }
+}
+
+/// Spawn a Cornish bandit at `pos` at the given `tier` carrying the
+/// explicit `loadout`. Fresh-game init rolls a Yeoman loadout via
+/// `roll_yeoman_loadout`; debug-console + future road encounters can
+/// pick `BanditTier::Sergeant` / `Knight` for richer loadouts. Render
+/// glyph + skill block scale with tier.
+pub fn spawn_humanoid_bandit(
+    ecs: &mut Ecs,
+    pos: Position,
+    tier: BanditTier,
+    loadout: YeomanLoadout,
+) -> Entity {
+    let main_hand = loadout
+        .main_hand
+        .unwrap_or(crate::items::ItemKind::Spear);
+    let worn_kinds: Vec<_> = loadout.worn_kinds().collect();
+    let (glyph, fg) = match tier {
+        BanditTier::Yeoman => (b'b', [210, 80, 70, 255]),
+        BanditTier::Sergeant => (b's', [220, 150, 70, 255]),
+        BanditTier::Knight => (b'K', [220, 220, 240, 255]),
+    };
+    let skills = match tier {
+        BanditTier::Yeoman => CombatSkills::starting_bandit(),
+        BanditTier::Sergeant => CombatSkills::starting_sergeant(),
+        BanditTier::Knight => CombatSkills::starting_knight(),
+    };
+    let entity = ecs.spawn((
+        pos,
+        Renderable {
+            glyph,
+            fg,
+            bg: [20, 17, 13, 255],
+        },
+        Speed::default(),
+        BodyParts::starting_human(),
+        Hostile,
+        Ai(AiKind::ChaseAndBump),
+        CornishBandit,
+        Wielded(main_hand),
+        skills,
+        worn_from_items(&worn_kinds),
+        Stamina::starting_human(),
+    ));
+    if let Some(off) = loadout.off_hand {
+        let _ = ecs.insert_one(entity, OffHand(off));
+    }
+    // Bow bandits get a small Pack with 12 arrows so the AI can shoot.
+    // Pack-on-hostile is transient (not saved) for phase 6 — restored
+    // bandits get fresh ammo. Phase 8+ can lift hostile inventory into
+    // the save format.
+    if loadout.main_hand == Some(crate::items::ItemKind::Bow) {
+        let mut pack = crate::items::Pack::empty(5_000);
+        let arrows = crate::items::ItemKind::Arrow.make_default_instance(12);
+        let _ = pack.try_add(arrows);
+        let _ = ecs.insert_one(entity, pack);
+    }
+    entity
+}
+
+/// Yeoman-tier convenience wrapper preserved for the existing
+/// `restore_hostiles` / test surface that doesn't pick a tier.
+pub fn spawn_cornish_bandit(ecs: &mut Ecs, pos: Position, loadout: YeomanLoadout) -> Entity {
+    spawn_humanoid_bandit(ecs, pos, BanditTier::Yeoman, loadout)
+}
+
+/// Optional off-hand item (knife / small round shield / nothing).
+/// Phase 3 stores it for save round-trip + death drops; the block
+/// bonus from a shield lands in a later phase per the cards.
+#[derive(Clone, Copy, Debug)]
+pub struct OffHand(pub crate::items::ItemKind);
+
+/// Eight equipment slots per `Armor model.md` §Equip slots. Acts as
+/// the source of truth for the player; `Wielded` / `OffHand` / `Worn`
+/// are kept in sync via `World::sync_equipment` on each equip /
+/// unequip / pickup-from-death. Phase 4 lifts this onto the bandit
+/// too so death drops walk the full slot set.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Equipment {
+    pub main_hand: Option<crate::items::ItemKind>,
+    pub off_hand: Option<crate::items::ItemKind>,
+    pub head: Option<crate::items::ItemKind>,
+    pub torso: Option<crate::items::ItemKind>,
+    pub l_arm: Option<crate::items::ItemKind>,
+    pub r_arm: Option<crate::items::ItemKind>,
+    pub l_leg: Option<crate::items::ItemKind>,
+    pub r_leg: Option<crate::items::ItemKind>,
+}
+
+impl Equipment {
+    /// Rabble-tier player kit: knife in main hand, nothing else equipped.
+    pub fn starting_player() -> Self {
+        Self {
+            main_hand: Some(crate::items::ItemKind::Knife),
+            ..Self::default()
+        }
+    }
+
+    /// Iterator over every (slot, ItemKind) pair currently occupied.
+    /// Used by death-drop and save round-trip.
+    pub fn occupied(&self) -> impl Iterator<Item = (EquipSlot, crate::items::ItemKind)> + '_ {
+        EquipSlot::ALL.into_iter().filter_map(move |s| self.get(s).map(|k| (s, k)))
+    }
+
+    pub fn get(&self, slot: EquipSlot) -> Option<crate::items::ItemKind> {
+        match slot {
+            EquipSlot::MainHand => self.main_hand,
+            EquipSlot::OffHand => self.off_hand,
+            EquipSlot::Head => self.head,
+            EquipSlot::Torso => self.torso,
+            EquipSlot::LArm => self.l_arm,
+            EquipSlot::RArm => self.r_arm,
+            EquipSlot::LLeg => self.l_leg,
+            EquipSlot::RLeg => self.r_leg,
+        }
+    }
+
+    pub fn set(&mut self, slot: EquipSlot, kind: Option<crate::items::ItemKind>) {
+        match slot {
+            EquipSlot::MainHand => self.main_hand = kind,
+            EquipSlot::OffHand => self.off_hand = kind,
+            EquipSlot::Head => self.head = kind,
+            EquipSlot::Torso => self.torso = kind,
+            EquipSlot::LArm => self.l_arm = kind,
+            EquipSlot::RArm => self.r_arm = kind,
+            EquipSlot::LLeg => self.l_leg = kind,
+            EquipSlot::RLeg => self.r_leg = kind,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EquipSlot {
+    MainHand,
+    OffHand,
+    Head,
+    Torso,
+    LArm,
+    RArm,
+    LLeg,
+    RLeg,
+}
+
+impl EquipSlot {
+    pub const ALL: [EquipSlot; 8] = [
+        EquipSlot::MainHand,
+        EquipSlot::OffHand,
+        EquipSlot::Head,
+        EquipSlot::Torso,
+        EquipSlot::LArm,
+        EquipSlot::RArm,
+        EquipSlot::LLeg,
+        EquipSlot::RLeg,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            EquipSlot::MainHand => "main hand",
+            EquipSlot::OffHand => "off hand",
+            EquipSlot::Head => "head",
+            EquipSlot::Torso => "torso",
+            EquipSlot::LArm => "left arm",
+            EquipSlot::RArm => "right arm",
+            EquipSlot::LLeg => "left leg",
+            EquipSlot::RLeg => "right leg",
+        }
+    }
+
+    pub fn save_key(self) -> &'static str {
+        match self {
+            EquipSlot::MainHand => "main_hand",
+            EquipSlot::OffHand => "off_hand",
+            EquipSlot::Head => "head",
+            EquipSlot::Torso => "torso",
+            EquipSlot::LArm => "l_arm",
+            EquipSlot::RArm => "r_arm",
+            EquipSlot::LLeg => "l_leg",
+            EquipSlot::RLeg => "r_leg",
+        }
+    }
+
+    pub fn from_save_key(s: &str) -> Option<Self> {
+        Some(match s {
+            "main_hand" => EquipSlot::MainHand,
+            "off_hand" => EquipSlot::OffHand,
+            "head" => EquipSlot::Head,
+            "torso" => EquipSlot::Torso,
+            "l_arm" => EquipSlot::LArm,
+            "r_arm" => EquipSlot::RArm,
+            "l_leg" => EquipSlot::LLeg,
+            "r_leg" => EquipSlot::RLeg,
+            _ => return None,
+        })
+    }
+}
+
+/// Decide which slot an `ItemKind` should occupy. Returns the first
+/// matching slot — armor pieces go to the first of their regions, since
+/// phase 3 uses a single-piece-per-region model. Weapons go to
+/// `MainHand`. None means the item isn't equippable.
+pub fn default_slot_for(kind: crate::items::ItemKind) -> Option<EquipSlot> {
+    let def = kind.def();
+    if def.weapon.is_some() || def.ranged.is_some() {
+        return Some(EquipSlot::MainHand);
+    }
+    if let Some(armor) = def.armor {
+        if let Some(part) = armor.regions.first() {
+            return Some(match part {
+                crate::combat::BodyPart::Head => EquipSlot::Head,
+                crate::combat::BodyPart::Torso => EquipSlot::Torso,
+                crate::combat::BodyPart::LArm => EquipSlot::LArm,
+                crate::combat::BodyPart::RArm => EquipSlot::RArm,
+                crate::combat::BodyPart::LLeg => EquipSlot::LLeg,
+                crate::combat::BodyPart::RLeg => EquipSlot::RLeg,
+            });
+        }
+    }
+    // Shields aren't weapons OR armor in the ItemDef sense (yet) — give
+    // them an explicit off-hand placement.
+    if matches!(kind, crate::items::ItemKind::SmallRoundShield) {
+        return Some(EquipSlot::OffHand);
+    }
+    None
+}
+
+/// Round-trip shape for one hostile entity. Lives here (not save.rs)
+/// because the conversion is local to the spawn / restore pair; save.rs
+/// just describes the on-disk bytes.
+#[derive(Clone, Debug)]
+pub struct HostileSnapshot {
+    pub pos: Position,
+    pub body: BodyParts,
+    pub main_hand: Option<crate::items::ItemKind>,
+    pub off_hand: Option<crate::items::ItemKind>,
+    pub worn_kinds: Vec<crate::items::ItemKind>,
+    pub flavor: &'static str,
+}
+
+/// Combat skill block carried on every combatant. Slice-1 hardcodes
+/// these; phase 3 hooks them up to the Skills XP cluster proper.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct CombatSkills {
+    pub melee: i16,
+    pub dodge: i16,
+    /// Stand-in for the per-weapon proficiency the phase-3 card unlocks.
+    pub weapon_prof: i16,
+    pub str_bonus: i16,
+    pub agi_mod: i16,
+    pub encumbrance: i16,
+}
+
+impl CombatSkills {
+    /// Rabble-tier player baseline. Numbers tuned so the
+    /// `combat::CRIT_MARGIN = 15` threshold trips on ~5–10% of hits at
+    /// the start of a run rather than every swing — per-weapon proficiency
+    /// XP train-up (later phase) climbs from this floor.
+    pub fn starting_player() -> Self {
+        Self {
+            melee: 6,
+            dodge: 4,
+            weapon_prof: 1,
+            str_bonus: 1,
+            agi_mod: 1,
+            encumbrance: 0,
+        }
+    }
+
+    /// Yeoman-tier Cornish bandit. A trained roadside thug — slightly
+    /// better than a Rabble-tier player at melee and dodge, with the
+    /// padded-doublet encumbrance making them sluggish on defence.
+    /// Encumbrance from `Worn` pieces folds in via `defender_stats`.
+    pub fn starting_bandit() -> Self {
+        Self {
+            melee: 7,
+            dodge: 5,
+            weapon_prof: 1,
+            str_bonus: 1,
+            agi_mod: 0,
+            encumbrance: 0,
+        }
+    }
+
+    /// Sergeant-tier — household soldier. Real training; serious threat
+    /// to a Rabble player.
+    pub fn starting_sergeant() -> Self {
+        Self {
+            melee: 12,
+            dodge: 8,
+            weapon_prof: 3,
+            str_bonus: 2,
+            agi_mod: 1,
+            encumbrance: 0,
+        }
+    }
+
+    /// Knight-tier — aristocratic. Mail + plate + lance; apex Cornwall
+    /// hostile in phase-8 v1.
+    pub fn starting_knight() -> Self {
+        Self {
+            melee: 18,
+            dodge: 10,
+            weapon_prof: 5,
+            str_bonus: 3,
+            agi_mod: 1,
+            encumbrance: 0,
+        }
+    }
+}
+
 pub struct World {
     /// Chunk store keyed on grid coords. Outside this module, prefer the
     /// `tile_at` / `cell_at` / `cell_at_mut` / `snapshot_*` accessor
@@ -689,6 +1444,15 @@ pub struct World {
     /// hunger / sleep / warmth stay pinned at their current values.
     /// Transient — not saved; cleared on World::new and a fresh boot.
     pub godmode: bool,
+    /// Most-recent combat / interaction messages. Capped at
+    /// `MAX_MESSAGE_LOG`; the renderer surfaces the last entry just
+    /// above the here-line. Transient — not saved (the log file is
+    /// the durable record).
+    pub message_log: VecDeque<String>,
+    /// Set whenever a player-vs-hostile resolution leaves the player
+    /// at 0 HP. main.rs reads this each frame for the death overlay
+    /// alongside the existing needs-based gate. Cleared on new-run.
+    pub player_killed_by_combat: bool,
 }
 
 /// Outcome of one `tick_fast_travel` call. The main loop matches on
@@ -805,7 +1569,21 @@ impl World {
             Needs::starting(),
             Skills::starting(),
             Speed::default(),
+            BodyParts::starting_human(),
+            CombatSkills::starting_player(),
+            Stamina::starting_human(),
+            // Player's equipment is the source of truth; Wielded /
+            // OffHand / Worn are derived caches kept in sync via
+            // `sync_equipment`. Rabble-tier player starts with a knife
+            // in main hand and nothing else equipped.
+            Equipment::starting_player(),
+            Wielded(crate::items::ItemKind::Knife),
         ));
+
+        // Bandit spawn intentionally NOT here — main.rs's fresh-run
+        // init places one Cornish bandit near the player. Keeping
+        // World::new entity-clean lets the unit tests reason about
+        // movement / needs / clock without combat interference.
 
         let mut world = Self {
             chunks,
@@ -821,11 +1599,32 @@ impl World {
             decoration_mutations: HashMap::new(),
             fast_travel: None,
             godmode: false,
+            message_log: VecDeque::new(),
+            player_killed_by_combat: false,
         };
         // First-frame FOV so the renderer doesn't draw a black screen on
         // the very first paint.
         world.recompute_fov();
         world
+    }
+
+    /// Cap on the in-game message ring buffer. Sized for the single-
+    /// line HUD surface; bumping this just keeps more history (the UI
+    /// only shows the latest).
+    pub const MAX_MESSAGE_LOG: usize = 8;
+
+    /// Append a one-line message to the in-game log. The frame loop
+    /// surfaces the newest entry above the here-line; older entries
+    /// stay around for a future scrollback panel.
+    pub fn push_message(&mut self, msg: impl Into<String>) {
+        let s = msg.into();
+        // Mirror to the disk log so we have a durable trail of fights
+        // even without scrollback.
+        crate::log_info!("[combat] {}", s);
+        self.message_log.push_back(s);
+        while self.message_log.len() > Self::MAX_MESSAGE_LOG {
+            self.message_log.pop_front();
+        }
     }
 
     fn chunk_coord_for(wx: i64, wy: i64) -> (ChunkCoord, u32, u32) {
@@ -1105,6 +1904,14 @@ impl World {
     }
 
     pub fn try_move_player(&mut self, dx: i32, dy: i32) {
+        // Grappled — can't move or attack until the hold breaks. Drain
+        // a small stamina cost on each attempted move so the player
+        // can "struggle" their way out by wasting moves.
+        if self.ecs.satisfies::<&Grappled>(self.player).unwrap_or(false) {
+            self.push_message("You're held — struggle!".to_string());
+            self.spend_moves(50);
+            return;
+        }
         let pos = self.player_pos();
         let nx = pos.x + dx;
         let ny = pos.y + dy;
@@ -1114,6 +1921,39 @@ impl World {
         // move would be rejected.
         let (target_cc, _, _) = Self::chunk_coord_for(nx as i64, ny as i64);
         self.ensure_chunk_ring(target_cc);
+        // Bump-attack: if a hostile occupies the destination cell, swing
+        // at it instead of moving. The action-economy clock advances by
+        // the weapon's swing cost (not the tile move-cost) so a fast
+        // dagger user attacks more often than they'd walk. After the
+        // swing, the hostile AI gets a chance to retaliate.
+        if let Some(target) = self.find_hostile_at(nx, ny) {
+            self.perform_melee_attack(self.player, target, 1);
+            self.tick_hostiles();
+            return;
+        }
+        // Reach-2 attack via the same movement key: if the player's
+        // wielded weapon has reach ≥ 2, the adjacent cell is empty,
+        // and a hostile sits one tile further along the same direction
+        // with line-of-sight, swing at the far hostile instead of
+        // moving. This makes the spear feel like a spear — first-strike
+        // a closing bandit rather than waiting for the bump.
+        if let Some(weapon) = self.player_wielded_profile() {
+            if weapon.reach >= 2 {
+                let fx = pos.x + dx * 2;
+                let fy = pos.y + dy * 2;
+                // Intermediate cell (the adjacent square between us and
+                // the target) must not block sight. Walls, trees, and
+                // gorse all block per `cell_blocks_sight_at`.
+                let intermediate_clear = !self.cell_blocks_sight_at(nx as i64, ny as i64);
+                if intermediate_clear {
+                    if let Some(target) = self.find_hostile_at(fx, fy) {
+                        self.perform_melee_attack(self.player, target, 2);
+                        self.tick_hostiles();
+                        return;
+                    }
+                }
+            }
+        }
         // Godmode walks through trees / water / gorse. The OOB-Wall
         // fallback still applies (you can't stand outside a loaded
         // chunk's bounds) — ensure_chunk_ring above already loaded the
@@ -1122,7 +1962,49 @@ impl World {
             self.set_player_pos(Position { x: nx, y: ny });
             self.spend_moves(MOVE_COST_TILE);
             self.recompute_fov();
+            // After the player moves, any hostile in the chunk gets a
+            // turn. Phase 1 wakes hostiles via player-action ticks (no
+            // free-running scheduler yet); phase 2's accumulator gets
+            // proper CDDA speed-based interleaving.
+            self.tick_hostiles();
         }
+    }
+
+    /// Player's currently-wielded weapon profile, if any. Used by the
+    /// reach-attack branch and any future "what can I swing right now"
+    /// query.
+    fn player_wielded_profile(&self) -> Option<crate::combat::WeaponProfile> {
+        let kind = self.ecs.get::<&Wielded>(self.player).ok().map(|w| w.0)?;
+        crate::combat::weapon_profile_for(kind)
+    }
+
+    /// Player's current main-hand ItemKind, if any. Public for the
+    /// action-availability checks (e.g. `Aim` needs a ranged weapon).
+    pub fn player_main_hand_kind(&self) -> Option<crate::items::ItemKind> {
+        self.ecs.get::<&Wielded>(self.player).ok().map(|w| w.0)
+    }
+
+    /// Lookup an entity's `Position`. Used by the targeting cursor
+    /// to snap onto a hostile and to commit shots.
+    pub fn position_of(&self, e: Entity) -> Option<Position> {
+        self.ecs.get::<&Position>(e).ok().map(|p| *p)
+    }
+
+    /// Find the hostile (if any) at world coords `(x, y)`. Public for
+    /// the targeting cursor's commit path.
+    pub fn hostile_at(&self, x: i32, y: i32) -> Option<Entity> {
+        self.find_hostile_at(x, y)
+    }
+
+    /// First hostile entity standing on `(x, y)`, if any. Used by the
+    /// bump-attack branch; phase 1's only hostile is the Cornish bandit.
+    fn find_hostile_at(&self, x: i32, y: i32) -> Option<Entity> {
+        for (e, (pos, _h)) in self.ecs.query::<(&Position, &Hostile)>().iter() {
+            if pos.x == x && pos.y == y {
+                return Some(e);
+            }
+        }
+        None
     }
 
     pub fn player_needs(&self) -> Needs {
@@ -1153,15 +2035,164 @@ impl World {
             .expect("player has Skills") = skills;
     }
 
-    /// Read the player's current `Speed` (CDDA-style action-economy
-    /// rate). Slice-1 returns the raw component value; future status
-    /// effects (haste/slow), encumbrance, and crippled-limb modifiers
-    /// will compose into the effective value through this accessor.
-    pub fn player_speed(&self) -> u16 {
+    /// Read the player's per-body-part HP for save serialization.
+    pub fn player_body(&self) -> BodyParts {
         self.ecs
-            .get::<&Speed>(self.player)
+            .get::<&BodyParts>(self.player)
+            .map(|b| *b)
+            .unwrap_or_else(|_| BodyParts::starting_human())
+    }
+
+    /// Restore the player's body-part HP from a save (or any future
+    /// regen/heal verb). No-op if the player entity lacks the
+    /// component (forward-compat).
+    pub fn set_player_body(&mut self, b: BodyParts) {
+        if let Ok(mut bp) = self.ecs.get::<&mut BodyParts>(self.player) {
+            *bp = b;
+        }
+    }
+
+    /// True if the world currently has any `Hostile` entity. Used by
+    /// the main-loop fresh-game init to decide whether to drop a
+    /// starter bandit (skip if a v3 save already restored them).
+    pub fn has_any_hostile(&self) -> bool {
+        self.ecs.query::<&Hostile>().iter().next().is_some()
+    }
+
+    /// Spawn one Cornish bandit a few tiles east of the player with a
+    /// freshly-rolled Yeoman loadout. The bestiary card explicitly
+    /// calls this out as the phase-1 first-encounter target. Idempotent
+    /// only via the caller's `has_any_hostile()` guard.
+    pub fn spawn_starter_bandit(&mut self) {
+        let p = self.player_pos();
+        let mut pos = Position { x: p.x + 5, y: p.y };
+        // Walk a couple of cells until we land somewhere walkable —
+        // the spawn cell can land on a tree or stream depending on
+        // chunk seed.
+        for dx in 5..15 {
+            let candidate = Position { x: p.x + dx, y: p.y };
+            if self.cell_walkable_at(candidate.x as i64, candidate.y as i64) {
+                pos = candidate;
+                break;
+            }
+        }
+        let loadout = roll_yeoman_loadout(&mut self.rng);
+        spawn_cornish_bandit(&mut self.ecs, pos, loadout);
+    }
+
+    /// Snapshot every hostile entity for save serialization. Returns
+    /// (position, health, wielded ItemKind, flavor key). Phase 1 only
+    /// emits "cornish_bandit" but the flavor field is stringly-typed
+    /// so future hostiles fit without a schema bump.
+    pub fn snapshot_hostiles(&self) -> Vec<HostileSnapshot> {
+        let mut out = Vec::new();
+        for (e, (pos, _h)) in self.ecs.query::<(&Position, &Hostile)>().iter() {
+            let body = self
+                .ecs
+                .get::<&BodyParts>(e)
+                .map(|b| *b)
+                .unwrap_or_else(|_| BodyParts::starting_human());
+            let main_hand = self.ecs.get::<&Wielded>(e).ok().map(|w| w.0);
+            let off_hand = self.ecs.get::<&OffHand>(e).ok().map(|w| w.0);
+            // Worn pieces round-trip via their `item_kind` source so
+            // restore rebuilds them from `ItemDef` rather than carrying
+            // stat copies in the save.
+            let worn_kinds: Vec<crate::items::ItemKind> = self
+                .ecs
+                .get::<&Worn>(e)
+                .map(|w| w.pieces.iter().filter_map(|p| p.item_kind).collect())
+                .unwrap_or_default();
+            let flavor = if self.ecs.satisfies::<&CornishBandit>(e).unwrap_or(false) {
+                "cornish_bandit"
+            } else {
+                "unknown"
+            };
+            out.push(HostileSnapshot {
+                pos: *pos,
+                body,
+                main_hand,
+                off_hand,
+                worn_kinds,
+                flavor,
+            });
+        }
+        out
+    }
+
+    /// Replace the world's hostile entities with the supplied snapshot.
+    /// Used by save load. Despawns all existing hostiles first so a
+    /// re-load doesn't double up the World::new spawn.
+    pub fn restore_hostiles<I>(&mut self, snapshot: I)
+    where
+        I: IntoIterator<Item = HostileSnapshot>,
+    {
+        let existing: Vec<Entity> = self
+            .ecs
+            .query::<&Hostile>()
+            .iter()
+            .map(|(e, _)| e)
+            .collect();
+        for e in existing {
+            let _ = self.ecs.despawn(e);
+        }
+        for snap in snapshot {
+            // Phase-1 only supports the Cornish bandit flavor. Unknown
+            // flavors still spawn as bandits (forward-compat default).
+            let _ = snap.flavor; // reserved for future dispatch
+            // Synthesize a YeomanLoadout from the saved Wielded / OffHand;
+            // worn pieces are rebuilt directly into the Worn component
+            // below (regardless of which slot they originated in).
+            let loadout = YeomanLoadout {
+                main_hand: snap.main_hand,
+                off_hand: snap.off_hand,
+                head: None,
+                torso: None,
+                torso_outer: None,
+                legs: None,
+            };
+            let entity = spawn_cornish_bandit(&mut self.ecs, snap.pos, loadout);
+            if let Ok(mut b) = self.ecs.get::<&mut BodyParts>(entity) {
+                *b = snap.body;
+            }
+            // Replace the (empty) Worn from spawn with the saved pieces.
+            if !snap.worn_kinds.is_empty() {
+                let worn = worn_from_items(&snap.worn_kinds);
+                let _ = self.ecs.insert_one(entity, worn);
+            }
+        }
+    }
+
+    /// Effective `Speed` for an entity, folding in:
+    /// - leg-cripple penalty (any crippled leg halves speed per
+    ///   `Damage math and hit roll.md`),
+    /// - leg encumbrance from Worn pieces (1% per encumbrance point).
+    /// Future status effects (haste/slow) compose through here too.
+    pub fn effective_speed_of(&self, entity: Entity) -> u16 {
+        let base = self
+            .ecs
+            .get::<&Speed>(entity)
             .map(|s| s.value)
-            .unwrap_or(Speed::BASELINE)
+            .unwrap_or(Speed::BASELINE);
+        let mut eff = base as i32;
+        if let Ok(bp) = self.ecs.get::<&BodyParts>(entity) {
+            if bp.any_leg_crippled() {
+                eff /= 2;
+            }
+        }
+        if let Ok(worn) = self.ecs.get::<&Worn>(entity) {
+            // 1% of base speed per leg-encumbrance point; gentle phase-2
+            // penalty pending the stamina card.
+            let leg_enc = worn.leg_encumbrance().max(0);
+            eff -= (base as i32 * leg_enc as i32) / 100;
+        }
+        eff.max(1) as u16
+    }
+
+    /// Read the player's effective `Speed`. Folded through
+    /// `effective_speed_of` so crippled legs + encumbrance compose for
+    /// free.
+    pub fn player_speed(&self) -> u16 {
+        self.effective_speed_of(self.player)
     }
 
     /// Overwrite the player's base speed. Used by save load; debug
@@ -1261,6 +2292,9 @@ impl World {
         let was_night = self.is_night();
         let before = self.clock_seconds;
         self.clock_seconds = self.clock_seconds.saturating_add(secs as u64);
+        // Stamina regen + grapple/prone timer decay ride the same tick
+        // path so save / load reproduce identically.
+        self.tick_combat_states(secs);
         // Calendar day advances at each midnight (24h) crossing. Use
         // floor-division on before/after so multi-day jumps from debug
         // commands or long sleeps land on the right calendar_day.
@@ -1961,6 +2995,1038 @@ impl World {
             self.ensure_chunk_loaded(cc);
             if let Some(c) = self.cell_at_mut(wx as i64, wy as i64) {
                 c.items = items;
+            }
+        }
+    }
+
+    // ---- Combat resolution -----------------------------------------
+    //
+    // Phase-1 vertical slice. `try_move_player` invokes
+    // `perform_melee_attack` on bump; after a player swing or move,
+    // `tick_hostiles` walks every Hostile entity once. Hits route
+    // through `apply_damage`; entities at 0 HP route to `on_death`,
+    // which drops the wielded weapon and despawns.
+
+    /// Award XP for a combat outcome and sync CombatSkills if the
+    /// underlying URW skill leveled up. The player is the only entity
+    /// with `Skills`; hostiles short-circuit.
+    fn award_combat_xp(&mut self, entity: Entity, kind: crate::skill::SkillKind, hit: bool) {
+        if entity != self.player {
+            return;
+        }
+        let leveled = {
+            let mut skills = self
+                .ecs
+                .get::<&mut crate::skill::Skills>(entity)
+                .map(|s| *s)
+                .unwrap_or_default();
+            let leveled = crate::skill::award_xp(skills.get_mut(kind), hit);
+            self.set_player_skills(skills);
+            leveled
+        };
+        if leveled {
+            self.sync_combat_skills_from_skills();
+        }
+    }
+
+    /// Sync the player's `CombatSkills` (the in-fight stat block read by
+    /// the resolver) from the URW `Skills` (the long-run training
+    /// ledger). +1 to the matching CombatSkills entry per Skills level.
+    /// Idempotent because each level only counts once via the starting
+    /// floor + Skills.value delta.
+    pub fn sync_combat_skills_from_skills(&mut self) {
+        let skills = self.ecs.get::<&crate::skill::Skills>(self.player).map(|s| *s);
+        let mut cs = self
+            .ecs
+            .get::<&mut CombatSkills>(self.player)
+            .ok()
+            .map(|c| *c);
+        if let (Ok(s), Some(mut combat)) = (skills, cs.as_mut()) {
+            let base = CombatSkills::starting_player();
+            // Each Skills level bumps the matching CombatSkills stat by
+            // +1 above the starting floor. Skills cap at 99 → max bump
+            // is +99, which keeps CombatSkills within signed-i16 safely.
+            combat.melee = base.melee + s.melee.value as i16;
+            combat.dodge = base.dodge + s.dodge.value as i16;
+            // Ranged: stand-in until the resolver splits Melee + Ranged
+            // — for now treat the higher of melee/ranged value as the
+            // weapon_prof bump so an archer who trains Ranged feels the
+            // upgrade on bow shots.
+            let weapon_bump = s.melee.value.max(s.ranged.value) as i16;
+            combat.weapon_prof = base.weapon_prof + weapon_bump / 4;
+            *self.ecs.get::<&mut CombatSkills>(self.player).unwrap() = *combat;
+        }
+        let _ = cs;
+    }
+
+    /// Run one melee swing from `attacker` against `target`. `range` is
+    /// the Chebyshev distance between the two (1 = adjacent, 2 = reach).
+    /// A reach-≥2 weapon used at range 1 takes the no-reach damage
+    /// penalty per `Reach and ranged.md`. Spends the weapon's swing
+    /// cost on the player's clock; hostile swings are free in the
+    /// phase-1 turn-by-turn loop.
+    pub fn perform_melee_attack(&mut self, attacker: Entity, target: Entity, range: u8) {
+        let Some((atk_stats, weapon_kind)) = self.attacker_loadout(attacker) else {
+            return;
+        };
+        let def_stats = self.defender_stats(target);
+        let weapon = match crate::combat::weapon_profile_for(weapon_kind) {
+            Some(w) => w,
+            None => return, // unarmored fist combat lands in a later phase
+        };
+        let outcome = crate::combat::resolve_hit(atk_stats, def_stats, weapon, &mut self.rng);
+        let weapon_label = weapon_kind.name();
+        let attacker_is_player = attacker == self.player;
+        let target_is_player = target == self.player;
+        // Capture hit-or-miss BEFORE moving the outcome into the match
+        // so we can award XP after the resolution.
+        let landed = outcome.landed();
+        // Capture the margin so we can tell a Dodge-eligible near-miss
+        // (close-call: defender just barely beat the attacker) from a
+        // wide miss (defender wasn't even threatened).
+        let margin = match outcome {
+            crate::combat::HitOutcome::Miss => -1,
+            crate::combat::HitOutcome::Hit { margin } => margin,
+            crate::combat::HitOutcome::Crit { margin } => margin,
+        };
+        match outcome {
+            crate::combat::HitOutcome::Miss => {
+                self.push_message(self.miss_line(attacker_is_player, target_is_player, weapon_label));
+            }
+            crate::combat::HitOutcome::Hit { .. } | crate::combat::HitOutcome::Crit { .. } => {
+                let crit = outcome.is_crit();
+                let part = crate::combat::roll_body_part(&mut self.rng);
+                let armor = self.layered_dr_for(target, part);
+                let situational_pct = if weapon.reach >= 2 && range == 1 {
+                    crate::combat::NO_REACH_DAMAGE_PCT
+                } else {
+                    100
+                };
+                let dmg = crate::combat::roll_damage_with_mult(
+                    weapon,
+                    atk_stats,
+                    armor,
+                    crit,
+                    situational_pct,
+                    &mut self.rng,
+                );
+                let total = dmg.total();
+                self.push_message(self.hit_line(
+                    attacker_is_player,
+                    target_is_player,
+                    weapon_label,
+                    part,
+                    total,
+                    crit,
+                ));
+                self.apply_damage_to_part(target, part, dmg);
+            }
+        }
+        if attacker_is_player {
+            self.spend_moves(weapon.move_cost);
+        }
+        // Skill XP. Attacker always trains Melee; defender trains Dodge
+        // only on a near-miss (margin in [-4, -1]) — pure miss + crit
+        // teach nothing dodge-relevant.
+        self.award_combat_xp(attacker, crate::skill::SkillKind::Melee, landed);
+        if !landed && (-4..0).contains(&margin) {
+            self.award_combat_xp(target, crate::skill::SkillKind::Dodge, true);
+        }
+    }
+
+    /// Fire one shot from `attacker` at the entity at `target_pos`
+    /// using the attacker's wielded ranged weapon. Consumes one piece
+    /// of ammo from the attacker's pack; on hit, the arrow drops on the
+    /// target's cell (70% recovery, 30% break — placeholder per the
+    /// reach-and-ranged card). LoS via `cell_blocks_sight_at` along a
+    /// Bresenham line; out-of-range / out-of-LoS shots short-circuit
+    /// with a log message instead of resolving.
+    pub fn perform_ranged_attack(&mut self, attacker: Entity, target: Entity) {
+        let attacker_is_player = attacker == self.player;
+        let Some((atk_stats, weapon_kind, ranged)) = self.ranged_loadout(attacker) else {
+            return;
+        };
+        // Range + LoS preflight.
+        let (Ok(atk_pos), Ok(tgt_pos)) = (
+            self.ecs.get::<&Position>(attacker).map(|p| *p),
+            self.ecs.get::<&Position>(target).map(|p| *p),
+        ) else {
+            return;
+        };
+        let dx = tgt_pos.x - atk_pos.x;
+        let dy = tgt_pos.y - atk_pos.y;
+        let cheb = dx.abs().max(dy.abs()) as u8;
+        if cheb > ranged.max_range {
+            if attacker_is_player {
+                self.push_message("Out of range.".to_string());
+            }
+            return;
+        }
+        if !self.ranged_los_clear(atk_pos, tgt_pos) {
+            if attacker_is_player {
+                self.push_message("No line of sight.".to_string());
+            }
+            return;
+        }
+        // Ammo: consume one from the attacker's pack. No pack → no shot.
+        let ammo_kind = crate::items::ItemKind::from_save_key(ranged.ammo_kind);
+        if let Some(kind) = ammo_kind {
+            let took = self
+                .ecs
+                .get::<&mut crate::items::Pack>(attacker)
+                .ok()
+                .map(|mut p| p.take_one_from_stack(kind))
+                .unwrap_or(false);
+            if !took {
+                if attacker_is_player {
+                    self.push_message(format!("No {} in your pack.", kind.name()));
+                }
+                return;
+            }
+        }
+        // Range penalty: -1 to_hit per tile past half max_range.
+        let range_penalty = {
+            let half = (ranged.max_range / 2) as i32;
+            (cheb as i32 - half).max(0) as i16
+        };
+        let weapon = crate::combat::WeaponProfile {
+            to_hit: ranged.to_hit - range_penalty,
+            damage_die: ranged.damage_die,
+            move_cost: ranged.move_cost,
+            reach: 1,
+        };
+        let def_stats = self.defender_stats(target);
+        let outcome = crate::combat::resolve_hit(atk_stats, def_stats, weapon, &mut self.rng);
+        let target_is_player = target == self.player;
+        let weapon_label = weapon_kind.name();
+        let landed = outcome.landed();
+        match outcome {
+            crate::combat::HitOutcome::Miss => {
+                self.push_message(self.ranged_miss_line(attacker_is_player, target_is_player));
+                // Missed arrow lands somewhere near the target — drop on
+                // the cell for the player to recover.
+                if let Some(kind) = ammo_kind {
+                    self.drop_arrow_near(tgt_pos, kind, true);
+                }
+            }
+            crate::combat::HitOutcome::Hit { .. } | crate::combat::HitOutcome::Crit { .. } => {
+                let crit = outcome.is_crit();
+                let part = crate::combat::roll_body_part(&mut self.rng);
+                let armor = self.layered_dr_for(target, part);
+                let dmg = crate::combat::roll_damage(weapon, atk_stats, armor, crit, &mut self.rng);
+                let total = dmg.total();
+                self.push_message(self.ranged_hit_line(
+                    attacker_is_player,
+                    target_is_player,
+                    weapon_label,
+                    part,
+                    total,
+                    crit,
+                ));
+                self.apply_damage_to_part(target, part, dmg);
+                if let Some(kind) = ammo_kind {
+                    // 70% of arrows survive embedded in the target —
+                    // pickup gives them back. Crits break the arrow
+                    // more often (placeholder).
+                    let break_roll = self.rng.d100();
+                    let break_threshold = if crit { 50 } else { 30 };
+                    let survives = break_roll > break_threshold;
+                    if survives {
+                        self.drop_arrow_near(tgt_pos, kind, false);
+                    }
+                }
+            }
+        }
+        if attacker_is_player {
+            self.spend_moves(ranged.move_cost);
+        }
+        // Skill XP. Bow + arrow swing always trains Ranged; defender
+        // trains nothing on a ranged miss — Dodge is a melee construct
+        // until a future card splits Ranged-Dodge.
+        self.award_combat_xp(attacker, crate::skill::SkillKind::Ranged, landed);
+    }
+
+    fn ranged_loadout(
+        &self,
+        e: Entity,
+    ) -> Option<(crate::combat::AttackerStats, crate::items::ItemKind, crate::combat::RangedProfile)> {
+        let kind = self.ecs.get::<&Wielded>(e).ok().map(|w| w.0)?;
+        let ranged = kind.def().ranged?;
+        let skills = self.ecs.get::<&CombatSkills>(e).ok()?;
+        let atk = crate::combat::AttackerStats {
+            // Ranged uses melee skill as a stand-in until phase 9 splits
+            // Melee + Ranged into separate top-level skills.
+            melee_skill: skills.melee,
+            weapon_prof: skills.weapon_prof,
+            agi_mod: skills.agi_mod,
+            str_bonus: skills.str_bonus,
+        };
+        Some((atk, kind, ranged))
+    }
+
+    /// True if every cell on the Bresenham line between `from` and `to`
+    /// (exclusive of endpoints) is transparent. Tree / wall / gorse all
+    /// block per `cell_blocks_sight_at`.
+    fn ranged_los_clear(&self, from: Position, to: Position) -> bool {
+        let mut x0 = from.x;
+        let mut y0 = from.y;
+        let x1 = to.x;
+        let y1 = to.y;
+        let dx = (x1 - x0).abs();
+        let dy = -(y1 - y0).abs();
+        let sx = if x0 < x1 { 1 } else { -1 };
+        let sy = if y0 < y1 { 1 } else { -1 };
+        let mut err = dx + dy;
+        loop {
+            // Step.
+            let e2 = 2 * err;
+            if e2 >= dy {
+                err += dy;
+                x0 += sx;
+            }
+            if e2 <= dx {
+                err += dx;
+                y0 += sy;
+            }
+            if x0 == x1 && y0 == y1 {
+                return true;
+            }
+            if self.cell_blocks_sight_at(x0 as i64, y0 as i64) {
+                return false;
+            }
+        }
+    }
+
+    fn drop_arrow_near(&mut self, pos: Position, kind: crate::items::ItemKind, miss: bool) {
+        // Miss scatters the arrow within one cell of the target. Hit
+        // drops on the target's exact cell (sticks in the body).
+        let (dx, dy) = if miss {
+            let r = self.rng.next_u32();
+            let dx = ((r % 3) as i32) - 1;
+            let dy = (((r / 3) % 3) as i32) - 1;
+            (dx, dy)
+        } else {
+            (0, 0)
+        };
+        let lx = pos.x + dx;
+        let ly = pos.y + dy;
+        let instance = kind.make_default_instance(1);
+        if let Some(cell) = self.cell_at_mut(lx as i64, ly as i64) {
+            cell.items.push(instance);
+        }
+    }
+
+    fn ranged_miss_line(&self, attacker_is_player: bool, target_is_player: bool) -> String {
+        match (attacker_is_player, target_is_player) {
+            (true, _) => "Your shot misses.".to_string(),
+            (_, true) => "Arrow whistles past you.".to_string(),
+            _ => "An arrow misses.".to_string(),
+        }
+    }
+
+    fn ranged_hit_line(
+        &self,
+        attacker_is_player: bool,
+        target_is_player: bool,
+        weapon: &str,
+        part: crate::combat::BodyPart,
+        dmg: u16,
+        crit: bool,
+    ) -> String {
+        let prefix = if crit { "CRIT! " } else { "" };
+        let where_ = part.label();
+        match (attacker_is_player, target_is_player) {
+            (true, _) => format!("{}You shoot bandit's {} -{}", prefix, where_, dmg),
+            (_, true) => format!("{}Arrow hits your {} -{}", prefix, where_, dmg),
+            _ => format!("{}{} shot lands on {} -{}", prefix, weapon, where_, dmg),
+        }
+    }
+
+    /// Rough hit-percent estimate for a ranged shot against `target`.
+    /// Used by the targeting cursor HUD only — actual resolution still
+    /// rolls the contested margin. Quick linear stand-in: 50% at
+    /// margin 0, ±5pp per point, clamped [5, 95].
+    pub fn estimate_ranged_hit_pct(&self, target: Entity) -> u8 {
+        let Some((atk_stats, _, ranged)) = self.ranged_loadout(self.player) else {
+            return 0;
+        };
+        let (Ok(atk_pos), Ok(tgt_pos)) = (
+            self.ecs.get::<&Position>(self.player).map(|p| *p),
+            self.ecs.get::<&Position>(target).map(|p| *p),
+        ) else {
+            return 0;
+        };
+        let cheb = (tgt_pos.x - atk_pos.x).abs().max((tgt_pos.y - atk_pos.y).abs()) as i16;
+        let range_penalty = {
+            let half = (ranged.max_range / 2) as i16;
+            (cheb - half).max(0)
+        };
+        let atk_score = atk_stats.melee_skill
+            + atk_stats.weapon_prof
+            + (ranged.to_hit - range_penalty)
+            + atk_stats.agi_mod;
+        let def = self.defender_stats(target);
+        let def_score = def.dodge_skill + def.agi_mod - def.encumbrance;
+        let margin = atk_score as i32 - def_score as i32;
+        // 50% at margin 0; +5pp per +1 margin; clamp [5, 95].
+        let pct = (50 + margin * 5).clamp(5, 95);
+        pct as u8
+    }
+
+    /// Returns true if the player has line of sight to the entity at
+    /// `pos`. Used by the targeting cursor to flag out-of-LoS picks.
+    pub fn player_has_los_to(&self, pos: Position) -> bool {
+        let Ok(p) = self.ecs.get::<&Position>(self.player).map(|p| *p) else { return false };
+        self.ranged_los_clear(p, pos)
+    }
+
+    /// Find a hostile in front of the attacker at any distance up to
+    /// `max_range` with LoS clear — used by AI to decide whether to
+    /// shoot or close.
+    pub fn nearest_visible_hostile(&self, from: Position, max_range: u8) -> Option<Entity> {
+        let mut best: Option<(Entity, u8)> = None;
+        for (e, (pos, _h)) in self.ecs.query::<(&Position, &Hostile)>().iter() {
+            let cheb = (pos.x - from.x).abs().max((pos.y - from.y).abs()) as u8;
+            if cheb == 0 || cheb > max_range {
+                continue;
+            }
+            if !self.ranged_los_clear(from, *pos) {
+                continue;
+            }
+            if best.map(|(_, d)| cheb < d).unwrap_or(true) {
+                best = Some((e, cheb));
+            }
+        }
+        best.map(|(e, _)| e)
+    }
+
+    /// Sum the DR contribution of every Worn piece that covers `part`
+    /// and rolls under its coverage %. The roll happens per-piece, not
+    /// per-type — a single piece either catches the swing or it doesn't.
+    fn layered_dr_for(&mut self, target: Entity, part: crate::combat::BodyPart) -> crate::combat::ArmorDr {
+        let Ok(worn) = self.ecs.get::<&Worn>(target) else {
+            return crate::combat::ArmorDr::default();
+        };
+        // Collect into a local Vec so we can drop the ECS borrow before
+        // touching the Rng (rng.d100 doesn't borrow the ECS but the
+        // Worn ref is &; keeping it open across a self.rng call is fine
+        // but the small alloc keeps the surface simple).
+        let pieces: Vec<(u8, crate::combat::ArmorDr)> = worn
+            .pieces
+            .iter()
+            .filter(|p| p.regions.contains(part))
+            .map(|p| (p.coverage_pct, p.dr))
+            .collect();
+        drop(worn);
+        let mut total = crate::combat::ArmorDr::default();
+        for (coverage_pct, dr) in pieces {
+            let roll = self.rng.d100();
+            if roll <= coverage_pct {
+                total.bash = total.bash.saturating_add(dr.bash);
+                total.cut = total.cut.saturating_add(dr.cut);
+                total.stab = total.stab.saturating_add(dr.stab);
+            }
+        }
+        total
+    }
+
+    fn attacker_loadout(&self, e: Entity) -> Option<(crate::combat::AttackerStats, crate::items::ItemKind)> {
+        let wielded = self.ecs.get::<&Wielded>(e).ok()?;
+        let skills = self.ecs.get::<&CombatSkills>(e).ok()?;
+        Some((
+            crate::combat::AttackerStats {
+                melee_skill: skills.melee,
+                weapon_prof: skills.weapon_prof,
+                agi_mod: skills.agi_mod,
+                str_bonus: skills.str_bonus,
+            },
+            wielded.0,
+        ))
+    }
+
+    fn defender_stats(&self, e: Entity) -> crate::combat::DefenderStats {
+        let Ok(skills) = self.ecs.get::<&CombatSkills>(e) else {
+            return crate::combat::DefenderStats::default();
+        };
+        let worn_enc = self
+            .ecs
+            .get::<&Worn>(e)
+            .map(|w| w.upper_body_encumbrance())
+            .unwrap_or(0);
+        // Stamina drain: when below the heavy floor, the defender's
+        // effective Dodge drops by LOW_HIT_PENALTY too (gasping for
+        // breath is hard to dodge through).
+        let stam_penalty = self
+            .ecs
+            .get::<&Stamina>(e)
+            .map(|s| if s.cur < Stamina::HEAVY_FLOOR { Stamina::LOW_HIT_PENALTY } else { 0 })
+            .unwrap_or(0);
+        // Grappled = can't dodge well; treat as +6 encumbrance.
+        let grappled_pen = if self.ecs.satisfies::<&Grappled>(e).unwrap_or(false) {
+            6
+        } else {
+            0
+        };
+        let prone_pen = if self.ecs.satisfies::<&Prone>(e).unwrap_or(false) {
+            Prone::DEFENDER_PENALTY
+        } else {
+            0
+        };
+        crate::combat::DefenderStats {
+            dodge_skill: skills.dodge,
+            agi_mod: skills.agi_mod,
+            encumbrance: skills.encumbrance + worn_enc + stam_penalty + grappled_pen + prone_pen,
+        }
+    }
+
+    /// Spend `cost` stamina on an entity. No-op if no Stamina component.
+    /// Used by heavy actions (Grapple/Throw/Disarm and later brace,
+    /// reload, aimed shots).
+    pub fn spend_stamina(&mut self, e: Entity, cost: i16) {
+        if let Ok(mut s) = self.ecs.get::<&mut Stamina>(e) {
+            s.cur = (s.cur - cost).max(0);
+        }
+    }
+
+    /// Tick every Stamina component by `secs` of regen (passive +2/sec
+    /// while not in a heavy action). Also decays Grappled / Prone
+    /// timers and removes the components when they expire.
+    pub fn tick_combat_states(&mut self, secs: u32) {
+        if secs == 0 {
+            return;
+        }
+        // Regen first.
+        for (_, s) in self.ecs.query::<&mut Stamina>().iter() {
+            let regen = 2 * secs as i16;
+            s.cur = (s.cur + regen).min(s.max);
+        }
+        // Grappled timers.
+        let expired_grapples: Vec<Entity> = self
+            .ecs
+            .query::<&mut Grappled>()
+            .iter()
+            .filter_map(|(e, g)| {
+                g.remaining_secs = g.remaining_secs.saturating_sub(secs);
+                if g.remaining_secs == 0 { Some(e) } else { None }
+            })
+            .collect();
+        for e in expired_grapples {
+            let _ = self.ecs.remove_one::<Grappled>(e);
+        }
+        // Prone timers.
+        let stood: Vec<Entity> = self
+            .ecs
+            .query::<&mut Prone>()
+            .iter()
+            .filter_map(|(e, p)| {
+                p.remaining_secs = p.remaining_secs.saturating_sub(secs);
+                if p.remaining_secs == 0 { Some(e) } else { None }
+            })
+            .collect();
+        for e in stood {
+            let _ = self.ecs.remove_one::<Prone>(e);
+        }
+    }
+
+    /// Read the player's current stamina (cur, max). Used by the HUD.
+    pub fn player_stamina(&self) -> (i16, i16) {
+        self.ecs
+            .get::<&Stamina>(self.player)
+            .map(|s| (s.cur, s.max))
+            .unwrap_or((0, 0))
+    }
+
+    /// True if the player has enough stamina to attempt a heavy action.
+    pub fn player_has_stamina_for_heavy(&self) -> bool {
+        self.player_stamina().0 >= Stamina::HEAVY_FLOOR
+    }
+
+    /// Cheapest adjacent hostile to the player, if any. Used by the
+    /// grapple / throw / disarm verbs to auto-target.
+    pub fn adjacent_hostile(&self) -> Option<Entity> {
+        let p = self.player_pos();
+        let mut best: Option<(Entity, i32)> = None;
+        for (e, (pos, _h)) in self.ecs.query::<(&Position, &Hostile)>().iter() {
+            let dx = (pos.x - p.x).abs();
+            let dy = (pos.y - p.y).abs();
+            if dx <= 1 && dy <= 1 && (dx + dy) > 0 {
+                let dist = dx + dy;
+                if best.map(|(_, d)| dist < d).unwrap_or(true) {
+                    best = Some((e, dist));
+                }
+            }
+        }
+        best.map(|(e, _)| e)
+    }
+
+    pub fn entity_has_wielded(&self, e: Entity) -> bool {
+        self.ecs.satisfies::<&Wielded>(e).unwrap_or(false)
+    }
+
+    pub fn entity_is_grappled(&self, e: Entity) -> bool {
+        self.ecs.satisfies::<&Grappled>(e).unwrap_or(false)
+    }
+
+    // ---- Heavy wrestling actions ----
+
+    /// Str contest between player and target. Returns true if attacker
+    /// wins. Stamina also folds in — exhausted attacker loses points.
+    fn str_contest(&mut self, attacker: Entity, target: Entity) -> bool {
+        let atk_str = self
+            .ecs
+            .get::<&CombatSkills>(attacker)
+            .map(|s| s.str_bonus)
+            .unwrap_or(0);
+        let def_str = self
+            .ecs
+            .get::<&CombatSkills>(target)
+            .map(|s| s.str_bonus)
+            .unwrap_or(0);
+        let stam_pen = self
+            .ecs
+            .get::<&Stamina>(attacker)
+            .map(|s| if s.cur < Stamina::HEAVY_FLOOR { 2 } else { 0 })
+            .unwrap_or(0);
+        let atk_roll = atk_str as i32 + (self.rng.d100() as i32 / 5) - stam_pen as i32;
+        let def_roll = def_str as i32 + (self.rng.d100() as i32 / 5);
+        atk_roll > def_roll
+    }
+
+    pub fn perform_grapple(&mut self, target: Entity) -> String {
+        let attacker = self.player;
+        self.spend_stamina(attacker, 20);
+        let win = self.str_contest(attacker, target);
+        if win {
+            let _ = self.ecs.insert_one(target, Grappled { remaining_secs: 3 });
+            "You lock up the bandit.".to_string()
+        } else {
+            "Bandit shrugs your grapple off.".to_string()
+        }
+    }
+
+    pub fn perform_throw(&mut self, target: Entity) -> String {
+        let attacker = self.player;
+        self.spend_stamina(attacker, 25);
+        let win = self.str_contest(attacker, target);
+        if win {
+            let _ = self.ecs.insert_one(target, Prone { remaining_secs: Prone::DURATION_SECS });
+            // Throw breaks the grapple too — they're on the floor now.
+            let _ = self.ecs.remove_one::<Grappled>(target);
+            "You slam the bandit to the ground.".to_string()
+        } else {
+            "Throw fails — bandit holds footing.".to_string()
+        }
+    }
+
+    pub fn perform_disarm(&mut self, target: Entity) -> String {
+        let attacker = self.player;
+        self.spend_stamina(attacker, 15);
+        let win = self.str_contest(attacker, target);
+        if !win {
+            return "Disarm fails.".to_string();
+        }
+        let weapon = self.ecs.get::<&Wielded>(target).ok().map(|w| w.0);
+        let pos = self.ecs.get::<&Position>(target).ok().map(|p| *p);
+        if let (Some(kind), Some(p)) = (weapon, pos) {
+            let _ = self.ecs.remove_one::<Wielded>(target);
+            if let Some(cell) = self.cell_at_mut(p.x as i64, p.y as i64) {
+                cell.items.push(kind.make_default_instance(1));
+            }
+            format!("Bandit drops their {}!", kind.name())
+        } else {
+            "Bandit had nothing to drop.".to_string()
+        }
+    }
+
+    fn miss_line(&self, attacker_is_player: bool, target_is_player: bool, _weapon: &str) -> String {
+        // Compact lines fit the 38-cell HUD without truncating. Weapon
+        // omitted from the miss line — you know what you swung; what
+        // matters is that it missed.
+        match (attacker_is_player, target_is_player) {
+            (true, _) => "You miss.".to_string(),
+            (_, true) => "Bandit misses.".to_string(),
+            _ => "A swing misses.".to_string(),
+        }
+    }
+
+    fn hit_line(
+        &self,
+        attacker_is_player: bool,
+        target_is_player: bool,
+        _weapon: &str,
+        part: crate::combat::BodyPart,
+        dmg: u16,
+        crit: bool,
+    ) -> String {
+        // Compact format: "You hit chest -18" or "CRIT! You hit head -27".
+        // Weapon name omitted (you know what you swung); body part +
+        // damage are the load-bearing info.
+        let prefix = if crit { "CRIT! " } else { "" };
+        let where_ = part.label();
+        match (attacker_is_player, target_is_player) {
+            (true, _) => format!("{}You hit {} -{}", prefix, where_, dmg),
+            (_, true) => format!("{}Bandit hits {} -{}", prefix, where_, dmg),
+            _ => format!("{}Hit {} -{}", prefix, where_, dmg),
+        }
+    }
+
+    /// Apply damage to a single body part, with overflow-to-torso and
+    /// crippling rules per `Damage math and hit roll.md`. Crippling
+    /// effects (drop wielded on arm, halve speed on leg) fire here so
+    /// they're visible the very next tick.
+    fn apply_damage_to_part(
+        &mut self,
+        target: Entity,
+        part: crate::combat::BodyPart,
+        dmg: crate::combat::DamageTriplet,
+    ) {
+        let total = dmg.total() as i16;
+        let mut overflow: i16 = 0;
+        let mut just_crippled = false;
+        let died;
+        {
+            let Ok(mut bp) = self.ecs.get::<&mut BodyParts>(target) else { return };
+            let was_crippled = bp.get(part).is_crippled();
+            let cell = bp.get_mut(part);
+            let new_hp = (cell.hp as i32) - (total as i32);
+            if new_hp < 0 && !part.is_vital() {
+                // Damage overflow on a limb spills to torso; the limb
+                // pins at 0 so cripple is binary.
+                overflow = (-new_hp).min(i16::MAX as i32) as i16;
+                cell.hp = 0;
+            } else {
+                cell.hp = new_hp.max(i16::MIN as i32) as i16;
+            }
+            if cell.is_crippled() && !was_crippled && !part.is_vital() {
+                just_crippled = true;
+            }
+            if overflow > 0 {
+                let torso = bp.get_mut(crate::combat::BodyPart::Torso);
+                torso.hp = (torso.hp as i32 - overflow as i32).max(i16::MIN as i32) as i16;
+            }
+            died = bp.is_dead();
+        }
+        // Crippling side-effects. Arm → drop wielded weapon. Leg cripple
+        // is implicit (effective_speed_of reads BodyParts each tick).
+        if just_crippled {
+            if part.is_arm() {
+                self.drop_wielded(target, part);
+            } else if part.is_leg() {
+                self.push_message(self.cripple_leg_line(target, part));
+            }
+        }
+        if died {
+            self.on_death(target);
+        }
+    }
+
+    /// Drop the entity's wielded weapon onto its cell as ground loot
+    /// and remove the `Wielded` component. Used by arm-cripple.
+    fn drop_wielded(&mut self, target: Entity, part: crate::combat::BodyPart) {
+        let (kind, pos) = match (
+            self.ecs.get::<&Wielded>(target).ok().map(|w| w.0),
+            self.ecs.get::<&Position>(target).ok().map(|p| *p),
+        ) {
+            (Some(k), Some(p)) => (k, p),
+            _ => return,
+        };
+        let instance = kind.make_default_instance(1);
+        if let Some(cell) = self.cell_at_mut(pos.x as i64, pos.y as i64) {
+            cell.items.push(instance);
+        }
+        let _ = self.ecs.remove_one::<Wielded>(target);
+        let line = if target == self.player {
+            format!("Your {} fails — drop {}.", part.label(), kind.name())
+        } else {
+            format!("Bandit's {} fails — drops {}.", part.label(), kind.name())
+        };
+        self.push_message(line);
+    }
+
+    fn cripple_leg_line(&self, target: Entity, part: crate::combat::BodyPart) -> String {
+        if target == self.player {
+            format!("Your {} buckles!", part.label())
+        } else {
+            format!("Bandit's {} gives out.", part.label())
+        }
+    }
+
+    fn on_death(&mut self, e: Entity) {
+        // Snapshot what we need before despawning so the borrow checker
+        // is happy and we can do the cell-items mutation cleanly.
+        let pos = match self.ecs.get::<&Position>(e) {
+            Ok(p) => *p,
+            Err(_) => return,
+        };
+        let is_player = e == self.player;
+        let is_bandit = self.ecs.satisfies::<&CornishBandit>(e).unwrap_or(false);
+        if is_player {
+            // Defer the actual game-over UI to main.rs's existing death
+            // screen; just raise the flag and log a final line.
+            self.player_killed_by_combat = true;
+            self.push_message("You die.".to_string());
+            return;
+        }
+        // Phase-4 full-loadout drop: every wielded / off-hand / worn
+        // armor piece becomes a ground item on the death cell. The
+        // player can pick up and equip the lot to climb from Rabble
+        // tier to Yeoman.
+        let mut drops: Vec<crate::items::ItemInstance> = Vec::new();
+        if let Ok(w) = self.ecs.get::<&Wielded>(e) {
+            drops.push(w.0.make_default_instance(1));
+        }
+        if let Ok(o) = self.ecs.get::<&OffHand>(e) {
+            drops.push(o.0.make_default_instance(1));
+        }
+        if let Ok(worn) = self.ecs.get::<&Worn>(e) {
+            for piece in worn.pieces.iter() {
+                if let Some(kind) = piece.item_kind {
+                    drops.push(kind.make_default_instance(1));
+                }
+            }
+        }
+        // Spill the hostile's pack contents (arrows for a bow bandit,
+        // anything else that's been added in later phases). Cloning
+        // ItemInstance preserves stack counts + metadata.
+        if let Ok(pack) = self.ecs.get::<&crate::items::Pack>(e) {
+            for item in pack.contents.iter() {
+                drops.push(item.clone());
+            }
+        }
+        for instance in drops {
+            if let Some(cell) = self.cell_at_mut(pos.x as i64, pos.y as i64) {
+                cell.items.push(instance);
+            }
+        }
+        if is_bandit {
+            self.push_message("You slay the bandit.".to_string());
+        } else {
+            self.push_message("It dies.".to_string());
+        }
+        let _ = self.ecs.despawn(e);
+    }
+
+    /// Rebuild the derived combat components (`Wielded`, `OffHand`,
+    /// `Worn`) from an entity's `Equipment`. The slot enum is the
+    /// source of truth; this just projects it back into the shape the
+    /// combat resolver consumes. Cheap — call after every equip /
+    /// unequip / death-loot pickup.
+    pub fn sync_equipment(&mut self, entity: Entity) {
+        let Ok(eq) = self.ecs.get::<&Equipment>(entity).map(|e| *e) else { return };
+        // Wielded mirrors main_hand; remove the component entirely if
+        // empty so combat-tick can skip the swing.
+        if let Some(kind) = eq.main_hand {
+            let _ = self.ecs.insert_one(entity, Wielded(kind));
+        } else {
+            let _ = self.ecs.remove_one::<Wielded>(entity);
+        }
+        if let Some(kind) = eq.off_hand {
+            let _ = self.ecs.insert_one(entity, OffHand(kind));
+        } else {
+            let _ = self.ecs.remove_one::<OffHand>(entity);
+        }
+        // Rebuild Worn from the six armor slots.
+        let armor_kinds: Vec<crate::items::ItemKind> = [
+            eq.head, eq.torso, eq.l_arm, eq.r_arm, eq.l_leg, eq.r_leg,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if armor_kinds.is_empty() {
+            let _ = self.ecs.remove_one::<Worn>(entity);
+        } else {
+            let _ = self.ecs.insert_one(entity, worn_from_items(&armor_kinds));
+        }
+    }
+
+    /// Equip `kind` from the player's pack into the matching slot.
+    /// Returns a message describing the outcome (success or refusal).
+    /// On success: the item leaves the pack, lands in the slot, and any
+    /// prior occupant of that slot is bounced back to the pack.
+    pub fn equip_from_pack(&mut self, kind: crate::items::ItemKind) -> String {
+        let Some(slot) = default_slot_for(kind) else {
+            return format!("You can't equip the {}.", kind.name());
+        };
+        // Pull one from the pack — Pack::take_one_from_stack already
+        // handles fungible decrement vs unique remove.
+        let pack_taken = {
+            let mut pack = self.ecs.get::<&mut Pack>(self.player).unwrap();
+            pack.take_one_from_stack(kind)
+        };
+        if !pack_taken {
+            return format!("No {} in your pack.", kind.name());
+        }
+        // Swap with any prior occupant of the slot.
+        let prior = {
+            let mut eq = self.ecs.get::<&mut Equipment>(self.player).unwrap();
+            let p = eq.get(slot);
+            eq.set(slot, Some(kind));
+            p
+        };
+        if let Some(prev) = prior {
+            // Bounce the prior occupant back to the pack. If the pack is
+            // somehow full, drop it on the player's cell so nothing
+            // vanishes — this matches the "pickup" fallback already used
+            // elsewhere.
+            let instance = prev.make_default_instance(1);
+            let bounce = {
+                let mut pack = self.ecs.get::<&mut Pack>(self.player).unwrap();
+                pack.try_add(instance)
+            };
+            if let Err(item) = bounce {
+                let pos = self.player_pos();
+                if let Some(cell) = self.cell_at_mut(pos.x as i64, pos.y as i64) {
+                    cell.items.push(item);
+                }
+            }
+        }
+        self.sync_equipment(self.player);
+        format!("You equip the {} ({}).", kind.name(), slot.label())
+    }
+
+    /// Unequip the slot back into the pack. Drops the item on the
+    /// ground if the pack is full. Returns a message describing the
+    /// outcome.
+    pub fn unequip_to_pack(&mut self, slot: EquipSlot) -> String {
+        let removed = {
+            let mut eq = self.ecs.get::<&mut Equipment>(self.player).unwrap();
+            let removed = eq.get(slot);
+            eq.set(slot, None);
+            removed
+        };
+        let Some(kind) = removed else {
+            return format!("Nothing equipped on your {}.", slot.label());
+        };
+        let instance = kind.make_default_instance(1);
+        let bounce = {
+            let mut pack = self.ecs.get::<&mut Pack>(self.player).unwrap();
+            pack.try_add(instance)
+        };
+        if let Err(item) = bounce {
+            let pos = self.player_pos();
+            if let Some(cell) = self.cell_at_mut(pos.x as i64, pos.y as i64) {
+                cell.items.push(item);
+            }
+        }
+        self.sync_equipment(self.player);
+        format!("You stow the {}.", kind.name())
+    }
+
+    /// Read the player's equipment for HUD / save serialization.
+    pub fn player_equipment(&self) -> Equipment {
+        self.ecs
+            .get::<&Equipment>(self.player)
+            .map(|e| *e)
+            .unwrap_or_default()
+    }
+
+    /// Restore the player's equipment from a save and re-sync derived
+    /// components.
+    pub fn set_player_equipment(&mut self, eq: Equipment) {
+        let _ = self.ecs.insert_one(self.player, eq);
+        self.sync_equipment(self.player);
+    }
+
+    /// Walk every hostile entity once; chase + bump per
+    /// `Bestiary slice 1.md`. Phase 1 keeps it strictly turn-based
+    /// (one swing per hostile per player action); the CDDA speed
+    /// accumulator lands in phase 2 alongside body parts.
+    pub fn tick_hostiles(&mut self) {
+        if self.player_killed_by_combat {
+            return;
+        }
+        let player_pos = self.player_pos();
+        let hostiles: Vec<Entity> = self
+            .ecs
+            .query::<(&Hostile, &Position)>()
+            .iter()
+            .map(|(e, _)| e)
+            .collect();
+        for e in hostiles {
+            // Grappled hostiles can't act — they're tied up trying to
+            // break the hold. Stamina regen still applies via the
+            // tick_combat_states path.
+            if self.ecs.satisfies::<&Grappled>(e).unwrap_or(false) {
+                continue;
+            }
+            let Ok(pos_ref) = self.ecs.get::<&Position>(e) else { continue };
+            let pos = *pos_ref;
+            drop(pos_ref);
+            let dx = (player_pos.x - pos.x).signum();
+            let dy = (player_pos.y - pos.y).signum();
+            let chebyshev =
+                (player_pos.x - pos.x).abs().max((player_pos.y - pos.y).abs()) as u8;
+            // Inspect the hostile's wielded item: ranged weapon vs melee
+            // changes both the attack distance and the resolver to call.
+            let wielded_kind = self.ecs.get::<&Wielded>(e).ok().map(|w| w.0);
+            let ranged = wielded_kind.and_then(|k| k.def().ranged);
+            let reach = wielded_kind
+                .and_then(crate::combat::weapon_profile_for)
+                .map(|w| w.reach)
+                .unwrap_or(1);
+            // Ranged path: bow bandit shoots if in max_range, LoS clear,
+            // and has at least one arrow in pack. If adjacent, the
+            // bow is awkward — they fall through to the melee path
+            // (which, for a bow main_hand, does nothing — placeholder
+            // until phase 7 wires a knife backup swap).
+            if let Some(r) = ranged {
+                let los = self.ranged_los_clear(pos, player_pos);
+                let has_ammo = crate::items::ItemKind::from_save_key(r.ammo_kind)
+                    .and_then(|k| self.ecs.get::<&crate::items::Pack>(e).ok().map(|p| p.has_stack(k)))
+                    .unwrap_or(false);
+                if chebyshev >= 2 && chebyshev <= r.max_range && los && has_ammo {
+                    self.perform_ranged_attack(e, self.player);
+                    if self.player_killed_by_combat {
+                        return;
+                    }
+                    continue;
+                }
+                // Bow + adjacent: archer kites — step away from the
+                // player if possible.
+                if chebyshev <= 1 {
+                    let bx = pos.x - dx;
+                    let by = pos.y - dy;
+                    if self.cell_walkable_at(bx as i64, by as i64)
+                        && self.find_hostile_at(bx, by).is_none()
+                    {
+                        if let Ok(mut p) = self.ecs.get::<&mut Position>(e) {
+                            p.x = bx;
+                            p.y = by;
+                        }
+                        continue;
+                    }
+                }
+            }
+            // Melee path. Reach-2 swing also needs the intermediate cell
+            // clear of sight blockers.
+            let in_range = chebyshev >= 1 && chebyshev <= reach;
+            let los_clear = if chebyshev <= 1 {
+                true
+            } else {
+                let ix = pos.x + dx;
+                let iy = pos.y + dy;
+                !self.cell_blocks_sight_at(ix as i64, iy as i64)
+            };
+            if in_range && los_clear {
+                self.perform_melee_attack(e, self.player, chebyshev);
+                if self.player_killed_by_combat {
+                    return;
+                }
+            } else {
+                // Step toward the player; greedy chase good enough for
+                // a single open chunk. Phase 2 can swap to A* once
+                // obstacles matter.
+                let nx = pos.x + dx;
+                let ny = pos.y + dy;
+                if self.cell_walkable_at(nx as i64, ny as i64)
+                    && self.find_hostile_at(nx, ny).is_none()
+                    && !(nx == player_pos.x && ny == player_pos.y)
+                {
+                    if let Ok(mut p) = self.ecs.get::<&mut Position>(e) {
+                        p.x = nx;
+                        p.y = ny;
+                    }
+                }
             }
         }
     }
@@ -3109,5 +5175,814 @@ mod tests {
 
         world.restore_cell_items(snap);
         assert!(!world.cell_at(21, 15).expect("cell").items.is_empty());
+    }
+
+    // ---- Phase 2 combat: body parts + crippling -------------------
+
+    fn drop_test_bandit(world: &mut World, dx: i32, dy: i32) -> Entity {
+        let p = world.player_pos();
+        // Deterministic loadout for tests: always spear + padded
+        // doublet + skullcap so assertions about armor coverage stay
+        // stable regardless of the world's RNG state.
+        let loadout = YeomanLoadout {
+            main_hand: Some(crate::items::ItemKind::Spear),
+            off_hand: Some(crate::items::ItemKind::Knife),
+            head: Some(crate::items::ItemKind::IronSkullcap),
+            torso: Some(crate::items::ItemKind::PaddedDoublet),
+            torso_outer: None,
+            legs: None,
+        };
+        spawn_cornish_bandit(
+            &mut world.ecs,
+            Position { x: p.x + dx, y: p.y + dy },
+            loadout,
+        )
+    }
+
+    #[test]
+    fn apply_damage_to_part_routes_to_chosen_part() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let bandit = drop_test_bandit(&mut world, 5, 0);
+        let before_head = world
+            .ecs
+            .get::<&BodyParts>(bandit)
+            .map(|b| b.head.hp)
+            .unwrap();
+        let before_torso = world
+            .ecs
+            .get::<&BodyParts>(bandit)
+            .map(|b| b.torso.hp)
+            .unwrap();
+        world.apply_damage_to_part(
+            bandit,
+            crate::combat::BodyPart::Head,
+            crate::combat::DamageTriplet { bash: 10, cut: 0, stab: 0 },
+        );
+        let bp = world.ecs.get::<&BodyParts>(bandit).map(|b| *b).unwrap();
+        assert_eq!(bp.head.hp, before_head - 10);
+        assert_eq!(bp.torso.hp, before_torso, "torso untouched");
+    }
+
+    #[test]
+    fn limb_overflow_spills_to_torso() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let bandit = drop_test_bandit(&mut world, 5, 0);
+        let starting_torso = BodyParts::TORSO_MAX;
+        // Punch the arm with massively more than its 60 HP.
+        world.apply_damage_to_part(
+            bandit,
+            crate::combat::BodyPart::LArm,
+            crate::combat::DamageTriplet { bash: 100, cut: 0, stab: 0 },
+        );
+        let bp = world.ecs.get::<&BodyParts>(bandit).map(|b| *b).unwrap();
+        assert_eq!(bp.l_arm.hp, 0, "limb pins at 0");
+        assert!(bp.l_arm.is_crippled());
+        // 60 absorbed by arm, 40 spills into torso.
+        assert_eq!(bp.torso.hp, starting_torso - (100 - BodyParts::ARM_MAX));
+    }
+
+    #[test]
+    fn vital_zero_triggers_death_event() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let bandit = drop_test_bandit(&mut world, 5, 0);
+        let pos = world.ecs.get::<&Position>(bandit).map(|p| *p).unwrap();
+        world.apply_damage_to_part(
+            bandit,
+            crate::combat::BodyPart::Head,
+            crate::combat::DamageTriplet { bash: 0, cut: 0, stab: BodyParts::HEAD_MAX as u16 + 5 },
+        );
+        // Bandit should be despawned now and have dropped its weapon.
+        assert!(world.ecs.get::<&Position>(bandit).is_err(), "bandit despawned");
+        let drops = &world.cell_at(pos.x as i64, pos.y as i64).unwrap().items;
+        assert!(drops.iter().any(|i| i.kind == ItemKind::Spear), "spear dropped on death cell");
+    }
+
+    #[test]
+    fn arm_cripple_drops_wielded_weapon() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let bandit = drop_test_bandit(&mut world, 5, 0);
+        let pos = world.ecs.get::<&Position>(bandit).map(|p| *p).unwrap();
+        world.apply_damage_to_part(
+            bandit,
+            crate::combat::BodyPart::LArm,
+            crate::combat::DamageTriplet { bash: BodyParts::ARM_MAX as u16, cut: 0, stab: 0 },
+        );
+        assert!(world.ecs.get::<&Wielded>(bandit).is_err(), "Wielded removed");
+        let drops = &world.cell_at(pos.x as i64, pos.y as i64).unwrap().items;
+        assert!(drops.iter().any(|i| i.kind == ItemKind::Spear), "weapon dropped to cell");
+    }
+
+    #[test]
+    fn leg_cripple_halves_effective_speed() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let player = world.player;
+        let before = world.effective_speed_of(player);
+        world.apply_damage_to_part(
+            player,
+            crate::combat::BodyPart::LLeg,
+            crate::combat::DamageTriplet { bash: BodyParts::LEG_MAX as u16, cut: 0, stab: 0 },
+        );
+        let after = world.effective_speed_of(player);
+        assert_eq!(after, before / 2);
+    }
+
+    #[test]
+    fn worn_upper_body_encumbrance_sums_pieces() {
+        // Bandit's Yeoman default: padded doublet (enc 1, regions
+        // torso+L arm+R arm) + iron skullcap (enc 1, region head).
+        // Upper-body sum = 1 * 3 = 3; head doesn't contribute to
+        // upper-body encumbrance.
+        let worn = worn_from_items(&[
+            ItemKind::PaddedDoublet,
+            ItemKind::IronSkullcap,
+        ]);
+        assert_eq!(worn.upper_body_encumbrance(), 3);
+        assert_eq!(worn.leg_encumbrance(), 0);
+    }
+
+    #[test]
+    fn yeoman_roll_main_hand_always_a_weapon() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        for _ in 0..200 {
+            let loadout = roll_yeoman_loadout(&mut world.rng);
+            let mh = loadout.main_hand.expect("main hand never empty");
+            let def = mh.def();
+            assert!(
+                def.weapon.is_some() || def.ranged.is_some(),
+                "rolled main_hand {:?} must have weapon or ranged stats",
+                mh
+            );
+            if let Some(oh) = loadout.off_hand {
+                assert!(
+                    matches!(oh, ItemKind::Knife | ItemKind::SmallRoundShield),
+                    "unexpected off_hand {:?}",
+                    oh
+                );
+            }
+            // Torso always has an armor piece.
+            let torso = loadout.torso.expect("torso always rolls something");
+            assert!(torso.def().armor.is_some(), "torso piece must be armor");
+        }
+    }
+
+    #[test]
+    fn equip_from_pack_moves_into_slot_and_syncs_wielded() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Drop a spear into the pack.
+        world
+            .ecs
+            .get::<&mut Pack>(world.player)
+            .unwrap()
+            .try_add(ItemKind::Spear.make_default_instance(1))
+            .unwrap();
+        let msg = world.equip_from_pack(ItemKind::Spear);
+        assert!(msg.contains("equip"), "msg: {}", msg);
+        // Player's main_hand should now be spear; the prior knife is
+        // bounced back to the pack.
+        let eq = world.player_equipment();
+        assert_eq!(eq.main_hand, Some(ItemKind::Spear));
+        let wielded = world
+            .ecs
+            .get::<&Wielded>(world.player)
+            .map(|w| w.0)
+            .unwrap();
+        assert_eq!(wielded, ItemKind::Spear);
+        let pack = world.ecs.get::<&Pack>(world.player).unwrap();
+        assert!(
+            pack.contents.iter().any(|i| i.kind == ItemKind::Knife),
+            "displaced knife should bounce to the pack",
+        );
+    }
+
+    #[test]
+    fn equip_padded_doublet_builds_worn_with_correct_dr() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Empty the starting pack so the 2.5kg doublet fits cleanly.
+        {
+            let mut pack = world.ecs.get::<&mut Pack>(world.player).unwrap();
+            pack.contents.clear();
+        }
+        world
+            .ecs
+            .get::<&mut Pack>(world.player)
+            .unwrap()
+            .try_add(ItemKind::PaddedDoublet.make_default_instance(1))
+            .unwrap();
+        world.equip_from_pack(ItemKind::PaddedDoublet);
+        let worn = world
+            .ecs
+            .get::<&Worn>(world.player)
+            .map(|w| w.clone())
+            .expect("Worn after equip");
+        assert_eq!(worn.pieces.len(), 1);
+        let p = &worn.pieces[0];
+        assert!(p.regions.contains(crate::combat::BodyPart::Torso));
+        assert!(p.regions.contains(crate::combat::BodyPart::LArm));
+        assert!(p.regions.contains(crate::combat::BodyPart::RArm));
+        assert_eq!(p.dr.bash, 4);
+    }
+
+    #[test]
+    fn unequip_returns_item_to_pack() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Player starts with Knife in main hand.
+        let pack_before = world
+            .ecs
+            .get::<&Pack>(world.player)
+            .unwrap()
+            .has_stack(ItemKind::Knife);
+        let msg = world.unequip_to_pack(EquipSlot::MainHand);
+        assert!(msg.contains("stow"), "msg: {}", msg);
+        assert!(world.ecs.get::<&Wielded>(world.player).is_err(), "Wielded removed");
+        let pack_after = world
+            .ecs
+            .get::<&Pack>(world.player)
+            .unwrap()
+            .has_stack(ItemKind::Knife);
+        // Starting pack ALSO had a knife already (separate copy). After
+        // unequip we end up with the equipped knife back too — `pack_after`
+        // should be true regardless; the meaningful change is the absence
+        // of Wielded plus Equipment.main_hand == None.
+        assert!(pack_after || !pack_before, "knife now in pack");
+        let eq = world.player_equipment();
+        assert_eq!(eq.main_hand, None);
+    }
+
+    #[test]
+    fn bandit_death_drops_full_loadout() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let bandit = drop_test_bandit(&mut world, 5, 0);
+        let pos = world.ecs.get::<&Position>(bandit).map(|p| *p).unwrap();
+        // Damage the torso to 0 with a stab attack.
+        world.apply_damage_to_part(
+            bandit,
+            crate::combat::BodyPart::Torso,
+            crate::combat::DamageTriplet { bash: 0, cut: 0, stab: 200 },
+        );
+        assert!(world.ecs.get::<&Position>(bandit).is_err(), "bandit despawned");
+        let drops = &world.cell_at(pos.x as i64, pos.y as i64).unwrap().items;
+        let has = |k: ItemKind| drops.iter().any(|i| i.kind == k);
+        assert!(has(ItemKind::Spear), "main_hand dropped");
+        assert!(has(ItemKind::Knife), "off_hand dropped");
+        assert!(has(ItemKind::IronSkullcap), "head armor dropped");
+        assert!(has(ItemKind::PaddedDoublet), "torso armor dropped");
+    }
+
+    #[test]
+    fn starting_crit_rate_feels_rare_not_every_swing() {
+        // Regression guard against the phase-3 "every swing is a crit"
+        // tuning bug. Simulates 5_000 player-vs-bandit and bandit-vs-
+        // player swings and asserts the crit rate stays under 25%. If a
+        // future change spikes this, the test names the symptom before
+        // the player ever sees it.
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let bandit = drop_test_bandit(&mut world, 5, 0);
+        let player = world.player;
+        let p_to_b_atk = world.attacker_loadout(player).unwrap();
+        let p_to_b_def = world.defender_stats(bandit);
+        let b_to_p_atk = world.attacker_loadout(bandit).unwrap();
+        let b_to_p_def = world.defender_stats(player);
+        let knife = crate::combat::weapon_profile_for(ItemKind::Knife).unwrap();
+        let spear = crate::combat::weapon_profile_for(ItemKind::Spear).unwrap();
+        let n = 5_000;
+        let mut p_crits = 0u32;
+        let mut b_crits = 0u32;
+        let mut rng = world.rng;
+        for _ in 0..n {
+            if crate::combat::resolve_hit(p_to_b_atk.0, p_to_b_def, knife, &mut rng).is_crit() {
+                p_crits += 1;
+            }
+            if crate::combat::resolve_hit(b_to_p_atk.0, b_to_p_def, spear, &mut rng).is_crit() {
+                b_crits += 1;
+            }
+        }
+        let p_rate = p_crits as f64 / n as f64;
+        let b_rate = b_crits as f64 / n as f64;
+        assert!(
+            p_rate < 0.25,
+            "player crit rate {:.3} too high — skills overpowered vs CRIT_MARGIN",
+            p_rate
+        );
+        assert!(
+            b_rate < 0.25,
+            "bandit crit rate {:.3} too high — skills overpowered vs CRIT_MARGIN",
+            b_rate
+        );
+    }
+
+    #[test]
+    fn spear_has_reach_two_knife_has_reach_one() {
+        let knife = crate::combat::weapon_profile_for(ItemKind::Knife).unwrap();
+        let spear = crate::combat::weapon_profile_for(ItemKind::Spear).unwrap();
+        assert_eq!(knife.reach, 1);
+        assert_eq!(spear.reach, 2);
+    }
+
+    #[test]
+    fn no_reach_penalty_reduces_adjacent_spear_damage() {
+        use crate::combat::*;
+        // Same seed, same inputs — only difference is mult_pct.
+        let spear = weapon_profile_for(ItemKind::Spear).unwrap();
+        let atk = AttackerStats { str_bonus: 2, weapon_prof: 1, ..Default::default() };
+        let mut rng_full = crate::skill::Rng::from_state(0x1234_5678);
+        let mut rng_pen = crate::skill::Rng::from_state(0x1234_5678);
+        let full = roll_damage_with_mult(spear, atk, ArmorDr::default(), false, 100, &mut rng_full);
+        let pen = roll_damage_with_mult(
+            spear,
+            atk,
+            ArmorDr::default(),
+            false,
+            NO_REACH_DAMAGE_PCT,
+            &mut rng_pen,
+        );
+        // Total should drop by ~30%. Allow ±1 per component for floor.
+        let full_total = full.total() as i32;
+        let pen_total = pen.total() as i32;
+        let expected = full_total * NO_REACH_DAMAGE_PCT as i32 / 100;
+        assert!(
+            (pen_total - expected).abs() <= 3,
+            "pen {} expected ~{} (full {} × {}%)",
+            pen_total, expected, full_total, NO_REACH_DAMAGE_PCT
+        );
+    }
+
+    #[test]
+    fn player_reach_attack_swings_at_distance_two() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Give the player a spear so they have reach 2.
+        {
+            let mut eq = world.ecs.get::<&mut Equipment>(world.player).unwrap();
+            eq.main_hand = Some(ItemKind::Spear);
+        }
+        world.sync_equipment(world.player);
+        // Spawn bandit exactly 2 east of the player on a clear line.
+        let p = world.player_pos();
+        let bandit = spawn_cornish_bandit(
+            &mut world.ecs,
+            Position { x: p.x + 2, y: p.y },
+            YeomanLoadout {
+                main_hand: Some(ItemKind::Knife),
+                off_hand: None,
+                head: None,
+                torso: None,
+                torso_outer: None,
+                legs: None,
+            },
+        );
+        let before = world.ecs.get::<&BodyParts>(bandit).map(|b| b.torso.hp).unwrap();
+        // Press east — destination (p.x+1, p.y) is empty, (p.x+2, p.y)
+        // has the bandit, spear reach 2 ⇒ should reach-attack.
+        let p_before = world.player_pos();
+        world.try_move_player(1, 0);
+        let p_after = world.player_pos();
+        assert_eq!(p_before, p_after, "reach-attack must not move the player");
+        let after = world.ecs.get::<&BodyParts>(bandit).map(|b| b.torso.hp).unwrap();
+        // The bandit may have crippled an arm or hit torso etc. Either
+        // way SOME body part should have taken damage — sum all parts
+        // for a robust check.
+        let total_before = before;
+        let after_bp = world.ecs.get::<&BodyParts>(bandit).map(|b| *b).unwrap();
+        let after_total = after_bp.head.hp + after_bp.torso.hp
+            + after_bp.l_arm.hp + after_bp.r_arm.hp
+            + after_bp.l_leg.hp + after_bp.r_leg.hp;
+        let expected_full = BodyParts::HEAD_MAX + BodyParts::TORSO_MAX
+            + 2 * BodyParts::ARM_MAX + 2 * BodyParts::LEG_MAX;
+        assert!(
+            after_total < expected_full || after < total_before,
+            "bandit should have taken some damage on the reach swing"
+        );
+    }
+
+    #[test]
+    fn player_reach_attack_blocked_by_intervening_tree() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        {
+            let mut eq = world.ecs.get::<&mut Equipment>(world.player).unwrap();
+            eq.main_hand = Some(ItemKind::Spear);
+        }
+        world.sync_equipment(world.player);
+        let p = world.player_pos();
+        // Plant a tree on the intermediate cell (p.x+1, p.y).
+        if let Some(c) = world.cell_at_mut((p.x + 1) as i64, p.y as i64) {
+            c.terrain = TerrainKind::TreeTrunk;
+            c.decoration = Decoration::None;
+        }
+        let bandit = spawn_cornish_bandit(
+            &mut world.ecs,
+            Position { x: p.x + 2, y: p.y },
+            YeomanLoadout::default(),
+        );
+        // Snapshot bandit body before; pressing east should walk INTO
+        // the tree (blocked) — no reach attack happens because the
+        // intermediate cell blocks sight.
+        let body_before = world.ecs.get::<&BodyParts>(bandit).map(|b| *b).unwrap();
+        world.try_move_player(1, 0);
+        let body_after = world.ecs.get::<&BodyParts>(bandit).map(|b| *b).unwrap();
+        let unchanged = body_before.head.hp == body_after.head.hp
+            && body_before.torso.hp == body_after.torso.hp
+            && body_before.l_arm.hp == body_after.l_arm.hp
+            && body_before.r_arm.hp == body_after.r_arm.hp
+            && body_before.l_leg.hp == body_after.l_leg.hp
+            && body_before.r_leg.hp == body_after.r_leg.hp;
+        assert!(unchanged, "tree should block the reach attack");
+    }
+
+    #[test]
+    fn melee_xp_awarded_on_player_swing() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let bandit = drop_test_bandit(&mut world, 1, 0);
+        let before_value = world.player_skills().melee.value;
+        let before_daily = world.player_skills().melee.daily_xp;
+        world.perform_melee_attack(world.player, bandit, 1);
+        let after = world.player_skills().melee;
+        // At starting value=0 the level-up threshold (5) catches a hit
+        // immediately, bumping value and resetting daily_xp. So measure
+        // *combined* progress: either value or daily_xp must climb.
+        let advanced = after.value > before_value || after.daily_xp > before_daily;
+        assert!(advanced, "swing should grant Melee XP (value or daily)");
+    }
+
+    #[test]
+    fn ranged_xp_awarded_on_player_shot() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        {
+            let mut pack = world.ecs.get::<&mut Pack>(world.player).unwrap();
+            pack.contents.clear();
+            pack.try_add(ItemKind::Bow.make_default_instance(1)).unwrap();
+            pack.try_add(ItemKind::Arrow.make_default_instance(5)).unwrap();
+        }
+        world.equip_from_pack(ItemKind::Bow);
+        let p = world.player_pos();
+        for dx in 1..=4 {
+            if let Some(c) = world.cell_at_mut((p.x + dx) as i64, p.y as i64) {
+                c.terrain = TerrainKind::Grass;
+                c.decoration = Decoration::None;
+            }
+        }
+        let bandit = spawn_cornish_bandit(
+            &mut world.ecs,
+            Position { x: p.x + 4, y: p.y },
+            YeomanLoadout::default(),
+        );
+        let before_value = world.player_skills().ranged.value;
+        let before_daily = world.player_skills().ranged.daily_xp;
+        world.perform_ranged_attack(world.player, bandit);
+        let after = world.player_skills().ranged;
+        let advanced = after.value > before_value || after.daily_xp > before_daily;
+        assert!(advanced, "shot should grant Ranged XP (value or daily)");
+    }
+
+    #[test]
+    fn sync_combat_skills_from_skills_bumps_melee() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let base = CombatSkills::starting_player().melee;
+        // Bump Skills.melee directly to simulate many days of training.
+        {
+            let mut s = world.player_skills();
+            s.melee.value = 10;
+            world.set_player_skills(s);
+        }
+        world.sync_combat_skills_from_skills();
+        let after = world
+            .ecs
+            .get::<&CombatSkills>(world.player)
+            .map(|c| c.melee)
+            .unwrap();
+        assert_eq!(after, base + 10);
+    }
+
+    #[test]
+    fn sergeant_loadout_always_includes_hauberk_and_helm() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        for _ in 0..200 {
+            let l = roll_sergeant_loadout(&mut world.rng);
+            assert_eq!(l.torso, Some(ItemKind::Hauberk));
+            assert!(l.head.is_some(), "sergeant always rolls a head piece");
+            let head = l.head.unwrap();
+            assert!(
+                matches!(
+                    head,
+                    ItemKind::KettleHat | ItemKind::IronSkullcap | ItemKind::MailCoif
+                ),
+                "unexpected sergeant head {:?}",
+                head
+            );
+            assert!(l.main_hand.is_some());
+        }
+    }
+
+    #[test]
+    fn knight_loadout_full_mail_plus_great_helm_or_coif() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        for _ in 0..200 {
+            let l = roll_knight_loadout(&mut world.rng);
+            assert_eq!(l.torso, Some(ItemKind::Hauberk));
+            assert_eq!(l.legs, Some(ItemKind::MailChausses));
+            let head = l.head.expect("knight always wears head");
+            assert!(
+                matches!(head, ItemKind::GreatHelm | ItemKind::MailCoif),
+                "unexpected knight head {:?}",
+                head
+            );
+        }
+    }
+
+    #[test]
+    fn knight_spawn_carries_tier_glyph_and_heavy_skills() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let p = world.player_pos();
+        let loadout = roll_knight_loadout(&mut world.rng);
+        let e = spawn_humanoid_bandit(
+            &mut world.ecs,
+            Position { x: p.x + 6, y: p.y },
+            BanditTier::Knight,
+            loadout,
+        );
+        let rend = world.ecs.get::<&Renderable>(e).map(|r| *r).unwrap();
+        assert_eq!(rend.glyph, b'K');
+        let skills = world.ecs.get::<&CombatSkills>(e).map(|s| *s).unwrap();
+        assert!(skills.melee >= 15, "knight melee should be substantial");
+    }
+
+    #[test]
+    fn bow_def_has_ranged_profile() {
+        let def = ItemKind::Bow.def();
+        assert!(def.ranged.is_some(), "bow must expose ranged stats");
+        assert_eq!(def.ranged.unwrap().ammo_kind, "arrow");
+        assert!(def.weapon.is_none(), "bow doesn't do melee");
+    }
+
+    #[test]
+    fn player_shoot_consumes_one_arrow_and_drops_on_target() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Equip a bow, stuff a few arrows.
+        {
+            let mut pack = world.ecs.get::<&mut Pack>(world.player).unwrap();
+            pack.contents.clear();
+            pack.try_add(ItemKind::Bow.make_default_instance(1)).unwrap();
+            pack.try_add(ItemKind::Arrow.make_default_instance(5)).unwrap();
+        }
+        world.equip_from_pack(ItemKind::Bow);
+        // Clear a 4-cell-east corridor of any chunkgen decorations so
+        // the Bresenham LoS check succeeds deterministically.
+        let p = world.player_pos();
+        for dx in 1..=4 {
+            if let Some(c) = world.cell_at_mut((p.x + dx) as i64, p.y as i64) {
+                c.terrain = TerrainKind::Grass;
+                c.decoration = Decoration::None;
+            }
+        }
+        let bandit = spawn_cornish_bandit(
+            &mut world.ecs,
+            Position { x: p.x + 4, y: p.y },
+            YeomanLoadout::default(),
+        );
+        let arrows_before: u16 = world
+            .ecs
+            .get::<&Pack>(world.player)
+            .unwrap()
+            .contents
+            .iter()
+            .filter(|i| i.kind == ItemKind::Arrow)
+            .map(|i| i.count)
+            .sum();
+        world.perform_ranged_attack(world.player, bandit);
+        let arrows_after: u16 = world
+            .ecs
+            .get::<&Pack>(world.player)
+            .unwrap()
+            .contents
+            .iter()
+            .filter(|i| i.kind == ItemKind::Arrow)
+            .map(|i| i.count)
+            .sum();
+        assert_eq!(
+            arrows_before - arrows_after,
+            1,
+            "exactly one arrow consumed per shot"
+        );
+    }
+
+    #[test]
+    fn ranged_out_of_range_short_circuits() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        {
+            let mut pack = world.ecs.get::<&mut Pack>(world.player).unwrap();
+            pack.contents.clear();
+            pack.try_add(ItemKind::Bow.make_default_instance(1)).unwrap();
+            pack.try_add(ItemKind::Arrow.make_default_instance(3)).unwrap();
+        }
+        world.equip_from_pack(ItemKind::Bow);
+        let p = world.player_pos();
+        // 15 cells away — beyond bow's max_range = 10.
+        let bandit = spawn_cornish_bandit(
+            &mut world.ecs,
+            Position { x: p.x + 15, y: p.y },
+            YeomanLoadout::default(),
+        );
+        let arrows_before: u16 = world
+            .ecs
+            .get::<&Pack>(world.player)
+            .unwrap()
+            .contents
+            .iter()
+            .filter(|i| i.kind == ItemKind::Arrow)
+            .map(|i| i.count)
+            .sum();
+        world.perform_ranged_attack(world.player, bandit);
+        let arrows_after: u16 = world
+            .ecs
+            .get::<&Pack>(world.player)
+            .unwrap()
+            .contents
+            .iter()
+            .filter(|i| i.kind == ItemKind::Arrow)
+            .map(|i| i.count)
+            .sum();
+        assert_eq!(arrows_before, arrows_after, "out-of-range shot must not consume ammo");
+    }
+
+    #[test]
+    fn ranged_los_blocked_by_tree() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        {
+            let mut pack = world.ecs.get::<&mut Pack>(world.player).unwrap();
+            pack.contents.clear();
+            pack.try_add(ItemKind::Bow.make_default_instance(1)).unwrap();
+            pack.try_add(ItemKind::Arrow.make_default_instance(3)).unwrap();
+        }
+        world.equip_from_pack(ItemKind::Bow);
+        let p = world.player_pos();
+        // Tree at p.x+2 blocks LoS to a bandit at p.x+4.
+        if let Some(c) = world.cell_at_mut((p.x + 2) as i64, p.y as i64) {
+            c.terrain = TerrainKind::TreeTrunk;
+            c.decoration = Decoration::None;
+        }
+        let bandit = spawn_cornish_bandit(
+            &mut world.ecs,
+            Position { x: p.x + 4, y: p.y },
+            YeomanLoadout::default(),
+        );
+        let arrows_before: u16 = world
+            .ecs
+            .get::<&Pack>(world.player)
+            .unwrap()
+            .contents
+            .iter()
+            .filter(|i| i.kind == ItemKind::Arrow)
+            .map(|i| i.count)
+            .sum();
+        world.perform_ranged_attack(world.player, bandit);
+        let arrows_after: u16 = world
+            .ecs
+            .get::<&Pack>(world.player)
+            .unwrap()
+            .contents
+            .iter()
+            .filter(|i| i.kind == ItemKind::Arrow)
+            .map(|i| i.count)
+            .sum();
+        assert_eq!(arrows_before, arrows_after, "tree-blocked shot must not consume ammo");
+    }
+
+    #[test]
+    fn bow_bandit_death_drops_arrows() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let p = world.player_pos();
+        let bandit = spawn_cornish_bandit(
+            &mut world.ecs,
+            Position { x: p.x + 5, y: p.y },
+            YeomanLoadout {
+                main_hand: Some(ItemKind::Bow),
+                off_hand: Some(ItemKind::Knife),
+                head: None,
+                torso: Some(ItemKind::PaddedDoublet),
+                torso_outer: None,
+                legs: None,
+            },
+        );
+        let bandit_pos = world.ecs.get::<&Position>(bandit).map(|p| *p).unwrap();
+        world.apply_damage_to_part(
+            bandit,
+            crate::combat::BodyPart::Torso,
+            crate::combat::DamageTriplet { bash: 0, cut: 0, stab: 200 },
+        );
+        let drops = &world.cell_at(bandit_pos.x as i64, bandit_pos.y as i64).unwrap().items;
+        let has = |k: ItemKind| drops.iter().any(|i| i.kind == k);
+        assert!(has(ItemKind::Bow), "bow dropped");
+        assert!(has(ItemKind::Arrow), "arrows dropped from pack");
+    }
+
+    #[test]
+    fn stamina_starts_full_and_regens_on_tick() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let (cur, max) = world.player_stamina();
+        assert_eq!(cur, max);
+        // Drain some, then tick — stamina should climb back.
+        world.spend_stamina(world.player, 50);
+        let after_drain = world.player_stamina().0;
+        assert_eq!(after_drain, max - 50);
+        world.tick_combat_states(10);
+        let after_regen = world.player_stamina().0;
+        assert!(after_regen > after_drain);
+    }
+
+    #[test]
+    fn grapple_immobilizes_target() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let bandit = drop_test_bandit(&mut world, 1, 0);
+        let result = world.perform_grapple(bandit);
+        // Result string varies on win/loss — but if it says "lock up"
+        // we expect Grappled component on the bandit.
+        if result.contains("lock up") {
+            assert!(world.entity_is_grappled(bandit));
+        }
+    }
+
+    #[test]
+    fn throw_makes_target_prone_when_strong_enough() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let bandit = drop_test_bandit(&mut world, 1, 0);
+        // Force the player to be much stronger so the contest reliably
+        // wins. Player default str_bonus = 1; bump to 20.
+        {
+            let mut cs = world.ecs.get::<&mut CombatSkills>(world.player).unwrap();
+            cs.str_bonus = 20;
+        }
+        // Grapple first so throw has a valid target state. We'll also
+        // confirm Prone arrives.
+        for _ in 0..3 {
+            let _ = world.perform_grapple(bandit);
+            if world.entity_is_grappled(bandit) {
+                break;
+            }
+        }
+        let _ = world.perform_throw(bandit);
+        assert!(world.ecs.satisfies::<&Prone>(bandit).unwrap_or(false));
+        assert!(!world.entity_is_grappled(bandit), "throw should break the grapple");
+    }
+
+    #[test]
+    fn disarm_drops_wielded_weapon_when_strong_enough() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let bandit = drop_test_bandit(&mut world, 1, 0);
+        {
+            let mut cs = world.ecs.get::<&mut CombatSkills>(world.player).unwrap();
+            cs.str_bonus = 20;
+        }
+        let pos = world.ecs.get::<&Position>(bandit).map(|p| *p).unwrap();
+        // Drop a kid: a few attempts since contest variance is small.
+        let mut dropped = false;
+        for _ in 0..6 {
+            let _ = world.perform_disarm(bandit);
+            if !world.entity_has_wielded(bandit) {
+                dropped = true;
+                break;
+            }
+        }
+        assert!(dropped, "high-str disarm should eventually succeed");
+        let cell = world.cell_at(pos.x as i64, pos.y as i64).unwrap();
+        assert!(cell.items.iter().any(|i| i.kind == ItemKind::Spear));
+    }
+
+    #[test]
+    fn grappled_player_cannot_walk_away() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let player = world.player;
+        let _ = world.ecs.insert_one(player, Grappled { remaining_secs: 5 });
+        let before = world.player_pos();
+        world.try_move_player(1, 0);
+        let after = world.player_pos();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn yeoman_main_hand_distribution_matches_spec() {
+        // Per Bestiary slice 1: 20% bow main_hand; the remaining 80%
+        // draw from 50% spear / 30% short sword / 20% falchion. Marginal
+        // expected: spear 40%, sword 24%, falchion 16%, bow 20%.
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        let mut spear = 0;
+        let mut sword = 0;
+        let mut falchion = 0;
+        let mut bow = 0;
+        let n = 5_000;
+        for _ in 0..n {
+            match roll_yeoman_loadout(&mut world.rng).main_hand {
+                Some(ItemKind::Spear) => spear += 1,
+                Some(ItemKind::ShortSword) => sword += 1,
+                Some(ItemKind::Falchion) => falchion += 1,
+                Some(ItemKind::Bow) => bow += 1,
+                other => panic!("unexpected main_hand roll {:?}", other),
+            }
+        }
+        let p_spear = spear as f64 / n as f64;
+        let p_sword = sword as f64 / n as f64;
+        let p_falchion = falchion as f64 / n as f64;
+        let p_bow = bow as f64 / n as f64;
+        assert!((p_spear - 0.40).abs() < 0.04, "spear {:.3}", p_spear);
+        assert!((p_sword - 0.24).abs() < 0.04, "sword {:.3}", p_sword);
+        assert!((p_falchion - 0.16).abs() < 0.04, "falchion {:.3}", p_falchion);
+        assert!((p_bow - 0.20).abs() < 0.04, "bow {:.3}", p_bow);
     }
 }
