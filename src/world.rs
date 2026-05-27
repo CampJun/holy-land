@@ -248,9 +248,10 @@ pub enum GroundCover {
 /// burnt-out groves) — see assets/CP437_MAP.md.
 pub const TREE_VARIANT_GLYPHS: &[u8] = &[0x05, 0x06, 0x17, 0x18];
 
-/// Iteration order for `TerrainKind::from_save_key`. Keep in sync with
-/// the enum variants — adding a kind here makes from_save_key find it.
-const ALL_TERRAINS: &[TerrainKind] = &[
+/// Iteration order for `TerrainKind::from_save_key` and the in-game
+/// tile-remap menu. Keep in sync with the enum variants — adding a kind
+/// here makes from_save_key find it AND makes it pickable in the remap UI.
+pub const ALL_TERRAINS: &[TerrainKind] = &[
     TerrainKind::Grass,
     TerrainKind::BareDirt,
     TerrainKind::SandShore,
