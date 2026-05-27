@@ -863,10 +863,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let count = PAUSE_OPTIONS.len();
                 match input_action {
                     Action::Up => {
-                        pause_menu = Some(selected.saturating_sub(1));
+                        pause_menu = Some(wrap_index(selected, -1, count));
                     }
                     Action::Down => {
-                        pause_menu = Some((selected + 1).min(count - 1));
+                        pause_menu = Some(wrap_index(selected, 1, count));
                     }
                     Action::A => {
                         let (chosen, _) = PAUSE_OPTIONS[selected];
@@ -1028,14 +1028,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         state.selected = 0;
                     }
                     Action::Up => {
-                        if row_count > 0 {
-                            state.selected = state.selected.saturating_sub(1);
-                        }
+                        state.selected = wrap_index(state.selected, -1, row_count);
                     }
                     Action::Down => {
-                        if row_count > 0 {
-                            state.selected = (state.selected + 1).min(row_count - 1);
-                        }
+                        state.selected = wrap_index(state.selected, 1, row_count);
                     }
                     Action::A => {
                         match state.tab {
@@ -1129,13 +1125,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // closes. Everything else is dropped so the world doesn't tick
             // while the player is browsing the catalog.
             if let Some(selected) = command_menu {
+                let count = action::ALL_ACTIONS.len();
                 match input_action {
                     Action::Up => {
-                        command_menu = Some(selected.saturating_sub(1));
+                        command_menu = Some(wrap_index(selected, -1, count));
                     }
                     Action::Down => {
-                        let max = action::ALL_ACTIONS.len().saturating_sub(1);
-                        command_menu = Some((selected + 1).min(max));
+                        command_menu = Some(wrap_index(selected, 1, count));
                     }
                     Action::A => {
                         let id = action::ALL_ACTIONS[selected].id;
@@ -2557,6 +2553,19 @@ fn draw_glyph_palette(cells: &mut [Option<Cell>], cursor: u8, palette: &Palette)
     }
 }
 
+/// PR B menu-wrap card: shift `cur` by `delta` within `[0, len)` and
+/// wrap at both ends (Down at the bottom goes to 0, Up at 0 jumps to
+/// `len - 1`). Returns 0 on empty lists. The card replaces the four
+/// `saturating_sub` / `.min(len-1)` clamp sites in the menu input
+/// handlers with a single call.
+fn wrap_index(cur: usize, delta: i32, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let len_i = len as i64;
+    ((cur as i64 + delta as i64).rem_euclid(len_i)) as usize
+}
+
 // ---- Info hub (Select-button tabbed overlay) -------------------------
 
 fn info_tab_row_count(world: &World, tab: InfoTab) -> usize {
@@ -3540,5 +3549,36 @@ impl Default for Palette {
             panel_dim_fg: Color::RGB(110, 100, 80),
             panel_title_fg: Color::RGB(230, 200, 120),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrap_index_handles_normal_moves_within_bounds() {
+        assert_eq!(wrap_index(2, 1, 5), 3);
+        assert_eq!(wrap_index(2, -1, 5), 1);
+    }
+
+    #[test]
+    fn wrap_index_wraps_at_both_ends() {
+        // Past the end → back to 0.
+        assert_eq!(wrap_index(4, 1, 5), 0);
+        // Before 0 → jumps to last.
+        assert_eq!(wrap_index(0, -1, 5), 4);
+    }
+
+    #[test]
+    fn wrap_index_returns_zero_for_empty_list() {
+        assert_eq!(wrap_index(0, 1, 0), 0);
+        assert_eq!(wrap_index(0, -1, 0), 0);
+    }
+
+    #[test]
+    fn wrap_index_handles_single_entry_list_stably() {
+        assert_eq!(wrap_index(0, 1, 1), 0);
+        assert_eq!(wrap_index(0, -1, 1), 0);
     }
 }
