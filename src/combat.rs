@@ -340,9 +340,11 @@ pub fn proficiency_for(kind: ItemKind) -> Option<crate::skill::Proficiency> {
         ItemKind::Falchion => Proficiency::Falchion,
         ItemKind::Axe => Proficiency::Axe,
         ItemKind::Spear | ItemKind::Lance => Proficiency::SpearLance,
+        ItemKind::Gisarme => Proficiency::GisarmeBill,
         ItemKind::Bow => Proficiency::Bow,
-        // Mace / Cudgel, Quarterstaff, Gisarme/Bill, Crossbow ItemKinds
-        // arrive with cards 4 and 5; their match arms land then.
+        ItemKind::Crossbow => Proficiency::Crossbow,
+        // Mace / Cudgel + Quarterstaff ItemKinds arrive with card 5
+        // (Rabble loadout).
         _ => return None,
     })
 }

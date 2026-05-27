@@ -102,6 +102,19 @@ pub enum ItemKind {
     CoatOfPlates,
     /// Large kite/round shield — Knight off-hand.
     LargeShield,
+    // ---- PR A card 4: ranged + final polearm ----
+    /// Sickle-bladed two-handed polearm — reach-2 cut+stab. The period
+    /// polearm proper per the Weapon-skills card; replaces the older
+    /// halberd/bardiche niche. No tier currently rolls it; available
+    /// via debug `give` and future authored loadouts.
+    Gisarme,
+    /// Mechanical-trigger ranged weapon. Slow draw + a separate Reload
+    /// verb; holds one bolt loaded at a time. Higher damage per shot
+    /// than the bow, with a stab + bash damage profile.
+    Crossbow,
+    /// Stackable crossbow ammo. Consumed per shot; same 70/30 recovery
+    /// shape as `Arrow`.
+    CrossbowBolt,
 }
 
 /// All per-kind metadata in one place. Adding a new `ItemKind` variant is
@@ -201,6 +214,9 @@ const ALL_KINDS: &[ItemKind] = &[
     ItemKind::GreatHelm,
     ItemKind::CoatOfPlates,
     ItemKind::LargeShield,
+    ItemKind::Gisarme,
+    ItemKind::Crossbow,
+    ItemKind::CrossbowBolt,
 ];
 
 impl ItemKind {
@@ -872,6 +888,59 @@ impl ItemKind {
                 glyph: b'O',
                 color: [130, 80, 50],
                 default_weight_g: 4_000,
+                blends_with_terrain: false,
+                weapon: None,
+                armor: None,
+                ranged: None,
+            },
+            // ---- PR A card 4 items ----
+            ItemKind::Gisarme => ItemDef {
+                save_key: "gisarme",
+                name: "gisarme",
+                is_fungible: false,
+                glyph: b'/',
+                color: [180, 165, 130],
+                default_weight_g: 2_600,
+                blends_with_terrain: false,
+                weapon: Some(WeaponProfile {
+                    to_hit: 1,
+                    // Sickle-bladed cut + stab, slow swing.
+                    damage_die: DamageTriplet { bash: 1, cut: 6, stab: 7 },
+                    move_cost: 140,
+                    reach: 2,
+                }),
+                armor: None,
+                ranged: None,
+            },
+            ItemKind::Crossbow => ItemDef {
+                save_key: "crossbow",
+                name: "crossbow",
+                is_fungible: false,
+                glyph: b'}',
+                color: [140, 110, 80],
+                default_weight_g: 3_500,
+                blends_with_terrain: false,
+                weapon: None,
+                armor: None,
+                ranged: Some(RangedProfile {
+                    to_hit: 4,
+                    // Stab + bash — the bolt's impact has heft. Higher
+                    // damage per shot than the bow per the card; firing
+                    // itself is fast (move_cost 90), the slow part is
+                    // the Reload verb the player runs between shots.
+                    damage_die: DamageTriplet { bash: 4, cut: 0, stab: 14 },
+                    move_cost: 90,
+                    max_range: 12,
+                    ammo_kind: "crossbow_bolt",
+                }),
+            },
+            ItemKind::CrossbowBolt => ItemDef {
+                save_key: "crossbow_bolt",
+                name: "crossbow bolt",
+                is_fungible: true,
+                glyph: b'-',
+                color: [170, 140, 100],
+                default_weight_g: 70,
                 blends_with_terrain: false,
                 weapon: None,
                 armor: None,

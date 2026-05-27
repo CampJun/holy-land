@@ -176,6 +176,11 @@ pub struct RunSave {
     // fresh-spawn full pool (100/100, cooldown 0).
     #[serde(default)]
     pub player_stamina: Option<StaminaSave>,
+    /// PR A card 4 — whether the player's crossbow currently has a
+    /// bolt chambered. Additive; defaults to false on saves written
+    /// before the field existed (matches a fresh boot).
+    #[serde(default)]
+    pub crossbow_loaded: bool,
 }
 
 /// Stamina pool round-trip per the Stamina card. Carried on the
@@ -493,6 +498,7 @@ impl RunSave {
             player_body_parts: None,
             player_equipment: None,
             player_stamina: None,
+            crossbow_loaded: false,
         }
     }
 }
@@ -815,6 +821,7 @@ mod tests {
             player_body_parts: None,
             player_equipment: None,
             player_stamina: None,
+            crossbow_loaded: false,
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();
@@ -924,6 +931,7 @@ mod tests {
             player_body_parts: None,
             player_equipment: None,
             player_stamina: None,
+            crossbow_loaded: false,
         };
         save_atomic(&path, &run).unwrap();
         let loaded = load_run(&path).unwrap();

@@ -493,6 +493,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 recent_combat_secs: stam.recent_combat_secs,
             });
         }
+        world.crossbow_loaded = run.crossbow_loaded;
         if !run.hostiles.is_empty() {
             // Cornish-bandit literal is the only flavor we restore as
             // of phase 3. Unknown flavors fall through the default in
@@ -1846,6 +1847,7 @@ fn save_game(
         max: s.max,
         recent_combat_secs: s.recent_combat_secs,
     });
+    run.crossbow_loaded = world.crossbow_loaded;
     // Leave the legacy single-pool field empty; phase 2 + later writes
     // route through body_parts. A v3 player_health field still loads
     // cleanly via serde but is never written.

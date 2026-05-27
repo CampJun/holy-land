@@ -1387,6 +1387,11 @@ pub struct World {
     /// at 0 HP. main.rs reads this each frame for the death overlay
     /// alongside the existing needs-based gate. Cleared on new-run.
     pub player_killed_by_combat: bool,
+    /// PR A card 4: whether the player's crossbow currently has a bolt
+    /// chambered. The Aim verb refuses to fire an unloaded crossbow;
+    /// the Reload verb sets this true at heavy move/stamina cost.
+    /// Irrelevant when not wielding a crossbow. Save-persisted.
+    pub crossbow_loaded: bool,
 }
 
 /// Outcome of one `tick_fast_travel` call. The main loop matches on
@@ -1535,6 +1540,7 @@ impl World {
             godmode: false,
             message_log: VecDeque::new(),
             player_killed_by_combat: false,
+            crossbow_loaded: false,
         };
         // First-frame FOV so the renderer doesn't draw a black screen on
         // the very first paint.
@@ -2973,6 +2979,36 @@ impl World {
         }
     }
 
+    /// Card 4 — player reload verb. Chambers a single bolt at heavy
+    /// move + stamina cost. The Aim verb refuses to commit a shot
+    /// while `crossbow_loaded` is false. Returns true if a bolt was
+    /// consumed (i.e. the reload took effect).
+    pub fn perform_crossbow_reload(&mut self) -> bool {
+        if self.player_main_hand_kind() != Some(crate::items::ItemKind::Crossbow) {
+            self.push_message("No crossbow wielded.".to_string());
+            return false;
+        }
+        if self.crossbow_loaded {
+            self.push_message("Already loaded.".to_string());
+            return false;
+        }
+        let took = self
+            .ecs
+            .get::<&mut crate::items::Pack>(self.player)
+            .ok()
+            .map(|mut p| p.take_one_from_stack(crate::items::ItemKind::CrossbowBolt))
+            .unwrap_or(false);
+        if !took {
+            self.push_message("No crossbow bolts in your pack.".to_string());
+            return false;
+        }
+        self.crossbow_loaded = true;
+        self.spend_stamina(self.player, Stamina::REACH_EXTENSION_COST);
+        self.spend_moves(300);
+        self.push_message("You chamber a bolt.".to_string());
+        true
+    }
+
     /// Card 3 — per-weapon proficiency XP. Always called on the player
     /// (the only `Skills` carrier) and gated by the caller to hit-only
     /// per the card. Uses the same URW chassis as `award_combat_xp`.
@@ -3174,6 +3210,14 @@ impl World {
             }
             return;
         }
+        // Crossbow: refuse to fire unless a bolt is currently chambered
+        // (player only — bandit crossbow load-state lives on its own
+        // entity once that loadout rolls; phase-7 stub: assume bandit
+        // crossbows are always loaded).
+        if weapon_kind == crate::items::ItemKind::Crossbow && attacker_is_player && !self.crossbow_loaded {
+            self.push_message("Crossbow is unloaded — reload first.".to_string());
+            return;
+        }
         // Ammo: consume one from the attacker's pack. No pack → no shot.
         let ammo_kind = crate::items::ItemKind::from_save_key(ranged.ammo_kind);
         if let Some(kind) = ammo_kind {
@@ -3189,6 +3233,10 @@ impl World {
                 }
                 return;
             }
+        }
+        // Spent the load on this shot.
+        if weapon_kind == crate::items::ItemKind::Crossbow && attacker_is_player {
+            self.crossbow_loaded = false;
         }
         // Range penalty: -1 to_hit per tile past half max_range.
         let range_penalty = {
@@ -3427,13 +3475,9 @@ impl World {
     /// Sum the DR contribution of every Worn piece that covers `part`
     /// and rolls under its coverage %. The roll happens per-piece, not
     /// per-type — a single piece either catches the swing or it doesn't.
-    fn layered_dr_for(&mut self, target: Entity, part: crate::combat::BodyPart) -> crate::combat::ArmorDr {
-        self.layered_dr_with_catches(target, part).0
-    }
-
-    /// Same as `layered_dr_for` but also surfaces the `ItemKind` of every
-    /// piece whose coverage roll succeeded. Card 3 routes those caught
-    /// item_kinds into per-armor-class XP grants.
+    /// Roll every piece covering `part` for whether it catches the
+    /// swing; sum the DR triplet of the catching pieces and surface
+    /// their `ItemKind`s so card 3 can route per-armor-class XP grants.
     fn layered_dr_with_catches(
         &mut self,
         target: Entity,
@@ -5614,6 +5658,60 @@ mod tests {
         let after = world.player_skills().ranged;
         let advanced = after.value > before_value || after.daily_xp > before_daily;
         assert!(advanced, "shot should grant Ranged XP (value or daily)");
+    }
+
+    #[test]
+    fn crossbow_must_be_loaded_to_fire_and_reload_chambers_a_bolt() {
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Equip crossbow + give bolts.
+        {
+            let mut pack = world.ecs.get::<&mut Pack>(world.player).unwrap();
+            pack.contents.clear();
+            pack.try_add(ItemKind::Crossbow.make_default_instance(1))
+                .unwrap();
+            pack.try_add(ItemKind::CrossbowBolt.make_default_instance(3))
+                .unwrap();
+        }
+        world.equip_from_pack(ItemKind::Crossbow);
+        // Clear LoS lane and spawn a bandit two tiles east.
+        let p = world.player_pos();
+        for dx in 1..=4 {
+            if let Some(c) = world.cell_at_mut((p.x + dx) as i64, p.y as i64) {
+                c.terrain = TerrainKind::Grass;
+                c.decoration = Decoration::None;
+            }
+        }
+        let bandit = spawn_cornish_bandit(
+            &mut world.ecs,
+            Position { x: p.x + 3, y: p.y },
+            YeomanLoadout::default(),
+        );
+        // Fresh-equip → unloaded, shot should bounce.
+        assert!(!world.crossbow_loaded);
+        let bolts_before = world
+            .player_pack()
+            .contents
+            .iter()
+            .find(|i| i.kind == ItemKind::CrossbowBolt)
+            .map(|i| i.count)
+            .unwrap_or(0);
+        world.perform_ranged_attack(world.player, bandit);
+        let bolts_after_blocked = world
+            .player_pack()
+            .contents
+            .iter()
+            .find(|i| i.kind == ItemKind::CrossbowBolt)
+            .map(|i| i.count)
+            .unwrap_or(0);
+        assert_eq!(
+            bolts_after_blocked, bolts_before,
+            "unloaded crossbow must not consume a bolt"
+        );
+        // Reload + verify loaded; a shot then fires + drops the load.
+        assert!(world.perform_crossbow_reload());
+        assert!(world.crossbow_loaded);
+        world.perform_ranged_attack(world.player, bandit);
+        assert!(!world.crossbow_loaded, "shot should spend the load");
     }
 
     #[test]
