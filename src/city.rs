@@ -90,6 +90,25 @@ pub enum LandmarkKind {
 
 const EXETER_RON: &str = include_str!("../assets/cities/exeter.ron");
 
+/// Per-chunk feature tag for the overmap. One per chunk that some part
+/// of the city touches; the renderer picks a glyph+color per tag.
+/// Stored in `LoadedCity::chunk_features`, built once at load.
+///
+/// Priority is encoded in the build order (later writes overwrite
+/// earlier): Building < Street < WallEdge < Cathedral/Castle < Gate.
+/// Rationale: gates matter most for navigation; major stone landmarks
+/// distinguish the silhouette; walls outline the city; streets show
+/// internal connectivity; building chunks are background fill.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CityChunkFeature {
+    Cathedral,
+    Castle,
+    WallEdge,
+    Gate,
+    Street,
+    Building,
+}
+
 /// A city's parsed RON plus world-cell anchor and bbox cached at load.
 /// City stamping intersects this bbox against each chunk (cities can
 /// extend well beyond the `NamedSite` biome-override radius, so we
@@ -109,9 +128,19 @@ pub struct LoadedCity {
     /// tighter than `bbox` (which also covers Rougemont / bridge /
     /// leat).
     pub wall_bbox: (i64, i64, i64, i64),
+    /// Per-chunk feature classification for the overmap renderer.
+    /// Chunks not touching the city are absent from the map.
+    chunk_features: HashMap<ChunkCoord, CityChunkFeature>,
 }
 
 impl LoadedCity {
+    /// Feature classification for this chunk, if the city overlaps it.
+    /// Returns `None` for chunks with no city feature (renderer falls
+    /// back to biome / road / river).
+    pub fn chunk_feature(&self, coord: ChunkCoord) -> Option<CityChunkFeature> {
+        self.chunk_features.get(&coord).copied()
+    }
+
     /// True if this city has any geometry inside the given chunk's
     /// world-cell bounds. Cheap rectangle-vs-rectangle intersect.
     pub fn intersects_chunk(&self, coord: ChunkCoord) -> bool {
@@ -176,6 +205,8 @@ pub fn cities() -> &'static HashMap<&'static str, LoadedCity> {
                 .map(|p| (p.0 + anchor.0, p.1 + anchor.1))
                 .collect();
             let wall_bbox = compute_bbox(&wall_world_polygon);
+            let chunk_features =
+                classify_chunks(&city, anchor, &wall_world_polygon, wall_bbox);
             map.insert(
                 name,
                 LoadedCity {
@@ -184,6 +215,7 @@ pub fn cities() -> &'static HashMap<&'static str, LoadedCity> {
                     bbox,
                     wall_world_polygon,
                     wall_bbox,
+                    chunk_features,
                 },
             );
         }
@@ -243,6 +275,153 @@ fn compute_city_bbox(city: &City, anchor: (i64, i64)) -> (i64, i64, i64, i64) {
         }
     }
     (min_x, min_y, max_x, max_y)
+}
+
+/// Build the per-chunk feature classification for the overmap. Visits
+/// each authored feature once and writes its tag into every chunk it
+/// touches. Build order encodes priority: Building → Street → WallEdge
+/// → Cathedral/Castle → Gate, with later writes winning.
+fn classify_chunks(
+    city: &City,
+    anchor: (i64, i64),
+    wall_world_polygon: &[(i64, i64)],
+    wall_bbox: (i64, i64, i64, i64),
+) -> HashMap<ChunkCoord, CityChunkFeature> {
+    let mut out: HashMap<ChunkCoord, CityChunkFeature> = HashMap::new();
+
+    // 1. Building: chunks whose center sits inside the wall polygon.
+    //    Cheap one-point test; the wall-edge pass below overwrites the
+    //    perimeter chunks so the outline still reads as wall.
+    let cx_min = wall_bbox.0.div_euclid(CHUNK_W as i64) as i32;
+    let cy_min = wall_bbox.1.div_euclid(CHUNK_H as i64) as i32;
+    let cx_max = wall_bbox.2.div_euclid(CHUNK_W as i64) as i32;
+    let cy_max = wall_bbox.3.div_euclid(CHUNK_H as i64) as i32;
+    for cy in cy_min..=cy_max {
+        for cx in cx_min..=cx_max {
+            let cc = ChunkCoord { cx, cy };
+            let center_x = cc.cx as i64 * CHUNK_W as i64 + CHUNK_W as i64 / 2;
+            let center_y = cc.cy as i64 * CHUNK_H as i64 + CHUNK_H as i64 / 2;
+            if point_in_polygon((center_x, center_y), wall_world_polygon) {
+                out.insert(cc, CityChunkFeature::Building);
+            }
+        }
+    }
+
+    // 2. Street: every chunk a street polyline touches.
+    for street in &city.streets {
+        for window in street.polyline.windows(2) {
+            let aw = (window[0].0 + anchor.0, window[0].1 + anchor.1);
+            let bw = (window[1].0 + anchor.0, window[1].1 + anchor.1);
+            for (wx, wy) in line_cells(aw, bw) {
+                out.insert(chunk_for_world_cell(wx, wy), CityChunkFeature::Street);
+            }
+        }
+    }
+
+    // 3. WallEdge: every chunk a wall segment touches.
+    let n = city.wall.polygon.len();
+    for i in 0..n {
+        let a = city.wall.polygon[i];
+        let b = city.wall.polygon[(i + 1) % n];
+        let aw = (a.0 + anchor.0, a.1 + anchor.1);
+        let bw = (b.0 + anchor.0, b.1 + anchor.1);
+        for (wx, wy) in line_cells(aw, bw) {
+            out.insert(chunk_for_world_cell(wx, wy), CityChunkFeature::WallEdge);
+        }
+    }
+
+    // 4. Cathedral / Castle landmarks. Name-based dispatch — there are
+    //    a handful of landmarks per city and matching by name keeps the
+    //    classification cheap and obvious from the RON.
+    for lm in &city.landmarks {
+        let feat = landmark_feature(&lm.name);
+        let Some(feat) = feat else { continue };
+        for (wx, wy) in footprint_cells(&lm.footprint, anchor) {
+            out.insert(chunk_for_world_cell(wx, wy), feat);
+        }
+    }
+
+    // 5. Gate: each gate chunk wins over the wall it sits on. One cell
+    //    per gate is enough — gates are points, not areas.
+    for gate in &city.wall.gates {
+        let wx = gate.cell.0 + anchor.0;
+        let wy = gate.cell.1 + anchor.1;
+        out.insert(chunk_for_world_cell(wx, wy), CityChunkFeature::Gate);
+    }
+
+    out
+}
+
+fn chunk_for_world_cell(wx: i64, wy: i64) -> ChunkCoord {
+    ChunkCoord {
+        cx: wx.div_euclid(CHUNK_W as i64) as i32,
+        cy: wy.div_euclid(CHUNK_H as i64) as i32,
+    }
+}
+
+/// Map a landmark name to its overmap feature tag. Returns `None` for
+/// landmarks we don't render on the overmap (Cathedral Close — paved
+/// fill is implicit under the Cathedral; Guildhall — too small to read
+/// at chunk scale; Bridge/Quay/Leat — extramural features not yet
+/// stamped in-game, so they shouldn't show on the overmap either).
+fn landmark_feature(name: &str) -> Option<CityChunkFeature> {
+    let n = name.to_ascii_lowercase();
+    if n.contains("cathedral") && !n.contains("close") {
+        Some(CityChunkFeature::Cathedral)
+    } else if n.contains("rougemont") {
+        Some(CityChunkFeature::Castle)
+    } else {
+        None
+    }
+}
+
+/// All world-cells covered by a landmark footprint (after anchor
+/// offset). Used by the chunk classifier to mark every chunk a landmark
+/// occupies, not just the centroid.
+fn footprint_cells(fp: &Footprint, anchor: (i64, i64)) -> Vec<(i64, i64)> {
+    match fp {
+        Footprint::Rect(a, b) => {
+            let min_x = a.0.min(b.0) + anchor.0;
+            let max_x = a.0.max(b.0) + anchor.0;
+            let min_y = a.1.min(b.1) + anchor.1;
+            let max_y = a.1.max(b.1) + anchor.1;
+            let mut out = Vec::with_capacity(((max_x - min_x + 1) * (max_y - min_y + 1)) as usize);
+            for y in min_y..=max_y {
+                for x in min_x..=max_x {
+                    out.push((x, y));
+                }
+            }
+            out
+        }
+        Footprint::Polygon(verts) => {
+            if verts.len() < 3 {
+                return Vec::new();
+            }
+            let world_poly: Vec<(i64, i64)> = verts
+                .iter()
+                .map(|p| (p.0 + anchor.0, p.1 + anchor.1))
+                .collect();
+            let mut min_x = i64::MAX;
+            let mut min_y = i64::MAX;
+            let mut max_x = i64::MIN;
+            let mut max_y = i64::MIN;
+            for &(x, y) in &world_poly {
+                if x < min_x { min_x = x; }
+                if y < min_y { min_y = y; }
+                if x > max_x { max_x = x; }
+                if y > max_y { max_y = y; }
+            }
+            let mut out = Vec::new();
+            for y in min_y..=max_y {
+                for x in min_x..=max_x {
+                    if point_in_polygon((x, y), &world_poly) {
+                        out.push((x, y));
+                    }
+                }
+            }
+            out
+        }
+    }
 }
 
 impl City {
@@ -1092,6 +1271,104 @@ mod tests {
         assert_eq!(
             leak, 0,
             "{leak} WoodWall cells leaked outside the wall polygon"
+        );
+    }
+
+    #[test]
+    fn chunk_features_cover_wall_perimeter_and_gates() {
+        let loaded = cities().get("Exeter").unwrap();
+        // Anchor chunk (0,0) is the Cathedral footprint.
+        assert_eq!(
+            loaded.chunk_feature(ChunkCoord { cx: 0, cy: 0 }),
+            Some(CityChunkFeature::Cathedral),
+            "anchor chunk should classify as Cathedral"
+        );
+        // Each gate's chunk classifies as Gate.
+        for gate in &loaded.city.wall.gates {
+            let wx = gate.cell.0 + loaded.anchor.0;
+            let wy = gate.cell.1 + loaded.anchor.1;
+            let cc = ChunkCoord {
+                cx: wx.div_euclid(CHUNK_W as i64) as i32,
+                cy: wy.div_euclid(CHUNK_H as i64) as i32,
+            };
+            assert_eq!(
+                loaded.chunk_feature(cc),
+                Some(CityChunkFeature::Gate),
+                "gate {} chunk {:?} should classify as Gate",
+                gate.name,
+                cc
+            );
+        }
+        // Rougemont chunks classify as Castle. Motte centroid ~ (-87, -488).
+        let rougemont_cc = ChunkCoord {
+            cx: (-87i64).div_euclid(CHUNK_W as i64) as i32,
+            cy: (-488i64).div_euclid(CHUNK_H as i64) as i32,
+        };
+        assert_eq!(
+            loaded.chunk_feature(rougemont_cc),
+            Some(CityChunkFeature::Castle),
+            "Rougemont chunk should classify as Castle"
+        );
+        // A chunk well outside the city (far north) has no feature.
+        assert_eq!(
+            loaded.chunk_feature(ChunkCoord { cx: 0, cy: -200 }),
+            None,
+        );
+    }
+
+    /// Dump Exeter's chunk-feature grid as ASCII so a reviewer can
+    /// eyeball the overmap layout without launching the game. Run via:
+    /// `cargo test --release chunk_feature_grid_dump -- --nocapture`
+    #[test]
+    fn chunk_feature_grid_dump() {
+        let loaded = cities().get("Exeter").unwrap();
+        let (min_x, min_y, max_x, max_y) = loaded.bbox;
+        let cx_min = min_x.div_euclid(CHUNK_W as i64) as i32 - 1;
+        let cy_min = min_y.div_euclid(CHUNK_H as i64) as i32 - 1;
+        let cx_max = max_x.div_euclid(CHUNK_W as i64) as i32 + 1;
+        let cy_max = max_y.div_euclid(CHUNK_H as i64) as i32 + 1;
+        println!("Exeter overmap chunk grid (cx {cx_min}..={cx_max}, cy {cy_min}..={cy_max})");
+        println!("legend: # cathedral · K castle · = wall · + gate · - street · . building · ' empty");
+        for cy in cy_min..=cy_max {
+            let mut row = String::new();
+            for cx in cx_min..=cx_max {
+                let glyph = match loaded.chunk_feature(ChunkCoord { cx, cy }) {
+                    Some(CityChunkFeature::Cathedral) => '#',
+                    Some(CityChunkFeature::Castle) => 'K',
+                    Some(CityChunkFeature::WallEdge) => '=',
+                    Some(CityChunkFeature::Gate) => '+',
+                    Some(CityChunkFeature::Street) => '-',
+                    Some(CityChunkFeature::Building) => '.',
+                    None => '\'',
+                };
+                row.push(glyph);
+                row.push(' ');
+            }
+            println!("  {row}");
+        }
+    }
+
+    #[test]
+    fn chunk_features_include_streets() {
+        let loaded = cities().get("Exeter").unwrap();
+        // Sample High Street mid-polyline cell (-40, -78) → its chunk
+        // should classify as Street (or Gate if it shares the East-gate
+        // chunk).
+        let cc = ChunkCoord {
+            cx: (-40i64).div_euclid(CHUNK_W as i64) as i32,
+            cy: (-78i64).div_euclid(CHUNK_H as i64) as i32,
+        };
+        let feat = loaded.chunk_feature(cc);
+        assert!(
+            matches!(
+                feat,
+                Some(CityChunkFeature::Street)
+                    | Some(CityChunkFeature::Gate)
+                    | Some(CityChunkFeature::WallEdge)
+            ),
+            "High Street chunk {:?} should be Street/Gate/WallEdge, got {:?}",
+            cc,
+            feat
         );
     }
 
