@@ -1044,6 +1044,12 @@ impl ItemKind {
         ALL_KINDS.iter().copied().find(|k| k.def().save_key == s)
     }
 
+    /// Every item kind, in catalog order. Backs the sprite-picker's
+    /// Items tab.
+    pub fn all() -> &'static [ItemKind] {
+        ALL_KINDS
+    }
+
     pub fn is_fungible(self) -> bool {
         self.def().is_fungible
     }

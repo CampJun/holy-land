@@ -98,6 +98,14 @@ pub struct RenderSettings {
     pub atlas_key: String,
     #[serde(default)]
     pub terrain_overrides: Vec<TerrainOverride>,
+    /// Per-target sprite overrides set via the in-game sprite picker.
+    /// Additive (rides the existing schema via `#[serde(default)]`), so
+    /// older meta saves load with no overrides and every target falls
+    /// back to its `sprites` registry default. The legacy CP437
+    /// `terrain_overrides` above is unused since the sprite migration
+    /// but kept for forward-compat.
+    #[serde(default)]
+    pub sprite_overrides: Vec<SpriteOverride>,
 }
 
 /// One terrain → glyph override. `kind_key` is `TerrainKind::save_key`;
@@ -108,6 +116,22 @@ pub struct TerrainOverride {
     pub kind_key: String,
     #[serde(default)]
     pub glyph: u8,
+}
+
+/// One game-target → sprite override from the in-game picker. `target`
+/// is a stable key like `terrain:grass` / `tree:oak` / `item:axe`;
+/// `sheet` is `sprites::Sheet::name`. Unknown targets/sheets are dropped
+/// on load (forward-compat).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SpriteOverride {
+    #[serde(default)]
+    pub target: String,
+    #[serde(default)]
+    pub sheet: String,
+    #[serde(default)]
+    pub col: u8,
+    #[serde(default)]
+    pub row: u8,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -822,6 +846,12 @@ mod tests {
             kind_key: "cobble_road".to_string(),
             glyph: 0xCD,
         });
+        meta.render.sprite_overrides.push(SpriteOverride {
+            target: "terrain:grass".to_string(),
+            sheet: "overworld".to_string(),
+            col: 1,
+            row: 0,
+        });
         save_atomic(&path, &meta).unwrap();
 
         let loaded = load_meta(&path).unwrap();
@@ -829,6 +859,11 @@ mod tests {
         assert_eq!(loaded.render.terrain_overrides.len(), 1);
         assert_eq!(loaded.render.terrain_overrides[0].kind_key, "cobble_road");
         assert_eq!(loaded.render.terrain_overrides[0].glyph, 0xCD);
+        assert_eq!(loaded.render.sprite_overrides.len(), 1);
+        assert_eq!(loaded.render.sprite_overrides[0].target, "terrain:grass");
+        assert_eq!(loaded.render.sprite_overrides[0].sheet, "overworld");
+        assert_eq!(loaded.render.sprite_overrides[0].col, 1);
+        assert_eq!(loaded.render.sprite_overrides[0].row, 0);
 
         fs::remove_dir_all(&dir).ok();
     }

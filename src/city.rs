@@ -434,6 +434,7 @@ impl City {
                     cells[idx].terrain = TerrainKind::Grass;
                 }
                 cells[idx].tree_species = None;
+                cells[idx].canopy = None;
                 cells[idx].decoration = crate::flora::Decoration::None;
                 cells[idx].items.clear();
                 cells[idx].ground_cover = GroundCover::None;
@@ -726,6 +727,7 @@ fn set_terrain(cells: &mut [CellState], lx: usize, ly: usize, terrain: TerrainKi
     let idx = ly * (CHUNK_W as usize) + lx;
     cells[idx].terrain = terrain;
     cells[idx].tree_species = None;
+    cells[idx].canopy = None;
     cells[idx].decoration = crate::flora::Decoration::None;
 }
 

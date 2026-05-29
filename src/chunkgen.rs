@@ -28,7 +28,7 @@
 // crosses chunk boundaries.
 
 use crate::cornwall::{self, Biome, OvermapInfo};
-use crate::flora::{Decoration, PlantState, TreeSpecies};
+use crate::flora::{Canopy, Decoration, PlantState, TreeSize, TreeSpecies};
 use crate::items::{ItemInstance, ItemKind, ItemMetadata};
 use crate::skill::Rng;
 use crate::world::{CellState, Chunk, ChunkCoord, GroundCover, TerrainKind, CHUNK_H, CHUNK_W};
@@ -43,6 +43,19 @@ const NOISE_LATTICE_STEP: i32 = 8;
 /// clears of trees + Gorse. Spawn at (CHUNK_W/2, CHUNK_H/2) = (20, 15)
 /// is guaranteed walkable with this radius.
 const SPAWN_DISC_RADIUS: i32 = 4;
+
+/// Average tree-footprint area (cells), used to convert the per-cell
+/// coverage target into a per-anchor stamp probability — each anchor
+/// claims `size²` cells, so anchoring at the raw per-cell probability
+/// would tile the chunk solid. Tuned so the mean coverage lands inside
+/// the procgen card's band (see `coverage_band_holds_on_average`).
+const TREE_FOOTPRINT_AVG: u32 = 2;
+
+/// Six water-loving trees on the pond's north-east perimeter (spawn
+/// chunk only). Hand-placed; same every seed. Stamped as 2×2 young
+/// trees by `generate_chunk`.
+const SKELETON_TREES: &[(u32, u32)] =
+    &[(33, 19), (34, 20), (34, 22), (33, 25), (31, 18), (26, 18)];
 
 pub fn generate_chunk(coord: ChunkCoord, world_seed: u64, info: OvermapInfo) -> Chunk {
     // Sea fast path. Off-peninsula chunks are open ocean — fill with
@@ -71,7 +84,8 @@ pub fn generate_chunk(coord: ChunkCoord, world_seed: u64, info: OvermapInfo) -> 
     if coord.cx == 0 && coord.cy == 0 {
         apply_stream(&mut cells);
         apply_pond_and_shore(&mut cells);
-        apply_skeleton_trees(&mut cells);
+        // Skeleton trees are stamped after the noise fields exist (they
+        // need a species roll), below.
     }
 
     // Stamp roads first, then rivers. Rivers win over roads at fords
@@ -98,43 +112,59 @@ pub fn generate_chunk(coord: ChunkCoord, world_seed: u64, info: OvermapInfo) -> 
     let target_coverage =
         cov_min + (cov_max - cov_min) * (canopy_mean as f32 / 255.0);
     let target_p_max: u32 = (target_coverage * 100.0).round() as u32;
+
+    // Occupancy grid: cells already claimed by a tree footprint or a
+    // non-Grass feature (stream/pond/road). Footprints never overlap or
+    // straddle these, so each cell renders its own slice with no
+    // z-ordering (per-cell pipeline untouched).
+    let mut occupied = vec![false; (CHUNK_W * CHUNK_H) as usize];
     for ly in 0..CHUNK_H {
         for lx in 0..CHUNK_W {
             let idx = cell_idx(lx, ly);
             if cells[idx].terrain != TerrainKind::Grass {
-                continue;
-            }
-            if in_spawn_disc(lx as i32, ly as i32) {
-                continue;
-            }
-            // Per-cell probability: canopy[idx] / 255 scaled by the
-            // chunk's target coverage. High canopy + high target →
-            // dense forest; low canopy + low target → sparse.
-            let cell_p = (canopy[idx] as u32 * target_p_max) / 255;
-            if (rng.next_u32() % 100) < cell_p {
-                cells[idx].terrain = TerrainKind::TreeTrunk;
-                cells[idx].tree_species = Some(pick_species_for_biome(
-                    info.biome,
-                    canopy[idx],
-                    moisture[idx],
-                    &mut rng,
-                ));
+                occupied[idx] = true;
             }
         }
     }
-    // Skeleton trees also need a species tag. Roll one each from
-    // their cell's local canopy/moisture for visual consistency.
+
+    // Skeleton trees: six hand-placed pond-side trees on the spawn
+    // chunk, stamped as 2×2 young trees. Placed before the noise loop so
+    // they're guaranteed; occupancy then steers noise trees clear of
+    // them. Coords that don't fit a 2×2 (pond/edge) are simply skipped.
+    if coord.cx == 0 && coord.cy == 0 {
+        for &(x, y) in SKELETON_TREES {
+            if footprint_fits(&cells, &occupied, x, y, TreeSize::Young) {
+                let idx = cell_idx(x, y);
+                let sp = pick_species_for_biome(info.biome, canopy[idx], moisture[idx], &mut rng);
+                stamp_tree(&mut cells, &mut occupied, x, y, TreeSize::Young, sp);
+            }
+        }
+    }
+
+    // Step 3: discrete tree stamping. Each anchor stamps a 2×2 / 4×4
+    // footprint; the per-cell anchor probability is the coverage target
+    // scaled DOWN by the average footprint area (one anchor fills many
+    // cells, so anchoring at the raw per-cell probability would tile the
+    // chunk solid). Rolling out of `100 * AVG` keeps `cell_p`'s full
+    // resolution. The canopy noise still drives clustering (anchor prob
+    // ∝ canopy), so forests thicken in shaded hollows.
     for ly in 0..CHUNK_H {
         for lx in 0..CHUNK_W {
             let idx = cell_idx(lx, ly);
-            if cells[idx].terrain == TerrainKind::TreeTrunk && cells[idx].tree_species.is_none() {
-                cells[idx].tree_species = Some(pick_species_for_biome(
-                    info.biome,
-                    canopy[idx],
-                    moisture[idx],
-                    &mut rng,
-                ));
+            if occupied[idx] || in_spawn_disc(lx as i32, ly as i32) {
+                continue;
             }
+            let cell_p = (canopy[idx] as u32 * target_p_max) / 255;
+            if (rng.next_u32() % (100 * TREE_FOOTPRINT_AVG)) >= cell_p {
+                continue;
+            }
+            let size = pick_tree_size(canopy[idx], &mut rng);
+            if !footprint_fits(&cells, &occupied, lx, ly, size) {
+                continue;
+            }
+            let species =
+                pick_species_for_biome(info.biome, canopy[idx], moisture[idx], &mut rng);
+            stamp_tree(&mut cells, &mut occupied, lx, ly, size, species);
         }
     }
 
@@ -147,7 +177,7 @@ pub fn generate_chunk(coord: ChunkCoord, world_seed: u64, info: OvermapInfo) -> 
         let x = (rng.next_u32() % CHUNK_W) as u32;
         let y = (rng.next_u32() % CHUNK_H) as u32;
         let idx = cell_idx(x, y);
-        if cells[idx].terrain != TerrainKind::Grass {
+        if cells[idx].terrain != TerrainKind::Grass || cells[idx].canopy.is_some() {
             continue;
         }
         if !cells[idx].items.is_empty() {
@@ -180,7 +210,7 @@ pub fn generate_chunk(coord: ChunkCoord, world_seed: u64, info: OvermapInfo) -> 
     for y in 0..CHUNK_H {
         for x in 0..CHUNK_W {
             let idx = cell_idx(x, y);
-            if cells[idx].terrain != TerrainKind::Grass {
+            if cells[idx].terrain != TerrainKind::Grass || cells[idx].canopy.is_some() {
                 continue;
             }
             if !cells[idx].items.is_empty() {
@@ -232,6 +262,83 @@ fn chunk_rng(coord: ChunkCoord, world_seed: u64) -> Rng {
 
 fn cell_idx(x: u32, y: u32) -> usize {
     (y * CHUNK_W + x) as usize
+}
+
+/// True if a `size×size` tree anchored at top-left `(lx, ly)` can be
+/// stamped: every footprint cell must be in-chunk (the chunk-boundary
+/// rule — no spill past the edge; a few-cell tree-free seam is
+/// acceptable), unoccupied, on Grass, and outside the spawn disc.
+fn footprint_fits(cells: &[CellState], occupied: &[bool], lx: u32, ly: u32, size: TreeSize) -> bool {
+    let s = size.cells() as u32;
+    for dr in 0..s {
+        for dc in 0..s {
+            let (cx, cy) = (lx + dc, ly + dr);
+            if cx >= CHUNK_W || cy >= CHUNK_H {
+                return false;
+            }
+            let idx = cell_idx(cx, cy);
+            if occupied[idx]
+                || cells[idx].terrain != TerrainKind::Grass
+                || in_spawn_disc(cx as i32, cy as i32)
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Stamp a `size×size` tree at top-left `(lx, ly)`: mark occupancy and
+/// tag every footprint cell with its `Canopy` slice + species. Ground
+/// stays Grass underneath; the canopy carries the render slice and the
+/// collision/sight bits. Caller must have checked `footprint_fits`.
+fn stamp_tree(
+    cells: &mut [CellState],
+    occupied: &mut [bool],
+    lx: u32,
+    ly: u32,
+    size: TreeSize,
+    species: TreeSpecies,
+) {
+    let s = size.cells() as u32;
+    for dr in 0..s {
+        for dc in 0..s {
+            let idx = cell_idx(lx + dc, ly + dr);
+            occupied[idx] = true;
+            cells[idx].tree_species = Some(species);
+            cells[idx].canopy = Some(Canopy {
+                species,
+                size,
+                sub_col: dc as u8,
+                sub_row: dr as u8,
+                is_trunk: is_trunk_cell(size, dc as u8, dr as u8),
+            });
+        }
+    }
+}
+
+/// Which cells of a tree footprint block movement (the trunk base).
+/// Young 2×2 → the bottom row; Mature 4×4 → the centre-bottom 2×2.
+/// Every other cell is walkable canopy you can slip under. Single
+/// source of the trunk geometry — growth-next reuses this when it
+/// promotes saplings into stamped trees.
+fn is_trunk_cell(size: TreeSize, dc: u8, dr: u8) -> bool {
+    match size {
+        TreeSize::Young => dr == 1,
+        TreeSize::Mature => (dc == 1 || dc == 2) && (dr == 2 || dr == 3),
+    }
+}
+
+/// Roll a tree size from local canopy noise: denser canopy → more
+/// likely a mature 4×4 (deep-wood oaks); sparse → mostly young 2×2
+/// (scrubby edges). Mature chance ramps ~5%→35% with canopy.
+fn pick_tree_size(canopy: u8, rng: &mut Rng) -> TreeSize {
+    let mature_pct = 5 + (canopy as u32 * 30) / 255; // 5..=35
+    if (rng.next_u32() % 100) < mature_pct {
+        TreeSize::Mature
+    } else {
+        TreeSize::Young
+    }
 }
 
 /// True if `(lx, ly)` is inside the central spawn-safe disc the
@@ -391,6 +498,7 @@ fn stamp_river(cells: &mut [CellState], coord: ChunkCoord) {
                 let idx = cell_idx(lx, ly);
                 cells[idx].terrain = TerrainKind::StreamWater;
                 cells[idx].tree_species = None;
+                cells[idx].canopy = None;
                 cells[idx].decoration = Decoration::None;
             }
         }
@@ -416,6 +524,7 @@ fn stamp_road(cells: &mut [CellState], coord: ChunkCoord) {
             if cornwall::cell_on_road(wx, wy) {
                 cells[idx].terrain = TerrainKind::BareDirt;
                 cells[idx].tree_species = None;
+                cells[idx].canopy = None;
                 cells[idx].decoration = Decoration::None;
             }
         }
@@ -486,10 +595,14 @@ fn enforce_spawn_disc(cells: &mut [CellState]) {
     for ly in (cy - SPAWN_DISC_RADIUS).max(0)..=(cy + SPAWN_DISC_RADIUS).min(ch - 1) {
         for lx in (cx - SPAWN_DISC_RADIUS).max(0)..=(cx + SPAWN_DISC_RADIUS).min(cw - 1) {
             let idx = cell_idx(lx as u32, ly as u32);
+            // Clear any tree footprint that intruded on the spawn disc
+            // (stamping already skips it, but skeleton trees / future
+            // sources might not) plus the legacy TreeTrunk terrain.
             if cells[idx].terrain == TerrainKind::TreeTrunk {
                 cells[idx].terrain = TerrainKind::Grass;
-                cells[idx].tree_species = None;
             }
+            cells[idx].tree_species = None;
+            cells[idx].canopy = None;
             if matches!(cells[idx].decoration, Decoration::Gorse { .. }) {
                 cells[idx].decoration = Decoration::None;
             }
@@ -561,20 +674,6 @@ fn apply_pond_and_shore(cells: &mut [CellState]) {
                 && cells[cell_idx(x as u32, y as u32)].terrain == TerrainKind::Grass
             {
                 cells[cell_idx(x as u32, y as u32)].terrain = TerrainKind::SandShore;
-            }
-        }
-    }
-}
-
-/// Six water-loving trees on the pond's north-east perimeter. Hand-
-/// placed; same every seed.
-fn apply_skeleton_trees(cells: &mut [CellState]) {
-    let trees: &[(u32, u32)] = &[(33, 19), (34, 20), (34, 22), (33, 25), (31, 18), (26, 18)];
-    for &(x, y) in trees {
-        if x < CHUNK_W && y < CHUNK_H {
-            let idx = cell_idx(x, y);
-            if cells[idx].terrain == TerrainKind::Grass {
-                cells[idx].terrain = TerrainKind::TreeTrunk;
             }
         }
     }
@@ -660,7 +759,9 @@ fn apply_leaf_litter(cells: &mut [CellState]) {
     for y in 0..ch {
         for x in 0..cw {
             let idx = cell_idx(x as u32, y as u32);
-            if cells[idx].terrain != TerrainKind::Grass {
+            // Litter goes on OPEN grass next to a tree, not on the
+            // walkable cells under a canopy footprint.
+            if cells[idx].terrain != TerrainKind::Grass || cells[idx].canopy.is_some() {
                 continue;
             }
             let mut near_tree = false;
@@ -674,7 +775,7 @@ fn apply_leaf_litter(cells: &mut [CellState]) {
                     if nx < 0 || ny < 0 || nx >= cw || ny >= ch {
                         continue;
                     }
-                    if cells[cell_idx(nx as u32, ny as u32)].terrain == TerrainKind::TreeTrunk {
+                    if cells[cell_idx(nx as u32, ny as u32)].canopy.is_some() {
                         near_tree = true;
                         break 'outer;
                     }
@@ -711,7 +812,7 @@ fn apply_undergrowth(
                 continue;
             }
             let idx = cell_idx(x as u32, y as u32);
-            if cells[idx].terrain != TerrainKind::Grass {
+            if cells[idx].terrain != TerrainKind::Grass || cells[idx].canopy.is_some() {
                 continue;
             }
             if !cells[idx].items.is_empty() {
@@ -814,9 +915,9 @@ mod tests {
         let tree_count = chunk
             .cells
             .iter()
-            .filter(|c| c.terrain == TerrainKind::TreeTrunk)
+            .filter(|c| c.canopy.is_some())
             .count();
-        assert!(tree_count >= 12, "expected >= 12 trees, got {}", tree_count);
+        assert!(tree_count >= 12, "expected >= 12 tree cells, got {}", tree_count);
     }
 
     /// Wilderness chunk well outside Exeter's wall + Rougemont bbox.
@@ -870,15 +971,17 @@ mod tests {
     #[test]
     fn leaf_litter_placed_near_trees() {
         let chunk = gen(ChunkCoord { cx: 0, cy: 0 }, 0xC0FFEE);
-        // Every Grass cell with at least one TreeTrunk among its 8
-        // neighbors must carry LeafLitter. Non-tree-adjacent Grass
-        // cells must NOT.
+        // Every OPEN Grass cell (no canopy) with at least one tree-
+        // footprint cell among its 8 neighbors must carry LeafLitter.
+        // Cells under a canopy and non-adjacent open grass must NOT.
         let cw = CHUNK_W as i32;
         let ch = CHUNK_H as i32;
         for y in 0..ch {
             for x in 0..cw {
                 let idx = cell_idx(x as u32, y as u32);
-                if chunk.cells[idx].terrain != TerrainKind::Grass {
+                if chunk.cells[idx].terrain != TerrainKind::Grass
+                    || chunk.cells[idx].canopy.is_some()
+                {
                     continue;
                 }
                 let mut near_tree = false;
@@ -893,7 +996,7 @@ mod tests {
                             continue;
                         }
                         let n = cell_idx(nx as u32, ny as u32);
-                        if chunk.cells[n].terrain == TerrainKind::TreeTrunk {
+                        if chunk.cells[n].canopy.is_some() {
                             near_tree = true;
                         }
                     }
@@ -922,15 +1025,20 @@ mod tests {
     fn every_tree_cell_has_a_species() {
         let chunk = gen(ChunkCoord { cx: 0, cy: 0 }, 0xC0FFEE);
         for c in chunk.cells.iter() {
-            if c.terrain == TerrainKind::TreeTrunk {
+            if c.canopy.is_some() {
                 assert!(
                     c.tree_species.is_some(),
-                    "TreeTrunk cell missing tree_species — chunkgen must tag every tree"
+                    "canopy cell missing tree_species — stamp_tree must tag every tree"
+                );
+                assert_eq!(
+                    c.terrain,
+                    TerrainKind::Grass,
+                    "canopy cell must keep Grass terrain underneath"
                 );
             } else {
                 assert!(
                     c.tree_species.is_none(),
-                    "non-tree cell has tree_species = {:?}",
+                    "non-canopy cell has tree_species = {:?}",
                     c.tree_species
                 );
             }
@@ -962,6 +1070,11 @@ mod tests {
         let mut diff = 0;
         for (ca, cb) in a.cells.iter().zip(b.cells.iter()) {
             if ca.terrain != cb.terrain {
+                diff += 1;
+            }
+            // Trees keep Grass terrain now, so canopy presence is the
+            // main tree-layout signal between seeds.
+            if ca.canopy.is_some() != cb.canopy.is_some() {
                 diff += 1;
             }
             if ca.items.len() != cb.items.len() {
@@ -1029,8 +1142,8 @@ mod tests {
                         dy
                     );
                     assert!(
-                        c.terrain != TerrainKind::TreeTrunk,
-                        "TreeTrunk in spawn 3x3 on seed offset {} at ({}, {})",
+                        c.canopy.is_none() && c.terrain != TerrainKind::TreeTrunk,
+                        "tree in spawn 3x3 on seed offset {} at ({}, {})",
                         seed_offset,
                         dx,
                         dy
@@ -1057,12 +1170,15 @@ mod tests {
             let chunk = gen(ChunkCoord { cx: 4, cy: 4 }, 0xC0FFEE ^ seed_offset);
             for c in chunk.cells.iter() {
                 // Skeleton features (water/sand) shouldn't count as
-                // tree-eligible; only count grass + tree cells.
+                // tree-eligible; only count grass cells. Trees keep Grass
+                // terrain with a canopy tag, so coverage = canopy cells /
+                // grass+baredirt cells.
                 match c.terrain {
-                    TerrainKind::Grass | TerrainKind::BareDirt => total_eligible += 1,
-                    TerrainKind::TreeTrunk => {
-                        total_trees += 1;
+                    TerrainKind::Grass | TerrainKind::BareDirt => {
                         total_eligible += 1;
+                        if c.canopy.is_some() {
+                            total_trees += 1;
+                        }
                     }
                     _ => {}
                 }
@@ -1110,6 +1226,64 @@ mod tests {
     }
 
     #[test]
+    fn trunk_geometry_young_bottom_row_mature_center_bottom() {
+        // Young 2×2: bottom row blocks, top row walkable canopy.
+        assert!(!is_trunk_cell(TreeSize::Young, 0, 0));
+        assert!(!is_trunk_cell(TreeSize::Young, 1, 0));
+        assert!(is_trunk_cell(TreeSize::Young, 0, 1));
+        assert!(is_trunk_cell(TreeSize::Young, 1, 1));
+        // Mature 4×4: centre-bottom 2×2 (dc∈{1,2}, dr∈{2,3}) blocks.
+        for dr in 0..4u8 {
+            for dc in 0..4u8 {
+                let expect = (dc == 1 || dc == 2) && (dr == 2 || dr == 3);
+                assert_eq!(is_trunk_cell(TreeSize::Mature, dc, dr), expect, "({dc},{dr})");
+            }
+        }
+    }
+
+    #[test]
+    fn footprint_fits_rejects_edge_overlap_and_nongrass() {
+        let mut cells: Vec<CellState> = (0..(CHUNK_W * CHUNK_H))
+            .map(|_| CellState::with_terrain(TerrainKind::Grass))
+            .collect();
+        let mut occ = vec![false; cells.len()];
+        // In-bounds, all grass, unoccupied → fits.
+        assert!(footprint_fits(&cells, &occ, 5, 5, TreeSize::Mature));
+        // Edge spill: a 4×4 within 3 cells of the right edge → rejected.
+        assert!(!footprint_fits(&cells, &occ, CHUNK_W - 2, 5, TreeSize::Mature));
+        // Overlap: one occupied footprint cell → rejected.
+        occ[cell_idx(6, 6)] = true;
+        assert!(!footprint_fits(&cells, &occ, 5, 5, TreeSize::Mature));
+        occ[cell_idx(6, 6)] = false;
+        // Non-grass in the footprint → rejected.
+        cells[cell_idx(7, 7)].terrain = TerrainKind::PondWater;
+        assert!(!footprint_fits(&cells, &occ, 5, 5, TreeSize::Mature));
+    }
+
+    #[test]
+    fn stamp_tree_tags_full_footprint_on_grass() {
+        let mut cells: Vec<CellState> = (0..(CHUNK_W * CHUNK_H))
+            .map(|_| CellState::with_terrain(TerrainKind::Grass))
+            .collect();
+        let mut occ = vec![false; cells.len()];
+        stamp_tree(&mut cells, &mut occ, 5, 5, TreeSize::Young, TreeSpecies::Oak);
+        for dr in 0..2u32 {
+            for dc in 0..2u32 {
+                let c = &cells[cell_idx(5 + dc, 5 + dr)];
+                let canopy = c.canopy.expect("footprint cell must carry canopy");
+                assert_eq!(canopy.species, TreeSpecies::Oak);
+                assert_eq!(c.tree_species, Some(TreeSpecies::Oak));
+                assert_eq!(c.terrain, TerrainKind::Grass, "ground stays Grass under tree");
+                assert_eq!((canopy.sub_col, canopy.sub_row), (dc as u8, dr as u8));
+                assert!(occ[cell_idx(5 + dc, 5 + dr)]);
+            }
+        }
+        // Top row walkable canopy; bottom row trunk.
+        assert!(!cells[cell_idx(5, 5)].canopy.unwrap().is_trunk);
+        assert!(cells[cell_idx(5, 6)].canopy.unwrap().is_trunk);
+    }
+
+    #[test]
     fn spawn_connectivity_above_80_percent_for_most_seeds() {
         // Flood-fill from spawn over walkable cells (terrain.walkable
         // AND !decoration.blocks_pass). At least 80% of walkables
@@ -1128,12 +1302,15 @@ mod tests {
         let n_seeds = 50;
         for seed_offset in 0..n_seeds {
             let chunk = gen(ChunkCoord { cx: 5, cy: 5 }, 0xDEAD ^ seed_offset);
-            // Count total walkables.
-            let total_walkable = chunk
-                .cells
-                .iter()
-                .filter(|c| c.terrain.def().walkable && !c.decoration.blocks_pass())
-                .count();
+            // Count total walkables. Trunk-base canopy cells block
+            // movement (upper canopy is walkable), matching the game's
+            // `cell_walkable_at`.
+            let walkable = |c: &CellState| {
+                c.terrain.def().walkable
+                    && !c.decoration.blocks_pass()
+                    && !c.canopy.map_or(false, |canopy| canopy.is_trunk)
+            };
+            let total_walkable = chunk.cells.iter().filter(|c| walkable(c)).count();
             if total_walkable == 0 {
                 continue;
             }
@@ -1156,8 +1333,7 @@ mod tests {
                     if reachable[ni] {
                         continue;
                     }
-                    let cell = &chunk.cells[ni];
-                    if cell.terrain.def().walkable && !cell.decoration.blocks_pass() {
+                    if walkable(&chunk.cells[ni]) {
                         reachable[ni] = true;
                         stack.push(ni);
                     }
