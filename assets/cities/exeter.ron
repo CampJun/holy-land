@@ -33,6 +33,7 @@
 
 City(
     name: "Exeter",
+    tier: Urban,
     wall: Wall(
         // Irregular ~21-vertex circuit (closed; last vertex omitted —
         // the stamper closes the loop). Clockwise in our coords
@@ -72,7 +73,7 @@ City(
 
     // Parsed but not yet stamped (task: streets+landmarks card).
     streets: [
-        Street(name: "High Street",    width: 2, polyline: [
+        Street(name: "High Street",    width: 3, polyline: [
             (-120,  -25),
             ( -95,  -66),
             ( -40,  -78),
@@ -80,7 +81,7 @@ City(
             (  70, -108),
             ( 112, -126),
         ]),
-        Street(name: "Fore Street",    width: 2, polyline: [
+        Street(name: "Fore Street",    width: 3, polyline: [
             (-236,  199),
             (-210,  160),
             (-182,  118),
@@ -88,21 +89,25 @@ City(
             (-135,   35),
             (-120,  -25),
         ]),
-        Street(name: "North Street",   width: 2, polyline: [
+        Street(name: "North Street",   width: 3, polyline: [
             (-120,  -25),
             (-140,  -45),
             (-160,  -60),
             (-176,  -68),
             (-188,  -70),
         ]),
-        Street(name: "South Street",   width: 2, polyline: [
+        Street(name: "South Street",   width: 3, polyline: [
             (-120,  -25),
             ( -95,   15),
             ( -60,   70),
             ( -10,  135),
             (  38,  182),
         ]),
-        Street(name: "Smythen Street", width: 1, polyline: [
+        // Smythen St. ("smiths' lane") — historically clustered with
+        // armurers / cutlers / bladesmiths per Exeter Mayor's Court
+        // Rolls 1300-1310. Tag a 50/50 smithy/house mix so fronting
+        // slots roll a smithy prefab roughly half the time.
+        Street(name: "Smythen Street", width: 1, tag_weights: [("smithy", 5), ("house", 5)], polyline: [
             ( -55,  -55),
             ( -32,  -10),
             (  -5,   45),

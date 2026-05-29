@@ -1,0 +1,26 @@
+// Urban craftsman workshop dwelling — timber-framed, shopfront on
+// the street-facing gable. The bulk of Exeter's c.1300 housing
+// stock per Kowaleski (1995) ch. 2: smaller-scale traders and
+// craftsmen who didn't hold a full stone burgage. Open shopfront
+// (CobbleRoad gap) is the period-typical shutter-down counter
+// that doubled as a serving board during business hours.
+Prefab(
+    tag: "house",
+    tier: Urban,
+    variant: "workshop",
+    weight: 3,
+    size: (6, 6),
+    palette: {
+        '#': WoodWall,
+        '.': Floor,
+        'o': CobbleRoad,
+    },
+    grid: [
+        "######",
+        "#....#",
+        "#....#",
+        "#....o",
+        "#....#",
+        "######",
+    ],
+)

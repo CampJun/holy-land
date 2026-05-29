@@ -1,0 +1,29 @@
+// Village farrier / general smith — horseshoes, nails, edge-tools.
+// Sources: Salzman, "English Industries of the Middle Ages" (1923)
+// ch. 6 on the village smith's product mix (horseshoes, plough
+// fittings, nails, sickle / billhook / axe heads); Statute of
+// Winchester (1285) §2 implies a smith reachable to every parish
+// for arming-tier 2-5 maintenance (the village smith repaired the
+// peasant ironmonger's bill / falchion, not the burgher's mail).
+// Open road-facing shopfront — the smith worked outside in good
+// weather and the door stayed open for horses to be shoed at the
+// threshold.
+Prefab(
+    tag: "smithy",
+    tier: Village,
+    variant: "farrier",
+    weight: 3,
+    size: (6, 5),
+    palette: {
+        '#': WoodWall,
+        '.': Floor,
+        'o': BareDirt,
+    },
+    grid: [
+        "######",
+        "#....#",
+        "#....o",
+        "#....#",
+        "######",
+    ],
+)

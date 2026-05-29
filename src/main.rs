@@ -1,5 +1,6 @@
 mod action;
 mod atlases;
+mod buildings;
 mod calendar;
 mod chunkgen;
 mod city;
@@ -3768,12 +3769,17 @@ fn draw_overmap(
                 (b'?', color_dim())
             } else {
                 let info = cornwall::overmap_info_at(cc);
-                // Display priority at a chunk: named-site (anchor only)
-                // wins over river / road / biome. Otherwise rivers
-                // visually take precedence over roads (you'd notice a
-                // river crossing a road, not the road under it), and
-                // roads override the biome glyph.
-                if let Some(site) = info.named_site {
+                // Display priority at a chunk: authored city features
+                // (wall, gate, cathedral, street, building chunks) win
+                // over the underlying biome and over cornwall-scale
+                // roads/rivers, because once inside the wall the city
+                // *is* the terrain. Cathedral / named-site overlay
+                // already comes out of the city-feature path (the
+                // anchor chunk classifies as Cathedral). Outside the
+                // city: rivers > roads > biome as before.
+                if let Some(feat) = city_feature_at(cc) {
+                    city_feature_glyph_color(feat, cc)
+                } else if let Some(site) = info.named_site {
                     if cornwall::chunk_for_anchor(site) == cc {
                         (
                             site.kind.overmap_glyph(),
@@ -3893,6 +3899,80 @@ fn chunk_glyph_color(cc: ChunkCoord, info: &cornwall::OvermapInfo) -> (u8, Color
 /// Beaten-earth highway tint. Tan-yellow so the road network reads as
 /// distinct from forest greens, moor grays, and water blues.
 const ROAD_FG: [u8; 3] = [200, 175, 110];
+
+/// First city-feature hit at this chunk across every authored city.
+/// Today only Exeter is authored, but iterating preserves the property
+/// when more cities land (Bodmin / Tintagel / etc).
+fn city_feature_at(cc: ChunkCoord) -> Option<city::CityChunkFeature> {
+    for c in city::cities().values() {
+        if let Some(feat) = c.chunk_feature(cc) {
+            return Some(feat);
+        }
+    }
+    None
+}
+
+/// Glyph + color for a city-feature chunk on the overmap. Streets get a
+/// box-drawing connector derived from neighboring city chunks; other
+/// features get a single fixed glyph each.
+fn city_feature_glyph_color(feat: city::CityChunkFeature, cc: ChunkCoord) -> (u8, Color) {
+    use city::CityChunkFeature::*;
+    match feat {
+        Cathedral => (
+            cornwall::SiteKind::Cathedral.overmap_glyph(),
+            color_from_rgb(cornwall::SiteKind::Cathedral.overmap_fg()),
+        ),
+        Castle => (
+            cornwall::SiteKind::Castle.overmap_glyph(),
+            color_from_rgb(cornwall::SiteKind::Castle.overmap_fg()),
+        ),
+        // Gate: ╬ in bright tan — the navigationally important opening
+        // in the wall. One per gate chunk (4 total around Exeter).
+        Gate => (0xCE, Color::RGB(240, 215, 120)),
+        // WallEdge: ▓ in stone gray — the city outline. Reads as a
+        // solid run; gates punch holes in it.
+        WallEdge => (0xB2, Color::RGB(170, 160, 150)),
+        // Street: box-drawing connector picked from cardinal neighbors
+        // that are also Street chunks. Same tan as the King's Highway
+        // so the road network reads continuously into the city.
+        Street => (street_connector_glyph(cc), color_from_rgb(ROAD_FG)),
+        // Building: ▒ in a warm roof brown — the dense interior between
+        // streets and walls.
+        Building => (0xB1, Color::RGB(165, 130, 90)),
+    }
+}
+
+/// CP437 box-drawing connector for a Street chunk, picked from which
+/// cardinal neighbors are also city chunks carrying Street or Gate
+/// (gates count as connectors so the line runs into them visually).
+/// Mirrors `road_connector_glyph` but reads city-feature state instead
+/// of the cornwall-scale `has_road` set.
+fn street_connector_glyph(cc: ChunkCoord) -> u8 {
+    fn street_or_gate(cc: ChunkCoord) -> bool {
+        matches!(
+            city_feature_at(cc),
+            Some(city::CityChunkFeature::Street) | Some(city::CityChunkFeature::Gate)
+        )
+    }
+    let n = street_or_gate(ChunkCoord { cx: cc.cx, cy: cc.cy - 1 });
+    let s = street_or_gate(ChunkCoord { cx: cc.cx, cy: cc.cy + 1 });
+    let e = street_or_gate(ChunkCoord { cx: cc.cx + 1, cy: cc.cy });
+    let w = street_or_gate(ChunkCoord { cx: cc.cx - 1, cy: cc.cy });
+    match (n, s, e, w) {
+        (true, true, true, true) => 0xC5,
+        (true, true, true, false) => 0xC3,
+        (true, true, false, true) => 0xB4,
+        (true, false, true, true) => 0xC1,
+        (false, true, true, true) => 0xC2,
+        (true, true, false, false) => 0xB3,
+        (false, false, true, true) => 0xC4,
+        (true, false, true, false) => 0xC0,
+        (true, false, false, true) => 0xD9,
+        (false, true, true, false) => 0xDA,
+        (false, true, false, true) => 0xBF,
+        _ => 0xC4,
+    }
+}
 
 /// CP437 box-drawing connector for a road chunk, picked from which of
 /// the 4 cardinal neighbors are also road chunks. Now that `has_road`

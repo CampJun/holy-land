@@ -1,0 +1,27 @@
+// Devon village longhouse — typical c.1300 rural dwelling.
+// Sources: Beresford & Hurst, "Wharram: a Study of Settlement on
+// the Yorkshire Wolds" (1990) — comparable Devon longhouse plans
+// in Beresford, "The Lost Villages of England" (1954); NHLE
+// listings for surviving Dartmoor longhouses (e.g. Higher
+// Uppacott). 5×5 single-room footprint represents the human end
+// of a longhouse; the byre end is omitted at this scale. Timber-
+// framed with cob infill, modelled as WoodWall.
+Prefab(
+    tag: "house",
+    tier: Village,
+    variant: "cottage",
+    weight: 5,
+    size: (5, 5),
+    palette: {
+        '#': WoodWall,
+        '.': Floor,
+        'o': BareDirt,
+    },
+    grid: [
+        "#####",
+        "#...#",
+        "#...o",
+        "#...#",
+        "#####",
+    ],
+)

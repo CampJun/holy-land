@@ -1,0 +1,32 @@
+// Exeter armurer — Smythen Street, c. 1300.
+// Sources: Statute of Winchester (1285) arming-tier requirements
+// drove demand for fitted mail / brigandine / great-helm in
+// boroughs; Exeter Mayor's Court Rolls 1300-1310 (Devon Heritage
+// Centre, Exeter ECC ED/M/CR/1-3) record "armurer" surnames
+// clustering on Smythen St. (the smiths' lane running south from
+// High St. — name attested in Hooker's 1587 map and earlier
+// civic deeds). Stone-walled because a serious arms forge needed
+// thicker thermal mass + fire defence than a domestic hearth, and
+// armurer guild status came with the means to build in stone.
+// Forge / anvil / armour-rack furniture is deferred to Card 3.
+Prefab(
+    tag: "smithy",
+    tier: Urban,
+    variant: "armorer",
+    weight: 3,
+    size: (7, 7),
+    palette: {
+        '#': StoneWall,
+        '.': Floor,
+        'o': CobbleRoad,
+    },
+    grid: [
+        "#######",
+        "#.....#",
+        "#.....#",
+        "#.....o",
+        "#.....#",
+        "#.....#",
+        "#######",
+    ],
+)
