@@ -19,6 +19,7 @@ mod platform;
 mod render;
 mod save;
 mod skill;
+mod sprites;
 mod world;
 
 use std::collections::HashMap;
@@ -34,7 +35,7 @@ use atlases::AtlasEntry;
 use input::{Action, Input};
 use items::{ItemInstance, Pack};
 use needs::Needs;
-use render::{draw_glyph, CELL_SIZE};
+use render::{draw_glyph, draw_sprite, CELL_SIZE};
 use save::{
     ActionStepSave, ActiveActionSave, CellItemsSave, DecorationMutationSave, MetaSave, NeedsSave,
     RenderSettings, RunSave, SaveHeader, SkillSave, SkillsSave, StaminaSave, TerrainMutationSave,
@@ -42,9 +43,8 @@ use save::{
 };
 use skill::{Rng, Skill, SkillKind, Skills};
 use world::{
-    brightness_at, dawns_elapsed, wall_connector_glyph, ChunkCoord, FastTravelStep, GroundCover,
-    Position, TerrainKind, ViewMode, World, MULTI_TURN_GAME_SEC_PER_FRAME, REMAPPABLE_TERRAINS,
-    TREE_VARIANT_GLYPHS,
+    brightness_at, dawns_elapsed, ChunkCoord, FastTravelStep, GroundCover, Position, TerrainKind,
+    ViewMode, World, MULTI_TURN_GAME_SEC_PER_FRAME, REMAPPABLE_TERRAINS,
 };
 
 const WORLD_W: u32 = 40;
@@ -58,11 +58,32 @@ const SLEEP_GUARD: Duration = Duration::from_millis(10);
 const SLEEP_GUARD: Duration = Duration::from_millis(3);
 const TIMING_LOG_INTERVAL: Duration = Duration::from_secs(1);
 
+/// What a rendered cell shows. The world layer draws Mini-Medieval
+/// sprites; UI text/menus/HUD keep the CP437 font (the sprite pack has
+/// no typeface). One unified `Cell` so both share the per-cell diff.
+#[derive(Clone, Copy, PartialEq)]
+enum CellArt {
+    Glyph(u8),
+    Sprite(sprites::Sprite),
+}
+
 #[derive(Clone, Copy, PartialEq)]
 struct Cell {
-    glyph: u8,
+    art: CellArt,
     fg: Color,
     bg: Color,
+}
+
+impl Cell {
+    /// CP437 font cell (UI text, menus, HUD). `fg` tints the glyph.
+    fn glyph(glyph: u8, fg: Color, bg: Color) -> Self {
+        Self { art: CellArt::Glyph(glyph), fg, bg }
+    }
+    /// World sprite cell. `fg` is the multiplicative tint (brightness +
+    /// day/night light); `bg` shows under transparent sprite pixels.
+    fn sprite(sprite: sprites::Sprite, fg: Color, bg: Color) -> Self {
+        Self { art: CellArt::Sprite(sprite), fg, bg }
+    }
 }
 
 /// Start-button pause-menu options. Render order = display order.
@@ -287,6 +308,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let mut atlas = atlases::load(&atlas_registry[atlas_idx])?;
     let mut current_atlas_idx = atlas_idx;
+    // Mini-Medieval sprite sheets for the world layer (decoded lazily).
+    let mut sheets = sprites::SpriteSheets::new();
     let mut terrain_overrides: HashMap<TerrainKind, u8> =
         build_terrain_overrides(&meta.render);
     let mut framebuf = Surface::new(logical_w, logical_h, PixelFormatEnum::ARGB8888)?;
@@ -1639,16 +1662,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for vx in 0..WORLD_W as i32 {
                 let wx = cam_x + vx as i64;
                 let wy = cam_y + vy as i64;
-                // Base terrain glyph via TerrainDef (one source of truth
-                // for glyph + fg + bg per kind; see world.rs).
+                // Base terrain sprite. Mini-Medieval art is pre-colored, so
+                // per-cell color now lives in the bg (ground tint / gradient /
+                // seasonal cover) that shows under transparent sprite pixels;
+                // brightness rides a white tint multiplied onto the sprite.
                 let terrain = world.tile_at(wx, wy);
                 let terrain_def = terrain.def();
-                let mut glyph = terrain_def.glyph;
-                if terrain.is_wall_like() {
-                    glyph = wall_connector_glyph(&world, wx, wy, terrain);
-                } else if let Some(&g) = terrain_overrides.get(&terrain) {
-                    glyph = g;
-                }
+                let mut sprite = sprites::terrain_sprite(terrain);
                 // Per-cell color gradient for walkable terrain: small
                 // hash-driven RGB offset on fg+bg so the floor reads as
                 // organic texture rather than a flat region. Unwalkable
@@ -1656,14 +1676,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // pierces the floor as a visual landmark.
                 let apply_gradient =
                     matches!(terrain, TerrainKind::Grass | TerrainKind::BareDirt | TerrainKind::SandShore);
-                let base_fg = terrain_def.fg(season);
                 let base_bg = terrain_def.bg(season);
-                let (fg_arr, bg_arr) = if apply_gradient {
-                    floor_with_gradient(base_fg, base_bg, wx as i32, wy as i32, world.seed)
+                let bg_arr = if apply_gradient {
+                    floor_with_gradient(terrain_def.fg(season), base_bg, wx as i32, wy as i32, world.seed).1
                 } else {
-                    (base_fg, base_bg)
+                    base_bg
                 };
-                let mut fg = Color::RGB(fg_arr[0], fg_arr[1], fg_arr[2]);
                 // Ground-cover lerps: stored variants paint over the
                 // seasonal terrain bg. Snow is render-time-only based on
                 // (Winter && terrain.is_outdoor()) and lerps on top of
@@ -1696,34 +1714,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     bg_arr
                 };
                 let bg = Color::RGB(bg_arr[0], bg_arr[1], bg_arr[2]);
-                // Sparse grass tufts: hash-driven so ~25% of grass
-                // cells show the 0x9C tuft sprite; the rest render as
-                // blank background. Deterministic across reloads via
-                // world.seed.
-                if terrain == TerrainKind::Grass
-                    && !grass_dot_visible(wx as i32, wy as i32, world.seed)
-                {
-                    glyph = b' ';
-                }
-                // Tree rendering: glyph + tint by species + season. The
-                // per-cell `cell.tree_species` (set by chunkgen) picks
-                // the species glyph; the per-species canopy_fg table
-                // picks the seasonal tint. Cells with no species (only
-                // hit if a save predates Phase C) fall back to the
-                // per-cell hash + species-agnostic TREE_VARIANT_GLYPHS
-                // catalog for visual variety.
+                // Tree canopy sprite by species (chunkgen sets per-cell).
                 if terrain == TerrainKind::TreeTrunk {
-                    let species = world.cell_at(wx, wy).and_then(|c| c.tree_species);
-                    match species {
-                        Some(sp) => {
-                            glyph = sp.canopy_glyph();
-                            let t = sp.canopy_fg(season);
-                            fg = Color::RGB(t[0], t[1], t[2]);
-                        }
-                        None => {
-                            let gi = tree_variant_index(wx as i32, wy as i32, world.seed);
-                            glyph = TREE_VARIANT_GLYPHS[gi % TREE_VARIANT_GLYPHS.len()];
-                        }
+                    if let Some(sp) = world.cell_at(wx, wy).and_then(|c| c.tree_species) {
+                        sprite = sprites::tree_sprite(sp);
                     }
                 }
                 let cell_state = world.cell_at(wx, wy);
@@ -1742,45 +1736,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .map(|c| c.decoration)
                         .unwrap_or(flora::Decoration::None);
                     if !matches!(decoration, flora::Decoration::None) {
-                        glyph = decoration.glyph();
-                        let [r, gn, b] = decoration.fg(season);
-                        fg = Color::RGB(r, gn, b);
+                        sprite = sprites::decoration_sprite(&decoration);
                     }
                     if let Some(top) = cell_state.and_then(|c| c.items.last()) {
-                        // Lit fires override the kind's default glyph so
-                        // a lit-firewood reads as fire (orange '*') rather
-                        // than a wood pile ('=' brown).
-                        let (g, [r, gn, b]) = match top.metadata {
-                            items::ItemMetadata::Lit { .. } => (b'*', [230, 140, 60]),
-                            _ => top.kind.glyph_color(),
-                        };
-                        glyph = g;
-                        // Blendable items mix their fg ~45% toward the
-                        // (per-cell-gradiented) terrain fg, so twigs /
-                        // grass / moss / mud read as part of the floor
-                        // texture. Stones / firewood / herbs / tools
-                        // stay full-saturation and pierce the floor.
-                        let is_blendable =
-                            !matches!(top.metadata, items::ItemMetadata::Lit { .. })
-                                && top.kind.def().blends_with_terrain;
-                        fg = if is_blendable {
-                            blend_to_terrain([r, gn, b], fg_arr, 0.45)
-                        } else {
-                            Color::RGB(r, gn, b)
+                        // Lit fires read as fire rather than their item sprite.
+                        sprite = match top.metadata {
+                            items::ItemMetadata::Lit { .. } => sprites::misc::FIRE,
+                            _ => sprites::item_sprite(top.kind),
                         };
                     }
-                    // Non-player entities (bandits etc.) render above
-                    // ground items but below the player @ — so a bandit
-                    // standing on a dropped spear shows the bandit, but
-                    // if the player and a bandit ever overlap (death
-                    // tile) the @ wins.
-                    if let Some((g, ec)) = world::entity_glyph_at(&world, wx as i32, wy as i32) {
-                        glyph = g;
-                        fg = Color::RGB(ec[0], ec[1], ec[2]);
+                    // Non-player entities (bandits etc.) render above ground
+                    // items but below the player — overlap resolves to @.
+                    if world::entity_glyph_at(&world, wx as i32, wy as i32).is_some() {
+                        sprite = sprites::units::BANDIT_YEOMAN;
                     }
                     if wx == pwx && wy == pwy {
-                        glyph = b'@';
-                        fg = palette.player_fg;
+                        sprite = sprites::units::PLAYER;
                     }
                 }
 
@@ -1816,20 +1787,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 let effective_brightness =
                     (cell_brightness + light * LIGHT_BRIGHTNESS_BOOST_MAX).min(1.0);
-                let mut fg = tint_color(fg, effective_brightness);
+                let mut sprite_tint = tint_color(Color::RGB(255, 255, 255), effective_brightness);
                 let mut bg = tint_color(bg, effective_brightness);
                 if light > 0.0 {
                     let mix = light * LIGHT_TINT_MIX_MAX;
-                    fg = blend_to_terrain(LIGHT_TINT, [fg.r, fg.g, fg.b], mix);
+                    sprite_tint = blend_to_terrain(
+                        LIGHT_TINT,
+                        [sprite_tint.r, sprite_tint.g, sprite_tint.b],
+                        mix,
+                    );
                     bg = blend_to_terrain(LIGHT_TINT, [bg.r, bg.g, bg.b], mix);
                 }
-                let mut cell = Cell { glyph, fg, bg };
+                let mut cell = Cell::sprite(sprite, sprite_tint, bg);
                 let i = (vy as u32 * WORLD_W + vx as u32) as usize;
                 if let Some(ui_cell) = ui_cells[i] {
                     cell = ui_cell;
                 }
                 if prev_cells[i] != Some(cell) {
-                    draw_glyph(&mut framebuf, &mut atlas, vx, vy, cell.glyph, cell.fg, cell.bg);
+                    match cell.art {
+                        CellArt::Glyph(g) => {
+                            draw_glyph(&mut framebuf, &mut atlas, vx, vy, g, cell.fg, cell.bg);
+                        }
+                        CellArt::Sprite(s) => {
+                            if let Ok(sheet) = sheets.get(s.sheet) {
+                                draw_sprite(
+                                    &mut framebuf,
+                                    sheet,
+                                    vx,
+                                    vy,
+                                    s.src_rect(),
+                                    cell.fg,
+                                    cell.bg,
+                                );
+                            }
+                        }
+                    }
                     prev_cells[i] = Some(cell);
                     changed_cells += 1;
                     dirty_min_x = dirty_min_x.min(vx);
@@ -2238,11 +2230,7 @@ fn build_ui_cells(
             &mut cells,
             x,
             1,
-            Cell {
-                glyph: *glyph,
-                fg: *sym_fg,
-                bg: palette.hud_bg,
-            },
+            Cell::glyph(*glyph, *sym_fg, palette.hud_bg),
         );
         x += 1;
         let s = value.to_string();
@@ -2407,33 +2395,6 @@ fn blend_to_terrain(item_rgb: [u8; 3], terrain_fg: [u8; 3], mix: f32) -> Color {
     Color::RGB(r, g, b)
 }
 
-/// Index into `TREE_VARIANT_GLYPHS` for a given cell. Deterministic
-/// per `(x, y, world.seed)` so the same cell always shows the same
-/// tree silhouette. Differs from the grass-dot hash via different
-/// mixer constants so neighboring cells don't visually correlate.
-fn tree_variant_index(x: i32, y: i32, seed: u64) -> usize {
-    let h = (x as i64)
-        .wrapping_mul(467_213)
-        .wrapping_add((y as i64).wrapping_mul(2_654_435_761))
-        .wrapping_add(seed as i64);
-    let mixed = (h as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    (mixed >> 28) as usize
-}
-
-/// Returns true for ~25% of grass cells, deterministically per
-/// `(x, y, world.seed)`. Used by the render loop to render a sparse
-/// pattern of tufts across grass rather than a wall of glyphs.
-fn grass_dot_visible(x: i32, y: i32, seed: u64) -> bool {
-    // Mixing constants: Knuth's multiplicative hash + two large primes
-    // for spatial decorrelation, then a final golden-ratio shuffle so
-    // adjacent cells don't show banding.
-    let h = (x as i64)
-        .wrapping_mul(73_856_093)
-        .wrapping_add((y as i64).wrapping_mul(19_349_663))
-        .wrapping_add(seed as i64);
-    let mixed = (h as u64).wrapping_mul(2_654_435_761);
-    (mixed >> 24) % 100 < 25
-}
 
 /// Bottom-left "what's underfoot" line. Reads the player's current
 /// cell's `items` and prints a comma-separated list (with stack counts
@@ -2498,7 +2459,7 @@ fn draw_target_cursor(
         // bg is at that index.
         let idx = (vy as u32 * WORLD_W + vx as u32) as usize;
         let bg = cells[idx].map(|c| c.bg).unwrap_or(palette.hud_bg);
-        cells[idx] = Some(Cell { glyph: b'+', fg: cursor_fg, bg });
+        cells[idx] = Some(Cell::glyph(b'+', cursor_fg, bg));
     }
     // HUD line above the here-line: "Aim: chest  hit 65%  rng 4/10".
     let player_pos = world.player_pos();
@@ -2678,11 +2639,7 @@ fn draw_menu_row(
         cells,
         layout.inner_x(),
         row_y,
-        Cell {
-            glyph: cursor,
-            fg: palette.panel_title_fg,
-            bg: palette.panel_bg,
-        },
+        Cell::glyph(cursor, palette.panel_title_fg, palette.panel_bg),
     );
     put_text(
         cells,
@@ -2801,11 +2758,7 @@ fn draw_menu_list(
             cells,
             layout.inner_x(),
             row_y,
-            Cell {
-                glyph: cur_glyph,
-                fg: palette.panel_title_fg,
-                bg: palette.panel_bg,
-            },
+            Cell::glyph(cur_glyph, palette.panel_title_fg, palette.panel_bg),
         );
 
         // Optional one-cell glyph preview between cursor and label.
@@ -2814,11 +2767,7 @@ fn draw_menu_list(
                 cells,
                 layout.inner_x() + 2,
                 row_y,
-                Cell {
-                    glyph,
-                    fg,
-                    bg: palette.panel_bg,
-                },
+                Cell::glyph(glyph, fg, palette.panel_bg),
             );
             layout.inner_x() + 4
         } else {
@@ -2847,11 +2796,7 @@ fn draw_menu_list(
             cells,
             layout.inner_right(),
             layout.first_row_y(),
-            Cell {
-                glyph: b'^',
-                fg: palette.panel_dim_fg,
-                bg: palette.panel_bg,
-            },
+            Cell::glyph(b'^', palette.panel_dim_fg, palette.panel_bg),
         );
     }
     if cursor.scroll + visible < total {
@@ -2859,11 +2804,7 @@ fn draw_menu_list(
             cells,
             layout.inner_right(),
             layout.first_row_y() + visible as i32 - 1,
-            Cell {
-                glyph: b'v',
-                fg: palette.panel_dim_fg,
-                bg: palette.panel_bg,
-            },
+            Cell::glyph(b'v', palette.panel_dim_fg, palette.panel_bg),
         );
     }
 }
@@ -2986,7 +2927,7 @@ fn draw_glyph_grid(
                 cells,
                 grid_x + col as i32,
                 grid_y + row as i32,
-                Cell { glyph: byte, fg, bg },
+                Cell::glyph(byte, fg, bg),
             );
         }
     }
@@ -3588,11 +3529,7 @@ fn draw_multi_turn_banner(
             cells,
             layout.inner_x() + i,
             body_y,
-            Cell {
-                glyph,
-                fg: palette.panel_fg,
-                bg: palette.panel_bg,
-            },
+            Cell::glyph(glyph, palette.panel_fg, palette.panel_bg),
         );
     }
     let remaining_m = total_remaining / 60;
@@ -3696,7 +3633,7 @@ fn draw_panel(
             } else {
                 b' '
             };
-            put_cell(cells, px, py, Cell { glyph, fg, bg });
+            put_cell(cells, px, py, Cell::glyph(glyph, fg, bg));
         }
     }
 }
@@ -3712,7 +3649,7 @@ fn tint_color(c: Color, t: f32) -> Color {
 
 fn put_text(cells: &mut [Option<Cell>], x: i32, y: i32, text: &str, fg: Color, bg: Color) {
     for (i, b) in text.bytes().enumerate() {
-        put_cell(cells, x + i as i32, y, Cell { glyph: b, fg, bg });
+        put_cell(cells, x + i as i32, y, Cell::glyph(b, fg, bg));
     }
 }
 
@@ -3815,11 +3752,7 @@ fn draw_overmap(
                 cells,
                 vx,
                 vy,
-                Cell {
-                    glyph,
-                    fg,
-                    bg: palette.panel_bg,
-                },
+                Cell::glyph(glyph, fg, palette.panel_bg),
             );
         }
     }
@@ -3853,11 +3786,7 @@ fn draw_overmap(
             cells,
             x,
             info_y,
-            Cell {
-                glyph: b' ',
-                fg: palette.panel_fg,
-                bg: palette.panel_bg,
-            },
+            Cell::glyph(b' ', palette.panel_fg, palette.panel_bg),
         );
     }
     put_text(cells, 1, info_y, &line, palette.panel_fg, palette.panel_bg);
@@ -3957,11 +3886,7 @@ fn draw_fast_travel_banner(
             cells,
             x,
             0,
-            Cell {
-                glyph: b' ',
-                fg: palette.panel_fg,
-                bg: palette.panel_bg,
-            },
+            Cell::glyph(b' ', palette.panel_fg, palette.panel_bg),
         );
     }
     let max_w = WORLD_W as i32 - 2;

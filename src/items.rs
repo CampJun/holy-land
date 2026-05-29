@@ -147,7 +147,9 @@ pub struct ItemDef {
     /// main.rs mixes the item color heavily toward the cell's terrain
     /// fg so the eye glides past it. Distinct items (stones, firewood,
     /// herbs, tools, structures) keep their saturation so they pierce
-    /// the floor as visual landmarks.
+    /// the floor as visual landmarks. Unused since the sprite migration
+    /// (sprites are pre-colored, no terrain blend); retained as item data.
+    #[allow(dead_code)]
     pub blends_with_terrain: bool,
     /// Weapon stats — `Some` for anything an entity can wield in melee.
     /// Phase-3 ships melee only; ranged ammo / bow weapons get a sibling
@@ -1053,6 +1055,9 @@ impl ItemKind {
 
     /// Glyph + RGB foreground color for ground rendering. Background uses
     /// the cell's terrain background so items sit "on" the floor visually.
+    /// Retained: world rendering moved to `sprites::item_sprite`; the CP437
+    /// glyph/color is kept for the dev tile tooling / fallback.
+    #[allow(dead_code)]
     pub fn glyph_color(self) -> (u8, [u8; 3]) {
         let d = self.def();
         (d.glyph, d.color)

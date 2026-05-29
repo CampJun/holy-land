@@ -323,6 +323,9 @@ pub enum GroundCover {
 /// forest has visual variety. 0xB5 / 0xC6 are the dead-tree sprites
 /// available for future TerrainKind::DeadTree (chopped stumps,
 /// burnt-out groves) — see assets/CP437_MAP.md.
+/// Retained: world rendering moved to `sprites::tree_sprite`; kept as the
+/// CP437 catalog for the dev tile tooling / fallback.
+#[allow(dead_code)]
 pub const TREE_VARIANT_GLYPHS: &[u8] = &[0x05, 0x06, 0x17, 0x18];
 
 /// Canonical iteration order for `TerrainKind::from_save_key`. Keep in
@@ -374,6 +377,9 @@ impl TerrainKind {
     /// `wall_connector_glyph`. Excludes `Wall` (the OOB sentinel).
     /// TODO: add future `Door` / `Gate` kinds here so wall runs stitch
     /// across openings.
+    /// Retained for the deferred sprite wall auto-tiler (and tested);
+    /// the sprite render path currently draws solid wall blocks.
+    #[allow(dead_code)]
     pub fn is_wall_like(self) -> bool {
         matches!(self, TerrainKind::StoneWall | TerrainKind::WoodWall)
     }
@@ -570,6 +576,10 @@ impl TerrainKind {
 /// renders connected (the perimeter cell picks its thick stub or T,
 /// the house cell picks its thin stub or T). Isolated cell (no wall
 /// neighbors) renders as a vertical pillar.
+/// Retained for the deferred sprite wall auto-tiler (and exercised by
+/// tests); the sprite render path currently draws solid wall blocks via
+/// `sprites::walls`.
+#[allow(dead_code)]
 pub fn wall_connector_glyph(world: &World, wx: i64, wy: i64, kind: TerrainKind) -> u8 {
     let n = world.tile_at(wx, wy - 1).is_wall_like();
     let s = world.tile_at(wx, wy + 1).is_wall_like();

@@ -68,6 +68,9 @@ impl TreeSpecies {
 
     /// Per-species canopy glyph. Picked from CP437 atlas; the existing
     /// TREE_VARIANT_GLYPHS array was the species-agnostic catalog.
+    /// Retained: world rendering moved to `sprites::tree_sprite`, but the
+    /// CP437 mapping is kept for the dev tile tooling / fallback.
+    #[allow(dead_code)]
     pub fn canopy_glyph(self) -> u8 {
         match self {
             TreeSpecies::Oak => 0x05,    // ♣
