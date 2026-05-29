@@ -1814,6 +1814,31 @@ fn find_adjacent_terrain<F: Fn(TerrainKind) -> bool>(
     None
 }
 
+/// Find an adjacent cell holding a tree — a multi-cell canopy footprint
+/// cell (any slice, trunk or upper canopy) or a legacy single-cell
+/// `TerrainKind::TreeTrunk`. Chopping any footprint cell fells the whole
+/// tree (see `World::fell_tree_at`).
+fn find_adjacent_tree(world: &World) -> Option<(i32, i32)> {
+    let p = world.player_pos();
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            let wx = p.x + dx;
+            let wy = p.y + dy;
+            let is_tree = world
+                .cell_at(wx as i64, wy as i64)
+                .map_or(false, |c| c.canopy.is_some())
+                || world.tile_at(wx as i64, wy as i64) == TerrainKind::TreeTrunk;
+            if is_tree {
+                return Some((wx, wy));
+            }
+        }
+    }
+    None
+}
+
 /// Find an adjacent cell holding an item that satisfies `pred`. Returns
 /// the cell coords + the item index within that cell's items vec.
 fn find_adjacent_item<F: Fn(&ItemInstance) -> bool>(
@@ -1909,7 +1934,7 @@ fn eval_chop_tree(world: &World) -> Availability {
         };
     }
     Availability::from_has(
-        find_adjacent_terrain(world, |t| t == TerrainKind::TreeTrunk).is_some(),
+        find_adjacent_tree(world).is_some(),
         world.moves_to_seconds(ActionId::ChopTree.move_cost()),
         "no tree adjacent",
     )
@@ -1919,7 +1944,7 @@ fn execute_chop_tree(world: &mut World) -> ExecuteOutcome {
     if !world.player_pack().has_stack(ItemKind::Axe) {
         return ExecuteOutcome::Done("need an axe".to_string());
     }
-    let Some((wx, wy)) = find_adjacent_terrain(world, |t| t == TerrainKind::TreeTrunk) else {
+    let Some((wx, wy)) = find_adjacent_tree(world) else {
         return ExecuteOutcome::Done("no tree to chop".to_string());
     };
 
@@ -1932,11 +1957,13 @@ fn execute_chop_tree(world: &mut World) -> ExecuteOutcome {
         .and_then(|c| c.tree_species);
     let planted_day = world.calendar_day;
 
-    // Fell: terrain converts to BareDirt (Phase D: a chopped cell is a
-    // stump-and-disturbed-dirt patch, not pristine grass); the species
-    // tag clears; a sapling decoration takes over. FOV recomputes —
-    // the tree no longer blocks sight, but the sapling doesn't block
-    // either, so the new line-of-sight opens up immediately.
+    // Fell the whole tree: clear the multi-cell canopy footprint
+    // (no-op for a legacy single-cell TreeTrunk), then leave a stump at
+    // the chopped cell — terrain converts to BareDirt, the species tag
+    // clears, a sapling decoration takes over. FOV recomputes: the
+    // canopy no longer blocks sight and the sapling doesn't either, so
+    // the new line-of-sight opens up immediately.
+    world.fell_tree_at(wx as i64, wy as i64);
     world.set_terrain_at(wx as i64, wy as i64, TerrainKind::BareDirt);
     world.set_tree_species_at(wx as i64, wy as i64, None);
     if let Some(sp) = species {

@@ -68,6 +68,9 @@ impl TreeSpecies {
 
     /// Per-species canopy glyph. Picked from CP437 atlas; the existing
     /// TREE_VARIANT_GLYPHS array was the species-agnostic catalog.
+    /// Retained: world rendering moved to `sprites::tree_sprite`, but the
+    /// CP437 mapping is kept for the dev tile tooling / fallback.
+    #[allow(dead_code)]
     pub fn canopy_glyph(self) -> u8 {
         match self {
             TreeSpecies::Oak => 0x05,    // ♣
@@ -149,6 +152,57 @@ impl TreeSpecies {
             TreeSpecies::Rowan => Some(ItemKind::RowanBerry),
             _ => None,
         }
+    }
+}
+
+/// Footprint size of a stamped tree. The 1-cell sapling stays a
+/// `Decoration::Sapling` (walkable); the multi-cell sizes below are
+/// stamped into the cell grid as a `Canopy` footprint by
+/// `chunkgen::stamp_tree`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TreeSize {
+    /// 2×2-cell tree.
+    Young,
+    /// 4×4-cell tree.
+    Mature,
+}
+
+impl TreeSize {
+    /// Footprint edge in cells (2 or 4).
+    pub fn cells(self) -> u8 {
+        match self {
+            TreeSize::Young => 2,
+            TreeSize::Mature => 4,
+        }
+    }
+}
+
+/// One cell of a multi-cell tree footprint. A tree is stamped as a
+/// `size×size` block of cells, each carrying a `Canopy` that records
+/// which 8×8 slice of the tree sprite it draws — `sub_col`/`sub_row`
+/// are the offset from the block's top-left — and whether it is a
+/// trunk-base cell. Only trunk cells block movement; every canopy cell
+/// blocks line of sight (slip under the boughs, but can't see through
+/// them). Footprints never overlap, so each cell renders its own slice
+/// with no z-ordering — the per-cell render pipeline stays untouched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Canopy {
+    pub species: TreeSpecies,
+    pub size: TreeSize,
+    pub sub_col: u8,
+    pub sub_row: u8,
+    pub is_trunk: bool,
+}
+
+impl Canopy {
+    /// Trunk-base cells stop movement; upper canopy cells are walkable.
+    pub fn blocks_pass(self) -> bool {
+        self.is_trunk
+    }
+
+    /// Every canopy cell breaks line of sight.
+    pub fn blocks_sight(self) -> bool {
+        true
     }
 }
 

@@ -64,3 +64,30 @@ pub fn draw_glyph(
     let src = Rect::new(src_x as i32, src_y as i32, CELL_SIZE, CELL_SIZE);
     let _ = atlas.blit(src, framebuf, dst);
 }
+
+/// Draw a pre-colored sprite into one cell, scaling its native source
+/// (8×8) up to the 16×16 cell. `tint` is a MULTIPLICATIVE modulation
+/// (white = unchanged) — visibility dimming + day/night light ride on
+/// it exactly like the CP437 `fg` does, but here the sprite keeps its
+/// authored colors when `tint` is white. Like `draw_glyph` this is a
+/// software surface blit, so the color/alpha mod survives on Miyoo's
+/// renderer (which no-ops the equivalent *texture* mods).
+pub fn draw_sprite(
+    framebuf: &mut Surface,
+    sheet: &mut Surface,
+    cx: i32,
+    cy: i32,
+    src: Rect,
+    tint: Color,
+    bg: Color,
+) {
+    let px = cx * CELL_SIZE as i32;
+    let py = cy * CELL_SIZE as i32;
+    let dst = Rect::new(px, py, CELL_SIZE, CELL_SIZE);
+
+    let _ = framebuf.fill_rect(dst, bg);
+
+    sheet.set_color_mod(Color::RGB(tint.r, tint.g, tint.b));
+    sheet.set_alpha_mod(tint.a);
+    let _ = sheet.blit_scaled(src, framebuf, dst);
+}

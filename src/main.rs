@@ -20,6 +20,7 @@ mod platform;
 mod render;
 mod save;
 mod skill;
+mod sprites;
 mod world;
 
 use std::collections::HashMap;
@@ -35,7 +36,7 @@ use atlases::AtlasEntry;
 use input::{Action, Input};
 use items::{ItemInstance, Pack};
 use needs::Needs;
-use render::{draw_glyph, CELL_SIZE};
+use render::{draw_glyph, draw_sprite, CELL_SIZE};
 use save::{
     ActionStepSave, ActiveActionSave, CellItemsSave, DecorationMutationSave, MetaSave, NeedsSave,
     RenderSettings, RunSave, SaveHeader, SkillSave, SkillsSave, StaminaSave, TerrainMutationSave,
@@ -43,13 +44,16 @@ use save::{
 };
 use skill::{Rng, Skill, SkillKind, Skills};
 use world::{
-    brightness_at, dawns_elapsed, wall_connector_glyph, ChunkCoord, FastTravelStep, GroundCover,
-    Position, TerrainKind, ViewMode, World, MULTI_TURN_GAME_SEC_PER_FRAME, REMAPPABLE_TERRAINS,
-    TREE_VARIANT_GLYPHS,
+    brightness_at, dawns_elapsed, ChunkCoord, FastTravelStep, GroundCover, Position, TerrainKind,
+    ViewMode, World, MULTI_TURN_GAME_SEC_PER_FRAME, REMAPPABLE_TERRAINS,
 };
 
 const WORLD_W: u32 = 40;
 const WORLD_H: u32 = 30;
+/// Sprite-browser grid window (cells), inside the 40×30 viewport with
+/// room for header + footer chrome. Sheets larger than this scroll.
+const SPRITE_BROWSER_VW: u8 = 36;
+const SPRITE_BROWSER_VH: u8 = 24;
 const META_FILE: &str = "meta.cbor";
 const RUN_FILE: &str = "run.cbor";
 const TARGET_FRAME: Duration = Duration::from_micros(16_667);
@@ -59,11 +63,32 @@ const SLEEP_GUARD: Duration = Duration::from_millis(10);
 const SLEEP_GUARD: Duration = Duration::from_millis(3);
 const TIMING_LOG_INTERVAL: Duration = Duration::from_secs(1);
 
+/// What a rendered cell shows. The world layer draws Mini-Medieval
+/// sprites; UI text/menus/HUD keep the CP437 font (the sprite pack has
+/// no typeface). One unified `Cell` so both share the per-cell diff.
+#[derive(Clone, Copy, PartialEq)]
+enum CellArt {
+    Glyph(u8),
+    Sprite(sprites::Sprite),
+}
+
 #[derive(Clone, Copy, PartialEq)]
 struct Cell {
-    glyph: u8,
+    art: CellArt,
     fg: Color,
     bg: Color,
+}
+
+impl Cell {
+    /// CP437 font cell (UI text, menus, HUD). `fg` tints the glyph.
+    fn glyph(glyph: u8, fg: Color, bg: Color) -> Self {
+        Self { art: CellArt::Glyph(glyph), fg, bg }
+    }
+    /// World sprite cell. `fg` is the multiplicative tint (brightness +
+    /// day/night light); `bg` shows under transparent sprite pixels.
+    fn sprite(sprite: sprites::Sprite, fg: Color, bg: Color) -> Self {
+        Self { art: CellArt::Sprite(sprite), fg, bg }
+    }
 }
 
 /// Start-button pause-menu options. Render order = display order.
@@ -72,7 +97,8 @@ const PAUSE_OPTIONS: &[(PauseAction, &str)] = &[
     (PauseAction::Quit, "Quit to desktop"),
     (PauseAction::ResetSave, "Delete save and reset"),
     (PauseAction::TilesetPicker, "Tileset…"),
-    (PauseAction::TileRemap, "Tile remap…"),
+    (PauseAction::SpriteRemap, "Sprite picker…"),
+    (PauseAction::TileRemap, "Tile remap (CP437 dev)…"),
     (PauseAction::GlyphPalette, "CP437 glyph palette (dev)"),
 ];
 
@@ -82,8 +108,38 @@ enum PauseAction {
     Quit,
     ResetSave,
     TilesetPicker,
+    SpriteRemap,
     TileRemap,
     GlyphPalette,
+}
+
+/// Sprite-picker remap-target list. Tabbed (L/R) like the info hub:
+/// tab 0 = Terrain + tree species, tab 1 = items.
+struct SpriteRemapList {
+    tab: usize,
+    cursor: MenuCursor,
+}
+
+impl SpriteRemapList {
+    const TAB_LABELS: [&'static str; 2] = ["Terrain", "Items"];
+
+    fn targets(&self) -> Vec<sprites::RemapTarget> {
+        match self.tab {
+            0 => sprites::RemapTarget::terrain_tab(),
+            _ => sprites::RemapTarget::item_tab(),
+        }
+    }
+}
+
+/// 2D sprite browser: pick a cell from a sheet to assign to `target`.
+#[derive(Clone, Copy)]
+struct SpriteBrowser {
+    target: sprites::RemapTarget,
+    sheet: usize, // index into sprites::Sheet::ALL
+    col: u8,
+    row: u8,
+    scroll_col: u8,
+    scroll_row: u8,
 }
 
 /// Phase 15 hold-Y radial overlay. Tap-Y (press+release within
@@ -288,8 +344,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let mut atlas = atlases::load(&atlas_registry[atlas_idx])?;
     let mut current_atlas_idx = atlas_idx;
+    // Mini-Medieval sprite sheets for the world layer (decoded lazily).
+    let mut sheets = sprites::SpriteSheets::new();
     let mut terrain_overrides: HashMap<TerrainKind, u8> =
         build_terrain_overrides(&meta.render);
+    // Live sprite overrides from the in-game picker (persists in meta).
+    let mut sprite_overrides = sprites::Overrides::from_save(&meta.render.sprite_overrides);
     let mut framebuf = Surface::new(logical_w, logical_h, PixelFormatEnum::ARGB8888)?;
     let mut present_tex = texture_creator
         .create_texture_streaming(PixelFormatEnum::ARGB8888, logical_w, logical_h)?;
@@ -660,6 +720,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut tileset_picker: Option<MenuCursor> = None;
     let mut tile_remap_list: Option<MenuCursor> = None;
     let mut tile_remap_pick: Option<(usize, u8)> = None;
+    // Sprite picker: a tabbed remap-target list and, when editing a
+    // target, a 2D browser into a sheet. Mutually exclusive.
+    let mut sprite_remap_list: Option<SpriteRemapList> = None;
+    let mut sprite_browser: Option<SpriteBrowser> = None;
 
     // Ranged-targeting cursor. Opened by the `Aim` verb (via
     // `ExecuteOutcome::OpenAim`); A commits the shot, B cancels.
@@ -928,6 +992,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 pause_menu = None;
                                 tile_remap_list = Some(MenuCursor::default());
                             }
+                            PauseAction::SpriteRemap => {
+                                pause_menu = None;
+                                sprite_remap_list = Some(SpriteRemapList {
+                                    tab: 0,
+                                    cursor: MenuCursor::default(),
+                                });
+                            }
                         }
                     }
                     Action::B | Action::Start => {
@@ -1023,6 +1094,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 && tileset_picker.is_none()
                 && tile_remap_list.is_none()
                 && tile_remap_pick.is_none()
+                && sprite_remap_list.is_none()
+                && sprite_browser.is_none()
                 && world.active_action.is_none()
             {
                 overmap_mode = Some(OvermapMode::open(&world, last_overmap_destination));
@@ -1182,6 +1255,138 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Action::Start => pause_menu = Some(MenuCursor::default()),
                     _ => {}
                 }
+                continue;
+            }
+
+            // Sprite browser: 2D grid of a sheet's sprites. dpad moves,
+            // L/R switch sheets, A assigns the highlighted sprite to the
+            // target (persists), X resets the target to its default, B
+            // returns to the remap list. Sits above the list block.
+            if let Some(mut b) = sprite_browser {
+                let (cols, rows) = sprites::Sheet::ALL[b.sheet].grid();
+                match input_action {
+                    Action::Left => b.col = b.col.saturating_sub(1),
+                    Action::Right => b.col = (b.col + 1).min(cols.saturating_sub(1)),
+                    Action::Up => b.row = b.row.saturating_sub(1),
+                    Action::Down => b.row = (b.row + 1).min(rows.saturating_sub(1)),
+                    Action::L => {
+                        b.sheet = (b.sheet + sprites::Sheet::COUNT - 1) % sprites::Sheet::COUNT;
+                        b.col = 0;
+                        b.row = 0;
+                        b.scroll_col = 0;
+                        b.scroll_row = 0;
+                    }
+                    Action::R => {
+                        b.sheet = (b.sheet + 1) % sprites::Sheet::COUNT;
+                        b.col = 0;
+                        b.row = 0;
+                        b.scroll_col = 0;
+                        b.scroll_row = 0;
+                    }
+                    Action::A => {
+                        let sprite =
+                            sprites::Sprite::at(sprites::Sheet::ALL[b.sheet], b.col, b.row);
+                        sprite_overrides.set(b.target, sprite);
+                        meta.render.sprite_overrides = sprite_overrides.to_save();
+                        save_meta_only(&save_dir, &mut meta, &mut prev_meta_header);
+                        prev_cells.fill(None);
+                        sprite_browser = None;
+                        continue;
+                    }
+                    Action::X => {
+                        sprite_overrides.clear(b.target);
+                        meta.render.sprite_overrides = sprite_overrides.to_save();
+                        save_meta_only(&save_dir, &mut meta, &mut prev_meta_header);
+                        prev_cells.fill(None);
+                        sprite_browser = None;
+                        continue;
+                    }
+                    Action::B => {
+                        sprite_browser = None;
+                        continue;
+                    }
+                    Action::Start => {
+                        sprite_browser = None;
+                        sprite_remap_list = None;
+                        pause_menu = Some(MenuCursor::default());
+                        continue;
+                    }
+                    _ => {}
+                }
+                // Keep the cursor inside the visible scroll window.
+                if b.col < b.scroll_col {
+                    b.scroll_col = b.col;
+                } else if b.col >= b.scroll_col + SPRITE_BROWSER_VW {
+                    b.scroll_col = b.col + 1 - SPRITE_BROWSER_VW;
+                }
+                if b.row < b.scroll_row {
+                    b.scroll_row = b.row;
+                } else if b.row >= b.scroll_row + SPRITE_BROWSER_VH {
+                    b.scroll_row = b.row + 1 - SPRITE_BROWSER_VH;
+                }
+                sprite_browser = Some(b);
+                continue;
+            }
+
+            // Sprite remap list: tabbed (L/R) target picker. A opens the
+            // browser for the selected target (starting at its current
+            // sprite); X resets it to default; B closes.
+            if let Some(mut list) = sprite_remap_list {
+                let targets = list.targets();
+                let count = targets.len();
+                let layout = PanelLayout::centered(36, 22);
+                let visible = menu_visible_rows(&layout, 0);
+                match input_action {
+                    Action::L => {
+                        list.tab = (list.tab + SpriteRemapList::TAB_LABELS.len() - 1)
+                            % SpriteRemapList::TAB_LABELS.len();
+                        list.cursor = MenuCursor::default();
+                    }
+                    Action::R => {
+                        list.tab = (list.tab + 1) % SpriteRemapList::TAB_LABELS.len();
+                        list.cursor = MenuCursor::default();
+                    }
+                    Action::Up => list.cursor.move_by(-1, count, visible),
+                    Action::Down => list.cursor.move_by(1, count, visible),
+                    Action::A => {
+                        if let Some(&target) = targets.get(list.cursor.selected) {
+                            let cur = sprite_overrides.resolve(target);
+                            let sheet_idx = sprites::Sheet::ALL
+                                .iter()
+                                .position(|&s| s == cur.sheet)
+                                .unwrap_or(0);
+                            sprite_browser = Some(SpriteBrowser {
+                                target,
+                                sheet: sheet_idx,
+                                col: cur.col,
+                                row: cur.row,
+                                scroll_col: cur.col.saturating_sub(2),
+                                scroll_row: cur.row.saturating_sub(2),
+                            });
+                        }
+                        sprite_remap_list = Some(list);
+                        continue;
+                    }
+                    Action::X => {
+                        if let Some(&target) = targets.get(list.cursor.selected) {
+                            sprite_overrides.clear(target);
+                            meta.render.sprite_overrides = sprite_overrides.to_save();
+                            save_meta_only(&save_dir, &mut meta, &mut prev_meta_header);
+                            prev_cells.fill(None);
+                        }
+                    }
+                    Action::B => {
+                        sprite_remap_list = None;
+                        continue;
+                    }
+                    Action::Start => {
+                        sprite_remap_list = None;
+                        pause_menu = Some(MenuCursor::default());
+                        continue;
+                    }
+                    _ => {}
+                }
+                sprite_remap_list = Some(list);
                 continue;
             }
 
@@ -1612,6 +1817,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &palette,
             );
         }
+        // Sprite picker: list under, browser (when open) on top.
+        if let Some(ref list) = sprite_remap_list {
+            draw_sprite_remap_list(&mut ui_cells, list, &sprite_overrides, &palette);
+        }
+        if let Some(ref b) = sprite_browser {
+            draw_sprite_browser(&mut ui_cells, b, &palette);
+        }
         if radial_open {
             draw_radial_menu(&mut ui_cells, &world, &palette);
         }
@@ -1640,16 +1852,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for vx in 0..WORLD_W as i32 {
                 let wx = cam_x + vx as i64;
                 let wy = cam_y + vy as i64;
-                // Base terrain glyph via TerrainDef (one source of truth
-                // for glyph + fg + bg per kind; see world.rs).
+                // Base terrain sprite. Mini-Medieval art is pre-colored, so
+                // per-cell color now lives in the bg (ground tint / gradient /
+                // seasonal cover) that shows under transparent sprite pixels;
+                // brightness rides a white tint multiplied onto the sprite.
                 let terrain = world.tile_at(wx, wy);
                 let terrain_def = terrain.def();
-                let mut glyph = terrain_def.glyph;
-                if terrain.is_wall_like() {
-                    glyph = wall_connector_glyph(&world, wx, wy, terrain);
-                } else if let Some(&g) = terrain_overrides.get(&terrain) {
-                    glyph = g;
-                }
+                let mut sprite = sprite_overrides.terrain(terrain);
                 // Per-cell color gradient for walkable terrain: small
                 // hash-driven RGB offset on fg+bg so the floor reads as
                 // organic texture rather than a flat region. Unwalkable
@@ -1657,14 +1866,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // pierces the floor as a visual landmark.
                 let apply_gradient =
                     matches!(terrain, TerrainKind::Grass | TerrainKind::BareDirt | TerrainKind::SandShore);
-                let base_fg = terrain_def.fg(season);
                 let base_bg = terrain_def.bg(season);
-                let (fg_arr, bg_arr) = if apply_gradient {
-                    floor_with_gradient(base_fg, base_bg, wx as i32, wy as i32, world.seed)
+                let bg_arr = if apply_gradient {
+                    floor_with_gradient(terrain_def.fg(season), base_bg, wx as i32, wy as i32, world.seed).1
                 } else {
-                    (base_fg, base_bg)
+                    base_bg
                 };
-                let mut fg = Color::RGB(fg_arr[0], fg_arr[1], fg_arr[2]);
                 // Ground-cover lerps: stored variants paint over the
                 // seasonal terrain bg. Snow is render-time-only based on
                 // (Winter && terrain.is_outdoor()) and lerps on top of
@@ -1697,35 +1904,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     bg_arr
                 };
                 let bg = Color::RGB(bg_arr[0], bg_arr[1], bg_arr[2]);
-                // Sparse grass tufts: hash-driven so ~25% of grass
-                // cells show the 0x9C tuft sprite; the rest render as
-                // blank background. Deterministic across reloads via
-                // world.seed.
-                if terrain == TerrainKind::Grass
-                    && !grass_dot_visible(wx as i32, wy as i32, world.seed)
-                {
-                    glyph = b' ';
-                }
-                // Tree rendering: glyph + tint by species + season. The
-                // per-cell `cell.tree_species` (set by chunkgen) picks
-                // the species glyph; the per-species canopy_fg table
-                // picks the seasonal tint. Cells with no species (only
-                // hit if a save predates Phase C) fall back to the
-                // per-cell hash + species-agnostic TREE_VARIANT_GLYPHS
-                // catalog for visual variety.
-                if terrain == TerrainKind::TreeTrunk {
-                    let species = world.cell_at(wx, wy).and_then(|c| c.tree_species);
-                    match species {
-                        Some(sp) => {
-                            glyph = sp.canopy_glyph();
-                            let t = sp.canopy_fg(season);
-                            fg = Color::RGB(t[0], t[1], t[2]);
-                        }
-                        None => {
-                            let gi = tree_variant_index(wx as i32, wy as i32, world.seed);
-                            glyph = TREE_VARIANT_GLYPHS[gi % TREE_VARIANT_GLYPHS.len()];
-                        }
-                    }
+                // Multi-cell tree footprint: draw this cell's own 8×8
+                // slice of the species' 2×2 / 4×4 tree block. Footprints
+                // never overlap, so this stays a per-cell pick — no
+                // multi-cell blit, no z-order. Legacy TerrainKind::TreeTrunk
+                // cells (e.g. regrown saplings) keep their terrain sprite
+                // picked above.
+                if let Some(canopy) = world.cell_at(wx, wy).and_then(|c| c.canopy) {
+                    let base = sprites::tree_base(canopy.species, canopy.size);
+                    sprite = sprites::Sprite::at(
+                        base.sheet,
+                        base.col + canopy.sub_col,
+                        base.row + canopy.sub_row,
+                    );
                 }
                 let cell_state = world.cell_at(wx, wy);
                 let visible = cell_state.map(|c| c.visible).unwrap_or(false);
@@ -1743,45 +1934,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .map(|c| c.decoration)
                         .unwrap_or(flora::Decoration::None);
                     if !matches!(decoration, flora::Decoration::None) {
-                        glyph = decoration.glyph();
-                        let [r, gn, b] = decoration.fg(season);
-                        fg = Color::RGB(r, gn, b);
+                        sprite = sprites::decoration_sprite(&decoration);
                     }
                     if let Some(top) = cell_state.and_then(|c| c.items.last()) {
-                        // Lit fires override the kind's default glyph so
-                        // a lit-firewood reads as fire (orange '*') rather
-                        // than a wood pile ('=' brown).
-                        let (g, [r, gn, b]) = match top.metadata {
-                            items::ItemMetadata::Lit { .. } => (b'*', [230, 140, 60]),
-                            _ => top.kind.glyph_color(),
-                        };
-                        glyph = g;
-                        // Blendable items mix their fg ~45% toward the
-                        // (per-cell-gradiented) terrain fg, so twigs /
-                        // grass / moss / mud read as part of the floor
-                        // texture. Stones / firewood / herbs / tools
-                        // stay full-saturation and pierce the floor.
-                        let is_blendable =
-                            !matches!(top.metadata, items::ItemMetadata::Lit { .. })
-                                && top.kind.def().blends_with_terrain;
-                        fg = if is_blendable {
-                            blend_to_terrain([r, gn, b], fg_arr, 0.45)
-                        } else {
-                            Color::RGB(r, gn, b)
+                        // Lit fires read as fire rather than their item sprite.
+                        sprite = match top.metadata {
+                            items::ItemMetadata::Lit { .. } => sprites::misc::FIRE,
+                            _ => sprite_overrides.item(top.kind),
                         };
                     }
-                    // Non-player entities (bandits etc.) render above
-                    // ground items but below the player @ — so a bandit
-                    // standing on a dropped spear shows the bandit, but
-                    // if the player and a bandit ever overlap (death
-                    // tile) the @ wins.
-                    if let Some((g, ec)) = world::entity_glyph_at(&world, wx as i32, wy as i32) {
-                        glyph = g;
-                        fg = Color::RGB(ec[0], ec[1], ec[2]);
+                    // Non-player entities (bandits etc.) render above ground
+                    // items but below the player — overlap resolves to @.
+                    if world::entity_glyph_at(&world, wx as i32, wy as i32).is_some() {
+                        sprite = sprites::units::BANDIT_YEOMAN;
                     }
                     if wx == pwx && wy == pwy {
-                        glyph = b'@';
-                        fg = palette.player_fg;
+                        sprite = sprites::units::PLAYER;
                     }
                 }
 
@@ -1817,20 +1985,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 let effective_brightness =
                     (cell_brightness + light * LIGHT_BRIGHTNESS_BOOST_MAX).min(1.0);
-                let mut fg = tint_color(fg, effective_brightness);
+                let mut sprite_tint = tint_color(Color::RGB(255, 255, 255), effective_brightness);
                 let mut bg = tint_color(bg, effective_brightness);
                 if light > 0.0 {
                     let mix = light * LIGHT_TINT_MIX_MAX;
-                    fg = blend_to_terrain(LIGHT_TINT, [fg.r, fg.g, fg.b], mix);
+                    sprite_tint = blend_to_terrain(
+                        LIGHT_TINT,
+                        [sprite_tint.r, sprite_tint.g, sprite_tint.b],
+                        mix,
+                    );
                     bg = blend_to_terrain(LIGHT_TINT, [bg.r, bg.g, bg.b], mix);
                 }
-                let mut cell = Cell { glyph, fg, bg };
+                let mut cell = Cell::sprite(sprite, sprite_tint, bg);
                 let i = (vy as u32 * WORLD_W + vx as u32) as usize;
                 if let Some(ui_cell) = ui_cells[i] {
                     cell = ui_cell;
                 }
                 if prev_cells[i] != Some(cell) {
-                    draw_glyph(&mut framebuf, &mut atlas, vx, vy, cell.glyph, cell.fg, cell.bg);
+                    match cell.art {
+                        CellArt::Glyph(g) => {
+                            draw_glyph(&mut framebuf, &mut atlas, vx, vy, g, cell.fg, cell.bg);
+                        }
+                        CellArt::Sprite(s) => {
+                            if let Ok(sheet) = sheets.get(s.sheet) {
+                                draw_sprite(
+                                    &mut framebuf,
+                                    sheet,
+                                    vx,
+                                    vy,
+                                    s.src_rect(),
+                                    cell.fg,
+                                    cell.bg,
+                                );
+                            }
+                        }
+                    }
                     prev_cells[i] = Some(cell);
                     changed_cells += 1;
                     dirty_min_x = dirty_min_x.min(vx);
@@ -2239,11 +2428,7 @@ fn build_ui_cells(
             &mut cells,
             x,
             1,
-            Cell {
-                glyph: *glyph,
-                fg: *sym_fg,
-                bg: palette.hud_bg,
-            },
+            Cell::glyph(*glyph, *sym_fg, palette.hud_bg),
         );
         x += 1;
         let s = value.to_string();
@@ -2372,7 +2557,10 @@ fn has_deciduous_neighbor(world: &World, wx: i64, wy: i64) -> bool {
                 continue;
             }
             if let Some(cell) = world.cell_at(wx + dx, wy + dy) {
-                if cell.terrain == TerrainKind::TreeTrunk {
+                // Any tree footprint cell counts (canopy implies a
+                // species). Trees keep Grass terrain now, so test canopy,
+                // not TerrainKind::TreeTrunk.
+                if cell.canopy.is_some() {
                     if let Some(sp) = cell.tree_species {
                         if sp.is_deciduous() {
                             return true;
@@ -2408,33 +2596,6 @@ fn blend_to_terrain(item_rgb: [u8; 3], terrain_fg: [u8; 3], mix: f32) -> Color {
     Color::RGB(r, g, b)
 }
 
-/// Index into `TREE_VARIANT_GLYPHS` for a given cell. Deterministic
-/// per `(x, y, world.seed)` so the same cell always shows the same
-/// tree silhouette. Differs from the grass-dot hash via different
-/// mixer constants so neighboring cells don't visually correlate.
-fn tree_variant_index(x: i32, y: i32, seed: u64) -> usize {
-    let h = (x as i64)
-        .wrapping_mul(467_213)
-        .wrapping_add((y as i64).wrapping_mul(2_654_435_761))
-        .wrapping_add(seed as i64);
-    let mixed = (h as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    (mixed >> 28) as usize
-}
-
-/// Returns true for ~25% of grass cells, deterministically per
-/// `(x, y, world.seed)`. Used by the render loop to render a sparse
-/// pattern of tufts across grass rather than a wall of glyphs.
-fn grass_dot_visible(x: i32, y: i32, seed: u64) -> bool {
-    // Mixing constants: Knuth's multiplicative hash + two large primes
-    // for spatial decorrelation, then a final golden-ratio shuffle so
-    // adjacent cells don't show banding.
-    let h = (x as i64)
-        .wrapping_mul(73_856_093)
-        .wrapping_add((y as i64).wrapping_mul(19_349_663))
-        .wrapping_add(seed as i64);
-    let mixed = (h as u64).wrapping_mul(2_654_435_761);
-    (mixed >> 24) % 100 < 25
-}
 
 /// Bottom-left "what's underfoot" line. Reads the player's current
 /// cell's `items` and prints a comma-separated list (with stack counts
@@ -2499,7 +2660,7 @@ fn draw_target_cursor(
         // bg is at that index.
         let idx = (vy as u32 * WORLD_W + vx as u32) as usize;
         let bg = cells[idx].map(|c| c.bg).unwrap_or(palette.hud_bg);
-        cells[idx] = Some(Cell { glyph: b'+', fg: cursor_fg, bg });
+        cells[idx] = Some(Cell::glyph(b'+', cursor_fg, bg));
     }
     // HUD line above the here-line: "Aim: chest  hit 65%  rng 4/10".
     let player_pos = world.player_pos();
@@ -2679,11 +2840,7 @@ fn draw_menu_row(
         cells,
         layout.inner_x(),
         row_y,
-        Cell {
-            glyph: cursor,
-            fg: palette.panel_title_fg,
-            bg: palette.panel_bg,
-        },
+        Cell::glyph(cursor, palette.panel_title_fg, palette.panel_bg),
     );
     put_text(
         cells,
@@ -2744,6 +2901,7 @@ struct MenuRow<'a> {
     label_fg: Color,
     right: Option<(&'a str, Color)>,
     prefix_glyph: Option<(u8, Color)>,
+    prefix_sprite: Option<sprites::Sprite>,
 }
 
 impl<'a> MenuRow<'a> {
@@ -2753,6 +2911,7 @@ impl<'a> MenuRow<'a> {
             label_fg,
             right: None,
             prefix_glyph: None,
+            prefix_sprite: None,
         }
     }
     fn with_right(mut self, right: &'a str, fg: Color) -> Self {
@@ -2761,6 +2920,12 @@ impl<'a> MenuRow<'a> {
     }
     fn with_prefix_glyph(mut self, glyph: u8, fg: Color) -> Self {
         self.prefix_glyph = Some((glyph, fg));
+        self
+    }
+    /// One-cell live sprite preview before the label (sprite picker).
+    /// Takes priority over `prefix_glyph` in `draw_menu_list`.
+    fn with_prefix_sprite(mut self, sprite: sprites::Sprite) -> Self {
+        self.prefix_sprite = Some(sprite);
         self
     }
 }
@@ -2802,24 +2967,25 @@ fn draw_menu_list(
             cells,
             layout.inner_x(),
             row_y,
-            Cell {
-                glyph: cur_glyph,
-                fg: palette.panel_title_fg,
-                bg: palette.panel_bg,
-            },
+            Cell::glyph(cur_glyph, palette.panel_title_fg, palette.panel_bg),
         );
 
-        // Optional one-cell glyph preview between cursor and label.
-        let label_x = if let Some((glyph, fg)) = row.prefix_glyph {
+        // Optional one-cell preview between cursor and label. A live
+        // sprite preview wins over the CP437 glyph preview.
+        let label_x = if let Some(sprite) = row.prefix_sprite {
             put_cell(
                 cells,
                 layout.inner_x() + 2,
                 row_y,
-                Cell {
-                    glyph,
-                    fg,
-                    bg: palette.panel_bg,
-                },
+                Cell::sprite(sprite, Color::RGB(255, 255, 255), palette.panel_bg),
+            );
+            layout.inner_x() + 4
+        } else if let Some((glyph, fg)) = row.prefix_glyph {
+            put_cell(
+                cells,
+                layout.inner_x() + 2,
+                row_y,
+                Cell::glyph(glyph, fg, palette.panel_bg),
             );
             layout.inner_x() + 4
         } else {
@@ -2848,11 +3014,7 @@ fn draw_menu_list(
             cells,
             layout.inner_right(),
             layout.first_row_y(),
-            Cell {
-                glyph: b'^',
-                fg: palette.panel_dim_fg,
-                bg: palette.panel_bg,
-            },
+            Cell::glyph(b'^', palette.panel_dim_fg, palette.panel_bg),
         );
     }
     if cursor.scroll + visible < total {
@@ -2860,11 +3022,7 @@ fn draw_menu_list(
             cells,
             layout.inner_right(),
             layout.first_row_y() + visible as i32 - 1,
-            Cell {
-                glyph: b'v',
-                fg: palette.panel_dim_fg,
-                bg: palette.panel_bg,
-            },
+            Cell::glyph(b'v', palette.panel_dim_fg, palette.panel_bg),
         );
     }
 }
@@ -2987,7 +3145,7 @@ fn draw_glyph_grid(
                 cells,
                 grid_x + col as i32,
                 grid_y + row as i32,
-                Cell { glyph: byte, fg, bg },
+                Cell::glyph(byte, fg, bg),
             );
         }
     }
@@ -3119,6 +3277,133 @@ fn draw_tile_remap_glyph_picker(
         "A: pick  X: reset  B: cancel",
         palette,
     );
+}
+
+/// Sprite-picker remap list — tabbed (Terrain | Items) target picker.
+/// Each row shows the target's current sprite preview, its name, and a
+/// right-status of `sheet col,row` (custom) or `default`.
+fn draw_sprite_remap_list(
+    cells: &mut [Option<Cell>],
+    list: &SpriteRemapList,
+    overrides: &sprites::Overrides,
+    palette: &Palette,
+) {
+    let layout = PanelLayout::centered(36, 22);
+    draw_panel_frame(cells, &layout, "", "L/R: tab  A: pick  X: reset  B: close", palette);
+
+    // Tab strip on the title row (mirrors the info hub).
+    let mut x = layout.inner_x();
+    for (i, label) in SpriteRemapList::TAB_LABELS.iter().enumerate() {
+        let fg = if i == list.tab {
+            palette.panel_title_fg
+        } else {
+            palette.panel_dim_fg
+        };
+        put_text(cells, x, layout.title_y(), label, fg, palette.panel_bg);
+        x += label.len() as i32;
+        if i + 1 < SpriteRemapList::TAB_LABELS.len() {
+            put_text(cells, x, layout.title_y(), " | ", palette.panel_dim_fg, palette.panel_bg);
+            x += 3;
+        }
+    }
+
+    let targets = list.targets();
+    // Owned status strings so the MenuRow refs can borrow them.
+    let statuses: Vec<(String, Color, sprites::Sprite)> = targets
+        .iter()
+        .map(|&t| {
+            let sprite = overrides.resolve(t);
+            let custom = overrides.get(t).is_some();
+            let text = if custom {
+                format!("{} {},{}", sprite.sheet.name(), sprite.col, sprite.row)
+            } else {
+                "default".to_string()
+            };
+            let fg = if custom {
+                palette.panel_title_fg
+            } else {
+                palette.panel_dim_fg
+            };
+            (text, fg, sprite)
+        })
+        .collect();
+
+    let rows: Vec<MenuRow<'_>> = targets
+        .iter()
+        .zip(statuses.iter())
+        .map(|(&t, (text, fg, sprite))| {
+            MenuRow::new(t.name(), palette.panel_fg)
+                .with_prefix_sprite(*sprite)
+                .with_right(text, *fg)
+        })
+        .collect();
+    draw_menu_list(cells, &layout, palette, &rows, &list.cursor, 0);
+}
+
+/// Sprite browser — full-screen scrollable grid of one sheet's 8×8
+/// sprites (rendered at the real 16px cell size). The cursor cell gets a
+/// bright bg plus gutter guides so it's locatable even over opaque
+/// tiles; the header shows `(col,row)` and the assignment target.
+fn draw_sprite_browser(cells: &mut [Option<Cell>], b: &SpriteBrowser, palette: &Palette) {
+    const X0: i32 = 2;
+    const Y0: i32 = 3;
+    let sheet = sprites::Sheet::ALL[b.sheet];
+    let (cols, rows) = sheet.grid();
+
+    // Dark backdrop over the whole viewport (modal).
+    for y in 0..WORLD_H as i32 {
+        for x in 0..WORLD_W as i32 {
+            put_cell(cells, x, y, Cell::glyph(b' ', palette.panel_fg, palette.panel_bg));
+        }
+    }
+
+    let header = format!(
+        "{}  {}x{}   cur ({},{})  ->  {}",
+        sheet.name(),
+        cols,
+        rows,
+        b.col,
+        b.row,
+        b.target.name()
+    );
+    put_text(cells, 1, 0, &header, palette.panel_title_fg, palette.panel_bg);
+    put_text(
+        cells,
+        1,
+        1,
+        "dpad move   L/R sheet   A assign   X reset   B back",
+        palette.panel_dim_fg,
+        palette.panel_bg,
+    );
+
+    let dark = Color::RGB(28, 28, 36);
+    let cursor_bg = Color::RGB(250, 220, 70);
+    for vy in 0..SPRITE_BROWSER_VH {
+        let r = b.scroll_row + vy;
+        if r >= rows {
+            break;
+        }
+        for vx in 0..SPRITE_BROWSER_VW {
+            let c = b.scroll_col + vx;
+            if c >= cols {
+                continue;
+            }
+            let is_cursor = c == b.col && r == b.row;
+            let bg = if is_cursor { cursor_bg } else { dark };
+            put_cell(
+                cells,
+                X0 + vx as i32,
+                Y0 + vy as i32,
+                Cell::sprite(sprites::Sprite::at(sheet, c, r), Color::RGB(255, 255, 255), bg),
+            );
+        }
+    }
+
+    // Gutter guides — visible even when the cursor sprite is opaque.
+    let gy = Y0 + (b.row - b.scroll_row) as i32;
+    put_cell(cells, 0, gy, Cell::glyph(b'>', cursor_bg, palette.panel_bg));
+    let gx = X0 + (b.col - b.scroll_col) as i32;
+    put_cell(cells, gx, 2, Cell::glyph(b'v', cursor_bg, palette.panel_bg));
 }
 
 // ---- Info hub (Select-button tabbed overlay) -------------------------
@@ -3589,11 +3874,7 @@ fn draw_multi_turn_banner(
             cells,
             layout.inner_x() + i,
             body_y,
-            Cell {
-                glyph,
-                fg: palette.panel_fg,
-                bg: palette.panel_bg,
-            },
+            Cell::glyph(glyph, palette.panel_fg, palette.panel_bg),
         );
     }
     let remaining_m = total_remaining / 60;
@@ -3697,7 +3978,7 @@ fn draw_panel(
             } else {
                 b' '
             };
-            put_cell(cells, px, py, Cell { glyph, fg, bg });
+            put_cell(cells, px, py, Cell::glyph(glyph, fg, bg));
         }
     }
 }
@@ -3713,7 +3994,7 @@ fn tint_color(c: Color, t: f32) -> Color {
 
 fn put_text(cells: &mut [Option<Cell>], x: i32, y: i32, text: &str, fg: Color, bg: Color) {
     for (i, b) in text.bytes().enumerate() {
-        put_cell(cells, x + i as i32, y, Cell { glyph: b, fg, bg });
+        put_cell(cells, x + i as i32, y, Cell::glyph(b, fg, bg));
     }
 }
 
@@ -3821,11 +4102,7 @@ fn draw_overmap(
                 cells,
                 vx,
                 vy,
-                Cell {
-                    glyph,
-                    fg,
-                    bg: palette.panel_bg,
-                },
+                Cell::glyph(glyph, fg, palette.panel_bg),
             );
         }
     }
@@ -3859,11 +4136,7 @@ fn draw_overmap(
             cells,
             x,
             info_y,
-            Cell {
-                glyph: b' ',
-                fg: palette.panel_fg,
-                bg: palette.panel_bg,
-            },
+            Cell::glyph(b' ', palette.panel_fg, palette.panel_bg),
         );
     }
     put_text(cells, 1, info_y, &line, palette.panel_fg, palette.panel_bg);
@@ -4037,11 +4310,7 @@ fn draw_fast_travel_banner(
             cells,
             x,
             0,
-            Cell {
-                glyph: b' ',
-                fg: palette.panel_fg,
-                bg: palette.panel_bg,
-            },
+            Cell::glyph(b' ', palette.panel_fg, palette.panel_bg),
         );
     }
     let max_w = WORLD_W as i32 - 2;

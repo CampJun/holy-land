@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::action::ActionId;
 use crate::calendar::{self, Season};
-use crate::flora::{Decoration, TreeSpecies};
+use crate::flora::{Canopy, Decoration, TreeSpecies};
 use crate::items::{starting_pack, ItemInstance, ItemKind, ItemMetadata, Pack};
 use crate::needs::{Needs, NeedsEnv};
 use crate::skill::{Rng, Skills};
@@ -323,6 +323,9 @@ pub enum GroundCover {
 /// forest has visual variety. 0xB5 / 0xC6 are the dead-tree sprites
 /// available for future TerrainKind::DeadTree (chopped stumps,
 /// burnt-out groves) — see assets/CP437_MAP.md.
+/// Retained: world rendering moved to `sprites::tree_sprite`; kept as the
+/// CP437 catalog for the dev tile tooling / fallback.
+#[allow(dead_code)]
 pub const TREE_VARIANT_GLYPHS: &[u8] = &[0x05, 0x06, 0x17, 0x18];
 
 /// Canonical iteration order for `TerrainKind::from_save_key`. Keep in
@@ -374,6 +377,9 @@ impl TerrainKind {
     /// `wall_connector_glyph`. Excludes `Wall` (the OOB sentinel).
     /// TODO: add future `Door` / `Gate` kinds here so wall runs stitch
     /// across openings.
+    /// Retained for the deferred sprite wall auto-tiler (and tested);
+    /// the sprite render path currently draws solid wall blocks.
+    #[allow(dead_code)]
     pub fn is_wall_like(self) -> bool {
         matches!(self, TerrainKind::StoneWall | TerrainKind::WoodWall)
     }
@@ -570,6 +576,10 @@ impl TerrainKind {
 /// renders connected (the perimeter cell picks its thick stub or T,
 /// the house cell picks its thin stub or T). Isolated cell (no wall
 /// neighbors) renders as a vertical pillar.
+/// Retained for the deferred sprite wall auto-tiler (and exercised by
+/// tests); the sprite render path currently draws solid wall blocks via
+/// `sprites::walls`.
+#[allow(dead_code)]
 pub fn wall_connector_glyph(world: &World, wx: i64, wy: i64, kind: TerrainKind) -> u8 {
     let n = world.tile_at(wx, wy - 1).is_wall_like();
     let s = world.tile_at(wx, wy + 1).is_wall_like();
@@ -639,10 +649,16 @@ pub struct CellState {
     /// and never lands here. Chunkgen places LeafLitter; the Phase-D
     /// lifecycle scheduler manages FallenLeaves spawn/clear.
     pub ground_cover: GroundCover,
-    /// Tree species when `terrain == TreeTrunk`. None elsewhere. Drives
-    /// per-cell canopy tint (Phase C replaces the species-agnostic
-    /// TREE_TINT_VARIANTS lottery) and mast drops in Phase D.
+    /// Tree species when this cell is part of a tree footprint (i.e.
+    /// `canopy.is_some()`). None elsewhere. Drives per-species seasonal
+    /// tint, the deciduous/leaf-litter hooks, and mast drops. Always
+    /// written together with `canopy` so the two never diverge.
     pub tree_species: Option<TreeSpecies>,
+    /// Multi-cell tree footprint slice occupying this cell, if any. The
+    /// render path draws the sub-tile; collision blocks only `is_trunk`
+    /// cells; line of sight is blocked by any canopy cell. None = no
+    /// tree here. See `flora::Canopy`.
+    pub canopy: Option<Canopy>,
     /// Undergrowth overlay (Fern/Moss/Bramble/Bracken/Gorse/Sapling/
     /// Mushroom). Gorse blocks pass + LOS; the others pass through.
     pub decoration: Decoration,
@@ -658,6 +674,7 @@ impl CellState {
             light_intensity: 0,
             ground_cover: GroundCover::None,
             tree_species: None,
+            canopy: None,
             decoration: Decoration::None,
         }
     }
@@ -1887,27 +1904,33 @@ impl World {
 
     /// True if the cell at `(wx, wy)` is walkable: terrain must be
     /// walkable AND any decoration must not block pass (Gorse stops
-    /// movement). Unloaded / OOB cells are not walkable.
+    /// movement) AND any tree footprint cell here must not be a trunk
+    /// (upper canopy cells are walkable — you slip under the boughs).
+    /// Unloaded / OOB cells are not walkable.
     pub fn cell_walkable_at(&self, wx: i64, wy: i64) -> bool {
         let terrain_ok = self.tile_at(wx, wy).def().walkable;
         if !terrain_ok {
             return false;
         }
         match self.cell_at(wx, wy) {
-            Some(c) => !c.decoration.blocks_pass(),
+            Some(c) => {
+                !c.decoration.blocks_pass()
+                    && !c.canopy.map_or(false, |canopy| canopy.blocks_pass())
+            }
             None => false,
         }
     }
 
-    /// True if the cell at `(wx, wy)` blocks line of sight: either
-    /// the terrain blocks sight OR a decoration there blocks (Gorse).
-    /// Unloaded / OOB cells block sight by default.
+    /// True if the cell at `(wx, wy)` blocks line of sight: the terrain
+    /// blocks sight OR a decoration there blocks (Gorse) OR a tree
+    /// footprint cell is present (any canopy cell breaks LOS). Unloaded
+    /// / OOB cells block sight by default.
     pub fn cell_blocks_sight_at(&self, wx: i64, wy: i64) -> bool {
         if self.tile_at(wx, wy).def().blocks_sight {
             return true;
         }
         match self.cell_at(wx, wy) {
-            Some(c) => c.decoration.blocks_sight(),
+            Some(c) => c.decoration.blocks_sight() || c.canopy.is_some(),
             None => true,
         }
     }
@@ -1973,7 +1996,16 @@ impl World {
         }
         for (&(x, y), &species) in self.tree_species_mutations.iter() {
             if let Some((lx, ly)) = local(x, y) {
-                chunk.cells[(ly * CHUNK_W + lx) as usize].tree_species = species;
+                let cell = &mut chunk.cells[(ly * CHUNK_W + lx) as usize];
+                cell.tree_species = species;
+                // Invariant: a canopy slice must have a species. A
+                // chopped/cleared cell records `None` here; clearing the
+                // regenerated canopy keeps felled trees felled across a
+                // reload (and reuses this path for legacy v3 chops, which
+                // recorded only `terrain` + `tree_species` mutations).
+                if species.is_none() {
+                    cell.canopy = None;
+                }
             }
         }
         for (&(x, y), &dec) in self.decoration_mutations.iter() {
@@ -3192,6 +3224,33 @@ impl World {
             .insert((wx as i32, wy as i32), species);
     }
 
+    /// Fell the whole tree that occupies `(wx, wy)`: clear the canopy on
+    /// every cell of its footprint and record each as a `tree_species =
+    /// None` mutation so the removal survives a reload (chunkgen
+    /// re-stamps the deterministic tree, then the canopy invariant
+    /// re-clears it). No-op if the cell isn't part of a multi-cell tree
+    /// (e.g. a legacy `TerrainKind::TreeTrunk` cell, which the caller
+    /// fells via `set_terrain_at` instead). The caller still handles the
+    /// stump/sapling/firewood at the chopped cell.
+    pub fn fell_tree_at(&mut self, wx: i64, wy: i64) {
+        let Some(canopy) = self.cell_at(wx, wy).and_then(|c| c.canopy) else {
+            return;
+        };
+        let size = canopy.size.cells() as i64;
+        let top_left_x = wx - canopy.sub_col as i64;
+        let top_left_y = wy - canopy.sub_row as i64;
+        for dr in 0..size {
+            for dc in 0..size {
+                let fx = top_left_x + dc;
+                let fy = top_left_y + dr;
+                if let Some(cell) = self.cell_at_mut(fx, fy) {
+                    cell.canopy = None;
+                }
+                self.set_tree_species_at(fx, fy, None);
+            }
+        }
+    }
+
     /// Phase D: mutate a cell's decoration and record the change for
     /// save round-trip.
     pub fn set_decoration_at(&mut self, wx: i64, wy: i64, decoration: Decoration) {
@@ -3215,6 +3274,12 @@ impl World {
             self.ensure_chunk_loaded(cc);
             if let Some(cell) = self.cell_at_mut(x as i64, y as i64) {
                 cell.tree_species = s;
+                // Same canopy invariant as `ensure_chunk_loaded`: clearing
+                // the species clears the (already-regenerated) canopy here,
+                // since this runs against an already-loaded chunk.
+                if s.is_none() {
+                    cell.canopy = None;
+                }
             }
             self.tree_species_mutations.insert((x, y), s);
         }
@@ -5723,6 +5788,76 @@ mod tests {
         let cell = world.cell_at(22, 15).expect("cell exists");
         assert_eq!(cell.tree_species, Some(TreeSpecies::Hazel));
         assert!(matches!(cell.decoration, Decoration::None));
+    }
+
+    #[test]
+    fn fell_tree_clears_whole_canopy_footprint() {
+        use crate::flora::{Canopy, TreeSize, TreeSpecies};
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Manually stamp a 2×2 Oak young tree at (5,5)..(6,6): top row
+        // walkable canopy, bottom row trunk.
+        for dr in 0..2u8 {
+            for dc in 0..2u8 {
+                if let Some(c) = world.cell_at_mut((5 + dc) as i64, (5 + dr) as i64) {
+                    c.terrain = TerrainKind::Grass;
+                    c.tree_species = Some(TreeSpecies::Oak);
+                    c.canopy = Some(Canopy {
+                        species: TreeSpecies::Oak,
+                        size: TreeSize::Young,
+                        sub_col: dc,
+                        sub_row: dr,
+                        is_trunk: dr == 1,
+                    });
+                }
+            }
+        }
+        // Upper canopy: walkable but blocks sight. Trunk: blocks pass.
+        assert!(world.cell_walkable_at(5, 5));
+        assert!(world.cell_blocks_sight_at(5, 5));
+        assert!(!world.cell_walkable_at(5, 6));
+        // Fell from the trunk cell — the WHOLE footprint clears.
+        world.fell_tree_at(5, 6);
+        for dr in 0..2i64 {
+            for dc in 0..2i64 {
+                let (x, y) = (5 + dc, 5 + dr);
+                let c = world.cell_at(x, y).unwrap();
+                assert!(c.canopy.is_none(), "({x},{y}) canopy not cleared");
+                assert!(c.tree_species.is_none());
+                assert!(world.cell_walkable_at(x, y));
+                assert!(!world.cell_blocks_sight_at(x, y));
+                // Removal is recorded for save round-trip.
+                assert_eq!(
+                    world.tree_species_mutations.get(&(x as i32, y as i32)),
+                    Some(&None)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn restoring_chopped_species_clears_regenerated_canopy() {
+        use crate::flora::{Canopy, TreeSize, TreeSpecies};
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // Simulate chunkgen having re-stamped a tree at (7,7) on reload.
+        if let Some(c) = world.cell_at_mut(7, 7) {
+            c.tree_species = Some(TreeSpecies::Ash);
+            c.canopy = Some(Canopy {
+                species: TreeSpecies::Ash,
+                size: TreeSize::Young,
+                sub_col: 0,
+                sub_row: 0,
+                is_trunk: false,
+            });
+        }
+        // A saved "chopped" mutation (species None) must clear the
+        // regenerated canopy so felled trees stay felled across a reload.
+        world.restore_tree_species_mutations(vec![(7, 7, None)]);
+        let c = world.cell_at(7, 7).unwrap();
+        assert!(
+            c.canopy.is_none(),
+            "regenerated canopy must clear when a chopped-cell mutation restores"
+        );
+        assert!(c.tree_species.is_none());
     }
 
     #[test]
