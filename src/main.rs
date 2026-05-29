@@ -23,7 +23,6 @@ mod skill;
 mod sprites;
 mod world;
 
-use std::collections::HashMap;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
@@ -39,13 +38,13 @@ use needs::Needs;
 use render::{draw_glyph, draw_sprite, draw_sprite_layered, CELL_SIZE};
 use save::{
     ActionStepSave, ActiveActionSave, CellItemsSave, DecorationMutationSave, MetaSave, NeedsSave,
-    RenderSettings, RunSave, SaveHeader, SkillSave, SkillsSave, StaminaSave, TerrainMutationSave,
-    TerrainOverride, TreeSpeciesMutationSave,
+    RunSave, SaveHeader, SkillSave, SkillsSave, StaminaSave, TerrainMutationSave,
+    TreeSpeciesMutationSave,
 };
 use skill::{Rng, Skill, SkillKind, Skills};
 use world::{
     brightness_at, dawns_elapsed, ChunkCoord, FastTravelStep, GroundCover, Position, TerrainKind,
-    ViewMode, World, MULTI_TURN_GAME_SEC_PER_FRAME, REMAPPABLE_TERRAINS,
+    ViewMode, World, MULTI_TURN_GAME_SEC_PER_FRAME,
 };
 
 const WORLD_W: u32 = 40;
@@ -112,8 +111,6 @@ const PAUSE_OPTIONS: &[(PauseAction, &str)] = &[
     (PauseAction::ResetSave, "Delete save and reset"),
     (PauseAction::TilesetPicker, "Tileset…"),
     (PauseAction::SpriteRemap, "Sprite picker…"),
-    (PauseAction::TileRemap, "Tile remap (CP437 dev)…"),
-    (PauseAction::GlyphPalette, "CP437 glyph palette (dev)"),
 ];
 
 #[derive(Clone, Copy, PartialEq)]
@@ -123,8 +120,6 @@ enum PauseAction {
     ResetSave,
     TilesetPicker,
     SpriteRemap,
-    TileRemap,
-    GlyphPalette,
 }
 
 /// Sprite-picker remap-target list. Tabbed (L/R) like the info hub:
@@ -360,8 +355,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut current_atlas_idx = atlas_idx;
     // Mini-Medieval sprite sheets for the world layer (decoded lazily).
     let mut sheets = sprites::SpriteSheets::new();
-    let mut terrain_overrides: HashMap<TerrainKind, u8> =
-        build_terrain_overrides(&meta.render);
     // Live sprite overrides from the in-game picker (persists in meta).
     let mut sprite_overrides = sprites::Overrides::from_save(&meta.render.sprite_overrides);
     let mut framebuf = Surface::new(logical_w, logical_h, PixelFormatEnum::ARGB8888)?;
@@ -719,21 +712,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // info_menu is closed or the active tab isn't Inventory.
     let mut x_press_at: Option<(Instant, usize)> = None;
 
-    // Dev tool: X-button toggles a CP437 glyph palette overlay so we
-    // can audit which bytes have which sprites in our custom atlas.
-    // Browse with dpad; the header shows the highlighted byte's value
-    // so we can pick replacements for the items.rs / world.rs glyph
-    // fields.
-    let mut glyph_palette: Option<u8> = None;
-
     // Pause-menu sub-screens. `tileset_picker` is a row cursor into
-    // `atlas_registry`; `tile_remap_list` is a row cursor into
-    // REMAPPABLE_TERRAINS; `tile_remap_pick` is `Some((terrain_idx, glyph))`
-    // while the user is choosing a new glyph for that terrain. All
-    // three persist their choices into `meta.render` and back to disk.
+    // `atlas_registry`; it persists its choice into `meta.render` and
+    // back to disk.
     let mut tileset_picker: Option<MenuCursor> = None;
-    let mut tile_remap_list: Option<MenuCursor> = None;
-    let mut tile_remap_pick: Option<(usize, u8)> = None;
     // Sprite picker: a tabbed remap-target list and, when editing a
     // target, a 2D browser into a sheet. Mutually exclusive.
     let mut sprite_remap_list: Option<SpriteRemapList> = None;
@@ -991,20 +973,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 pause_menu = None;
                                 log_info!("[menu] save deleted; in-memory state reset");
                             }
-                            PauseAction::GlyphPalette => {
-                                pause_menu = None;
-                                glyph_palette = Some(0);
-                            }
                             PauseAction::TilesetPicker => {
                                 pause_menu = None;
                                 tileset_picker = Some(MenuCursor {
                                     selected: current_atlas_idx,
                                     scroll: 0,
                                 });
-                            }
-                            PauseAction::TileRemap => {
-                                pause_menu = None;
-                                tile_remap_list = Some(MenuCursor::default());
                             }
                             PauseAction::SpriteRemap => {
                                 pause_menu = None;
@@ -1104,100 +1078,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if input_action == Action::OpenOvermap
                 && command_menu.is_none()
                 && info_menu.is_none()
-                && glyph_palette.is_none()
                 && tileset_picker.is_none()
-                && tile_remap_list.is_none()
-                && tile_remap_pick.is_none()
                 && sprite_remap_list.is_none()
                 && sprite_browser.is_none()
                 && world.active_action.is_none()
             {
                 overmap_mode = Some(OvermapMode::open(&world, last_overmap_destination));
-                continue;
-            }
-
-            // Tile-remap glyph picker: pick which CP437 byte to use
-            // for the currently-being-edited terrain. Reuses the
-            // glyph-palette dpad pattern; A confirms, X resets to
-            // default, B cancels back to the terrain list.
-            if let Some((terrain_idx, cursor)) = tile_remap_pick {
-                match input_action {
-                    Action::Up => {
-                        tile_remap_pick = Some((terrain_idx, cursor.wrapping_sub(16)));
-                    }
-                    Action::Down => {
-                        tile_remap_pick = Some((terrain_idx, cursor.wrapping_add(16)));
-                    }
-                    Action::Left => {
-                        tile_remap_pick = Some((terrain_idx, cursor.wrapping_sub(1)));
-                    }
-                    Action::Right => {
-                        tile_remap_pick = Some((terrain_idx, cursor.wrapping_add(1)));
-                    }
-                    Action::A => {
-                        let kind = REMAPPABLE_TERRAINS[terrain_idx];
-                        set_terrain_override(&mut meta.render, kind, Some(cursor));
-                        terrain_overrides = build_terrain_overrides(&meta.render);
-                        save_meta_only(&save_dir, &mut meta, &mut prev_meta_header);
-                        prev_cells.fill(None);
-                        tile_remap_pick = None;
-                    }
-                    Action::X => {
-                        let kind = REMAPPABLE_TERRAINS[terrain_idx];
-                        set_terrain_override(&mut meta.render, kind, None);
-                        terrain_overrides = build_terrain_overrides(&meta.render);
-                        save_meta_only(&save_dir, &mut meta, &mut prev_meta_header);
-                        prev_cells.fill(None);
-                        tile_remap_pick = None;
-                    }
-                    Action::B => tile_remap_pick = None,
-                    Action::Start => {
-                        tile_remap_pick = None;
-                        tile_remap_list = None;
-                        pause_menu = Some(MenuCursor::default());
-                    }
-                    _ => {}
-                }
-                continue;
-            }
-
-            // Tile-remap terrain list: pick which TerrainKind to edit.
-            // A enters the glyph picker; X resets the highlighted
-            // terrain back to its default glyph; B closes.
-            if let Some(ref mut cursor) = tile_remap_list {
-                let count = REMAPPABLE_TERRAINS.len();
-                let visible = menu_visible_rows(
-                    &PanelLayout::centered(
-                        36,
-                        (REMAPPABLE_TERRAINS.len() as i32 + 6).clamp(8, WORLD_H as i32 - 2),
-                    ),
-                    0,
-                );
-                match input_action {
-                    Action::Up => cursor.move_by(-1, count, visible),
-                    Action::Down => cursor.move_by(1, count, visible),
-                    Action::A => {
-                        let kind = REMAPPABLE_TERRAINS[cursor.selected];
-                        let start = terrain_overrides
-                            .get(&kind)
-                            .copied()
-                            .unwrap_or(kind.def().glyph);
-                        tile_remap_pick = Some((cursor.selected, start));
-                    }
-                    Action::X => {
-                        let kind = REMAPPABLE_TERRAINS[cursor.selected];
-                        set_terrain_override(&mut meta.render, kind, None);
-                        terrain_overrides = build_terrain_overrides(&meta.render);
-                        save_meta_only(&save_dir, &mut meta, &mut prev_meta_header);
-                        prev_cells.fill(None);
-                    }
-                    Action::B => tile_remap_list = None,
-                    Action::Start => {
-                        tile_remap_list = None;
-                        pause_menu = Some(MenuCursor::default());
-                    }
-                    _ => {}
-                }
                 continue;
             }
 
@@ -1257,21 +1143,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
 
-            // Dev glyph-palette overlay (X). Highest non-pause priority
-            // so it overlays whatever else is open.
-            if let Some(cursor) = glyph_palette {
-                match input_action {
-                    Action::Up => glyph_palette = Some(cursor.wrapping_sub(16)),
-                    Action::Down => glyph_palette = Some(cursor.wrapping_add(16)),
-                    Action::Left => glyph_palette = Some(cursor.wrapping_sub(1)),
-                    Action::Right => glyph_palette = Some(cursor.wrapping_add(1)),
-                    Action::B => glyph_palette = None,
-                    Action::Start => pause_menu = Some(MenuCursor::default()),
-                    _ => {}
-                }
-                continue;
-            }
-
             // Sprite browser: 2D grid of a sheet's sprites. dpad moves,
             // L/R switch sheets, A assigns the highlighted sprite to the
             // target (persists), X resets the target to its default, B
@@ -1301,17 +1172,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let sprite =
                             sprites::Sprite::at(sprites::Sheet::ALL[b.sheet], b.col, b.row);
                         sprite_overrides.set(b.target, sprite);
-                        meta.render.sprite_overrides = sprite_overrides.to_save();
-                        save_meta_only(&save_dir, &mut meta, &mut prev_meta_header);
-                        prev_cells.fill(None);
+                        persist_sprite_overrides(
+                            &sprite_overrides,
+                            &mut meta,
+                            &save_dir,
+                            &mut prev_meta_header,
+                            &mut prev_cells,
+                        );
                         sprite_browser = None;
                         continue;
                     }
                     Action::X => {
                         sprite_overrides.clear(b.target);
-                        meta.render.sprite_overrides = sprite_overrides.to_save();
-                        save_meta_only(&save_dir, &mut meta, &mut prev_meta_header);
-                        prev_cells.fill(None);
+                        persist_sprite_overrides(
+                            &sprite_overrides,
+                            &mut meta,
+                            &save_dir,
+                            &mut prev_meta_header,
+                            &mut prev_cells,
+                        );
                         sprite_browser = None;
                         continue;
                     }
@@ -1384,9 +1263,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Action::X => {
                         if let Some(&target) = targets.get(list.cursor.selected) {
                             sprite_overrides.clear(target);
-                            meta.render.sprite_overrides = sprite_overrides.to_save();
-                            save_meta_only(&save_dir, &mut meta, &mut prev_meta_header);
-                            prev_cells.fill(None);
+                            persist_sprite_overrides(
+                                &sprite_overrides,
+                                &mut meta,
+                                &save_dir,
+                                &mut prev_meta_header,
+                                &mut prev_cells,
+                            );
                         }
                     }
                     Action::B => {
@@ -1808,26 +1691,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(state) = info_menu.as_ref() {
             draw_info_menu(&mut ui_cells, &world, state, &palette);
         }
-        if let Some(cursor) = glyph_palette {
-            draw_glyph_palette(&mut ui_cells, cursor, &palette);
-        }
         if let Some(ref cursor) = tileset_picker {
             draw_tileset_picker(
                 &mut ui_cells,
                 &atlas_registry,
                 cursor,
                 current_atlas_idx,
-                &palette,
-            );
-        }
-        if let Some(ref cursor) = tile_remap_list {
-            draw_tile_remap_list(&mut ui_cells, &terrain_overrides, cursor, &palette);
-        }
-        if let Some((terrain_idx, cursor)) = tile_remap_pick {
-            draw_tile_remap_glyph_picker(
-                &mut ui_cells,
-                REMAPPABLE_TERRAINS[terrain_idx],
-                cursor,
                 &palette,
             );
         }
@@ -2957,10 +2826,6 @@ impl<'a> MenuRow<'a> {
         self.right = Some((right, fg));
         self
     }
-    fn with_prefix_glyph(mut self, glyph: u8, fg: Color) -> Self {
-        self.prefix_glyph = Some((glyph, fg));
-        self
-    }
     /// One-cell live sprite preview before the label (sprite picker).
     /// Takes priority over `prefix_glyph` in `draw_menu_list`.
     fn with_prefix_sprite(mut self, sprite: sprites::Sprite) -> Self {
@@ -3079,32 +2944,8 @@ fn pick_atlas_index(registry: &[AtlasEntry], key: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// Resolve `RenderSettings.terrain_overrides` into a fast lookup keyed
-/// by `TerrainKind`. Unknown `kind_key` strings (e.g. a future variant
-/// the save mentions but this build doesn't recognize) are dropped.
-fn build_terrain_overrides(settings: &RenderSettings) -> HashMap<TerrainKind, u8> {
-    settings
-        .terrain_overrides
-        .iter()
-        .filter_map(|o| TerrainKind::from_save_key(&o.kind_key).map(|k| (k, o.glyph)))
-        .collect()
-}
-
-/// Insert / replace / remove a terrain override. `None` clears the
-/// override so the terrain reverts to its `def().glyph` default.
-fn set_terrain_override(settings: &mut RenderSettings, kind: TerrainKind, glyph: Option<u8>) {
-    let key = kind.save_key();
-    settings.terrain_overrides.retain(|o| o.kind_key != key);
-    if let Some(g) = glyph {
-        settings.terrain_overrides.push(TerrainOverride {
-            kind_key: key.to_string(),
-            glyph: g,
-        });
-    }
-}
-
 /// Persist meta.cbor only (no run.cbor write). Used by the tileset /
-/// tile-remap UI so a single setting change doesn't have to drag a
+/// sprite-picker UI so a single setting change doesn't have to drag a
 /// full RunSave roundtrip with it.
 fn save_meta_only(
     save_dir: &std::path::Path,
@@ -3122,72 +2963,19 @@ fn save_meta_only(
     }
 }
 
-/// Dev overlay: render every CP437 byte (0x00–0xFF) in a 16x16 grid so
-/// we can audit what's actually in our custom atlas. The cursor byte
-/// is inverted (bg <-> fg) and shown in the header. Dpad navigates
-/// (wraps); B/X closes.
-fn draw_glyph_palette(cells: &mut [Option<Cell>], cursor: u8, palette: &Palette) {
-    let title = format!(
-        "CP437 0x{:02X} (row {:X}, col {:X})",
-        cursor,
-        cursor >> 4,
-        cursor & 0x0F
-    );
-    draw_glyph_grid(cells, cursor, &title, "dpad: navigate   B: close", palette);
-}
-
-/// Shared 16x16 glyph grid renderer. Used by the dev palette and by the
-/// tile-remap glyph picker (which passes a terrain-specific title and
-/// footer). Layout is identical; only the chrome strings differ.
-fn draw_glyph_grid(
-    cells: &mut [Option<Cell>],
-    cursor: u8,
-    title: &str,
-    footer: &str,
-    palette: &Palette,
+/// Persist the current sprite overrides to meta.cbor and clear the
+/// per-cell diff cache so the new art redraws next frame. Shared tail of
+/// the sprite-picker assign / reset paths.
+fn persist_sprite_overrides(
+    overrides: &sprites::Overrides,
+    meta: &mut MetaSave,
+    save_dir: &std::path::Path,
+    prev_meta_header: &mut SaveHeader,
+    prev_cells: &mut [Option<Cell>],
 ) {
-    let layout = PanelLayout::centered(36, 24);
-    draw_panel_frame(cells, &layout, title, footer, palette);
-
-    let grid_x = layout.inner_x() + 2;
-    let grid_y = layout.first_row_y() + 1;
-
-    for col in 0..16u8 {
-        put_text(
-            cells,
-            grid_x + col as i32,
-            grid_y - 1,
-            &format!("{:X}", col),
-            palette.panel_dim_fg,
-            palette.panel_bg,
-        );
-    }
-
-    for row in 0..16u8 {
-        put_text(
-            cells,
-            layout.inner_x(),
-            grid_y + row as i32,
-            &format!("{:X}", row),
-            palette.panel_dim_fg,
-            palette.panel_bg,
-        );
-        for col in 0..16u8 {
-            let byte = (row << 4) | col;
-            let is_cursor = byte == cursor;
-            let (fg, bg) = if is_cursor {
-                (palette.panel_bg, palette.panel_fg)
-            } else {
-                (palette.panel_fg, palette.panel_bg)
-            };
-            put_cell(
-                cells,
-                grid_x + col as i32,
-                grid_y + row as i32,
-                Cell::glyph(byte, fg, bg),
-            );
-        }
-    }
+    meta.render.sprite_overrides = overrides.to_save();
+    save_meta_only(save_dir, meta, prev_meta_header);
+    prev_cells.fill(None);
 }
 
 /// PR B menu-wrap card: shift `cur` by `delta` within `[0, len)` and
@@ -3239,83 +3027,6 @@ fn draw_tileset_picker(
         })
         .collect();
     draw_menu_list(cells, &layout, palette, &rows, cursor, 0);
-}
-
-/// Tile-remap list: pick which TerrainKind to edit. Each row shows the
-/// terrain's current effective glyph as a preview cell, the human name,
-/// and (in the right column) either the override byte or "default".
-fn draw_tile_remap_list(
-    cells: &mut [Option<Cell>],
-    overrides: &HashMap<TerrainKind, u8>,
-    cursor: &MenuCursor,
-    palette: &Palette,
-) {
-    let h = (REMAPPABLE_TERRAINS.len() as i32 + 6).clamp(8, WORLD_H as i32 - 2);
-    let layout = PanelLayout::centered(36, h);
-    draw_panel_frame(
-        cells,
-        &layout,
-        "Tile remap",
-        "A: edit  X: reset  B: close",
-        palette,
-    );
-
-    // Right-status strings live in their own vec so the MenuRow refs
-    // can borrow them.
-    let rights: Vec<(String, Color, u8, Option<u8>)> = REMAPPABLE_TERRAINS
-        .iter()
-        .map(|kind| {
-            let def = kind.def();
-            let override_glyph = overrides.get(kind).copied();
-            let effective_glyph = override_glyph.unwrap_or(def.glyph);
-            let text = match override_glyph {
-                Some(g) => format!("0x{:02X}", g),
-                None => format!("default 0x{:02X}", def.glyph),
-            };
-            let status_fg = if override_glyph.is_some() {
-                palette.panel_title_fg
-            } else {
-                palette.panel_dim_fg
-            };
-            (text, status_fg, effective_glyph, override_glyph)
-        })
-        .collect();
-
-    let rows: Vec<MenuRow<'_>> = REMAPPABLE_TERRAINS
-        .iter()
-        .zip(rights.iter())
-        .enumerate()
-        .map(|(i, (kind, (text, status_fg, glyph, _override)))| {
-            let is_selected = i == cursor.selected;
-            let label_fg = if is_selected {
-                palette.panel_title_fg
-            } else {
-                palette.panel_fg
-            };
-            MenuRow::new(kind.def().name, label_fg)
-                .with_prefix_glyph(*glyph, palette.panel_fg)
-                .with_right(text, *status_fg)
-        })
-        .collect();
-    draw_menu_list(cells, &layout, palette, &rows, cursor, 0);
-}
-
-/// Glyph picker reused for the tile-remap flow. Same 16x16 grid as the
-/// dev palette but the header names the terrain being edited.
-fn draw_tile_remap_glyph_picker(
-    cells: &mut [Option<Cell>],
-    kind: TerrainKind,
-    cursor: u8,
-    palette: &Palette,
-) {
-    let title = format!("{}  →  0x{:02X}", kind.def().name, cursor);
-    draw_glyph_grid(
-        cells,
-        cursor,
-        &title,
-        "A: pick  X: reset  B: cancel",
-        palette,
-    );
 }
 
 /// Sprite-picker remap list — tabbed (Terrain | Items) target picker.

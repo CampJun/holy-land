@@ -41,6 +41,20 @@ pub fn load_atlas(png_bytes: &[u8]) -> Result<Surface<'static>, String> {
     Ok(atlas)
 }
 
+/// Destination rect for cell `(cx, cy)` in the framebuffer.
+fn cell_to_rect(cx: i32, cy: i32) -> Rect {
+    Rect::new(cx * CELL_SIZE as i32, cy * CELL_SIZE as i32, CELL_SIZE, CELL_SIZE)
+}
+
+/// Apply a multiplicative color+alpha modulation to `surface` before a
+/// blit. RGB tints the silhouette; alpha rides visibility dimming /
+/// day-night light. (Software surface mod — survives Miyoo's renderer,
+/// which no-ops the equivalent *texture* mods.)
+fn tint(surface: &mut Surface, c: Color) {
+    surface.set_color_mod(Color::RGB(c.r, c.g, c.b));
+    surface.set_alpha_mod(c.a);
+}
+
 pub fn draw_glyph(
     framebuf: &mut Surface,
     atlas: &mut Surface,
@@ -50,14 +64,11 @@ pub fn draw_glyph(
     fg: Color,
     bg: Color,
 ) {
-    let px = cx * CELL_SIZE as i32;
-    let py = cy * CELL_SIZE as i32;
-    let dst = Rect::new(px, py, CELL_SIZE, CELL_SIZE);
+    let dst = cell_to_rect(cx, cy);
 
     let _ = framebuf.fill_rect(dst, bg);
 
-    atlas.set_color_mod(Color::RGB(fg.r, fg.g, fg.b));
-    atlas.set_alpha_mod(fg.a);
+    tint(atlas, fg);
 
     let src_x = (glyph as u32 % ATLAS_COLS) * CELL_SIZE;
     let src_y = (glyph as u32 / ATLAS_COLS) * CELL_SIZE;
@@ -78,17 +89,14 @@ pub fn draw_sprite(
     cx: i32,
     cy: i32,
     src: Rect,
-    tint: Color,
+    tint_color: Color,
     bg: Color,
 ) {
-    let px = cx * CELL_SIZE as i32;
-    let py = cy * CELL_SIZE as i32;
-    let dst = Rect::new(px, py, CELL_SIZE, CELL_SIZE);
+    let dst = cell_to_rect(cx, cy);
 
     let _ = framebuf.fill_rect(dst, bg);
 
-    sheet.set_color_mod(Color::RGB(tint.r, tint.g, tint.b));
-    sheet.set_alpha_mod(tint.a);
+    tint(sheet, tint_color);
     let _ = sheet.blit_scaled(src, framebuf, dst);
 }
 
@@ -110,23 +118,19 @@ pub fn draw_sprite_layered(
     overlay_src: Rect,
     cx: i32,
     cy: i32,
-    tint: Color,
+    tint_color: Color,
     bg: Color,
 ) {
-    let px = cx * CELL_SIZE as i32;
-    let py = cy * CELL_SIZE as i32;
-    let dst = Rect::new(px, py, CELL_SIZE, CELL_SIZE);
+    let dst = cell_to_rect(cx, cy);
 
     let _ = framebuf.fill_rect(dst, bg);
 
-    base_sheet.set_color_mod(Color::RGB(tint.r, tint.g, tint.b));
-    base_sheet.set_alpha_mod(tint.a);
+    tint(base_sheet, tint_color);
     let _ = base_sheet.blit_scaled(base_src, framebuf, dst);
 
     match overlay_sheet {
         Some(s) => {
-            s.set_color_mod(Color::RGB(tint.r, tint.g, tint.b));
-            s.set_alpha_mod(tint.a);
+            tint(s, tint_color);
             let _ = s.blit_scaled(overlay_src, framebuf, dst);
         }
         None => {
