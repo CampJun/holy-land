@@ -1,0 +1,30 @@
+// Exeter bladesmith / cutler — Smythen Street, c. 1300.
+// Sources: Exeter Mayor's Court Rolls 1300-1310 record both
+// "ferreour" (general smith) and discrete cutler / bladesmith
+// surnames on Smythen St.; Salzman, "English Industries of the
+// Middle Ages" (1923) ch. 6 on the cutler / bladesmith / armurer
+// trade separation. Smaller, timber-framed scale than the armurer
+// — bladesmithing wanted access + ventilation but not the armurer's
+// volume of stock. Open shopfront where finished blades were
+// displayed for sale.
+Prefab(
+    tag: "smithy",
+    tier: Urban,
+    variant: "weaponsmith",
+    weight: 2,
+    size: (6, 7),
+    palette: {
+        '#': WoodWall,
+        '.': Floor,
+        'o': CobbleRoad,
+    },
+    grid: [
+        "######",
+        "#....#",
+        "#....#",
+        "#....o",
+        "#....#",
+        "#....#",
+        "######",
+    ],
+)

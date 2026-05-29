@@ -11,12 +11,17 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
+use crate::buildings::{catalog, CityTier, Prefab};
 use crate::world::{CellState, GroundCover, TerrainKind, CHUNK_H, CHUNK_W, ChunkCoord};
 
 #[derive(Debug, Deserialize)]
 pub struct City {
     #[allow(dead_code)] // human label; useful for logging once wired
     pub name: String,
+    /// Settlement size — drives which prefab pool the block-fill
+    /// picks from. Defaults to Urban so old RONs keep parsing.
+    #[serde(default)]
+    pub tier: CityTier,
     pub wall: Wall,
     #[serde(default)]
     #[allow(dead_code)] // populated later
@@ -48,6 +53,13 @@ pub struct Street {
     pub name: String,
     pub polyline: Vec<(i64, i64)>,
     pub width: u16,
+    /// District-flavour tags broadcast to nearby house slots.
+    /// e.g. Smythen Street → `[("smithy", 5), ("house", 5)]` so half
+    /// of fronting slots roll a smithy prefab. Empty (default) means
+    /// "no flavour", and slots near this street fall back to the
+    /// generic `[("house", 1)]` at pick time.
+    #[serde(default)]
+    pub tag_weights: Vec<(String, u32)>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,6 +140,16 @@ pub struct LoadedCity {
     /// tighter than `bbox` (which also covers Rougemont / bridge /
     /// leat).
     pub wall_bbox: (i64, i64, i64, i64),
+    /// Every world-cell covered by a street polyline (including the
+    /// width widening). Block-fill consults this to skip slots whose
+    /// house rectangle would straddle a street.
+    pub street_cells: HashSet<(i64, i64)>,
+    /// District-tag distribution per house slot (anchor-relative
+    /// `(slot_x, slot_y)`). Each street's `tag_weights` are summed
+    /// into every slot whose centre is within Chebyshev-K of the
+    /// street's widened polyline. Missing slots fall back to the
+    /// generic `[("house", 1)]` at pick time.
+    pub slot_tags: HashMap<(i64, i64), Vec<(String, u32)>>,
     /// Per-chunk feature classification for the overmap renderer.
     /// Chunks not touching the city are absent from the map.
     chunk_features: HashMap<ChunkCoord, CityChunkFeature>,
@@ -170,12 +192,131 @@ impl LoadedCity {
             world_seed,
             &self.wall_world_polygon,
             self.wall_bbox,
+            &self.street_cells,
+            &self.slot_tags,
         );
     }
 }
 
 fn rect_intersects(a: (i64, i64, i64, i64), b: (i64, i64, i64, i64)) -> bool {
     !(a.2 < b.0 || a.0 > b.2 || a.3 < b.1 || a.1 > b.3)
+}
+
+/// Width-N street neighbourhood offsets. Mirrors `gate_skip_cells`:
+/// width=1 → {0}; width=2 → {-1, 0}; width=3 → {-1, 0, +1}; width=4
+/// → {-2, -1, 0, +1}. Even widths are NW-biased (one extra cell to
+/// the north/west of centre); odd widths are symmetric. Used by both
+/// the in-chunk stamper and the global `street_cells` precompute, so
+/// they always agree on which cells count as "street".
+fn street_half_extents(width: u16) -> (i64, i64) {
+    let w = width as i64;
+    let lo = -(w / 2);
+    let hi = lo + w - 1;
+    (lo, hi)
+}
+
+/// Chebyshev radius around a street's widened polyline within which
+/// slots inherit the street's `tag_weights`. K=12 ≈ 1.5 house-pitches:
+/// covers slots fronting the street plus the immediate back row, so
+/// a "smiths' lane" tag bleeds one block deep but no further.
+const STREET_TAG_RADIUS: i64 = 12;
+
+/// Per-slot district-tag distribution. For each street, find every
+/// house slot within `STREET_TAG_RADIUS` (Chebyshev) of the street's
+/// widened polyline, then add the street's `tag_weights` to that
+/// slot's accumulated map *once* — dedup-per-street keeps contribution
+/// flat regardless of how many polyline cells happen to be in range.
+fn compute_slot_tags(
+    city: &City,
+    anchor: (i64, i64),
+) -> HashMap<(i64, i64), Vec<(String, u32)>> {
+    let k = STREET_TAG_RADIUS;
+    let mut acc: HashMap<(i64, i64), HashMap<String, u32>> = HashMap::new();
+    for street in &city.streets {
+        if street.tag_weights.is_empty() {
+            continue;
+        }
+        let (lo, hi) = street_half_extents(street.width);
+        let mut slots_touched: HashSet<(i64, i64)> = HashSet::new();
+        for window in street.polyline.windows(2) {
+            let aw = (window[0].0 + anchor.0, window[0].1 + anchor.1);
+            let bw = (window[1].0 + anchor.0, window[1].1 + anchor.1);
+            for (wx, wy) in line_cells(aw, bw) {
+                for dy in lo..=hi {
+                    for dx in lo..=hi {
+                        let cx = wx + dx;
+                        let cy = wy + dy;
+                        // Slot-coord range whose centre might be in
+                        // Chebyshev-k of (cx, cy). Use div_euclid for
+                        // both bounds + an extra cell on the high side
+                        // to absorb the ceil case; the exact check
+                        // below filters the over-iteration.
+                        let sx_lo = (cx - anchor.0 - HOUSE_PITCH / 2 - k)
+                            .div_euclid(HOUSE_PITCH);
+                        let sx_hi = (cx - anchor.0 - HOUSE_PITCH / 2 + k)
+                            .div_euclid(HOUSE_PITCH)
+                            + 1;
+                        let sy_lo = (cy - anchor.1 - HOUSE_PITCH / 2 - k)
+                            .div_euclid(HOUSE_PITCH);
+                        let sy_hi = (cy - anchor.1 - HOUSE_PITCH / 2 + k)
+                            .div_euclid(HOUSE_PITCH)
+                            + 1;
+                        for sy in sy_lo..=sy_hi {
+                            for sx in sx_lo..=sx_hi {
+                                let centre_x =
+                                    sx * HOUSE_PITCH + anchor.0 + HOUSE_PITCH / 2;
+                                let centre_y =
+                                    sy * HOUSE_PITCH + anchor.1 + HOUSE_PITCH / 2;
+                                if (cx - centre_x).abs() <= k
+                                    && (cy - centre_y).abs() <= k
+                                {
+                                    slots_touched.insert((sx, sy));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for slot in slots_touched {
+            let entry = acc.entry(slot).or_default();
+            for (tag, w) in &street.tag_weights {
+                *entry.entry(tag.clone()).or_insert(0) += w;
+            }
+        }
+    }
+    acc.into_iter()
+        .map(|(slot, tags)| {
+            // Stable order: by tag string so the picker iterates the
+            // same way on every host. (Roulette is order-sensitive
+            // when total weight wraps.)
+            let mut v: Vec<(String, u32)> = tags.into_iter().collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            (slot, v)
+        })
+        .collect()
+}
+
+/// Every world cell that any street polyline covers, including its
+/// width widening. Built once at city load and consulted during
+/// block-fill to keep house rectangles from straddling streets.
+fn compute_street_cells(city: &City, anchor: (i64, i64)) -> HashSet<(i64, i64)> {
+    let mut out = HashSet::new();
+    for street in &city.streets {
+        let (lo, hi) = street_half_extents(street.width);
+        for window in street.polyline.windows(2) {
+            let aw = (window[0].0 + anchor.0, window[0].1 + anchor.1);
+            let bw = (window[1].0 + anchor.0, window[1].1 + anchor.1);
+            for (wx, wy) in line_cells(aw, bw) {
+                for dy in lo..=hi {
+                    for dx in lo..=hi {
+                        out.insert((wx + dx, wy + dy));
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 static CITIES: OnceLock<HashMap<&'static str, LoadedCity>> = OnceLock::new();
@@ -205,6 +346,8 @@ pub fn cities() -> &'static HashMap<&'static str, LoadedCity> {
                 .map(|p| (p.0 + anchor.0, p.1 + anchor.1))
                 .collect();
             let wall_bbox = compute_bbox(&wall_world_polygon);
+            let street_cells = compute_street_cells(&city, anchor);
+            let slot_tags = compute_slot_tags(&city, anchor);
             let chunk_features =
                 classify_chunks(&city, anchor, &wall_world_polygon, wall_bbox);
             map.insert(
@@ -215,6 +358,8 @@ pub fn cities() -> &'static HashMap<&'static str, LoadedCity> {
                     bbox,
                     wall_world_polygon,
                     wall_bbox,
+                    street_cells,
+                    slot_tags,
                     chunk_features,
                 },
             );
@@ -450,6 +595,8 @@ impl City {
         world_seed: u64,
         wall_world_polygon: &[(i64, i64)],
         wall_bbox: (i64, i64, i64, i64),
+        street_cells: &HashSet<(i64, i64)>,
+        slot_tags: &HashMap<(i64, i64), Vec<(String, u32)>>,
     ) {
         let chunk_origin_x = coord.cx as i64 * CHUNK_W as i64;
         let chunk_origin_y = coord.cy as i64 * CHUNK_H as i64;
@@ -572,6 +719,8 @@ impl City {
                 anchor,
                 world_seed,
                 wall_world_polygon,
+                street_cells,
+                slot_tags,
                 chunk_origin_x,
                 chunk_origin_y,
                 chunk_max_x,
@@ -629,6 +778,8 @@ impl City {
         anchor: (i64, i64),
         world_seed: u64,
         wall_world_polygon: &[(i64, i64)],
+        street_cells: &HashSet<(i64, i64)>,
+        slot_tags: &HashMap<(i64, i64), Vec<(String, u32)>>,
         chunk_origin_x: i64,
         chunk_origin_y: i64,
         chunk_max_x: i64,
@@ -643,12 +794,15 @@ impl City {
 
         for slot_y in slot_min_y..=slot_max_y {
             for slot_x in slot_min_x..=slot_max_x {
-                stamp_one_house_slot(
+                stamp_one_prefab_slot(
                     slot_x,
                     slot_y,
                     anchor,
                     world_seed,
+                    self.tier,
                     wall_world_polygon,
+                    street_cells,
+                    slot_tags,
                     chunk_origin_x,
                     chunk_origin_y,
                     chunk_max_x,
@@ -669,15 +823,15 @@ impl City {
         chunk_max_y: i64,
         cells: &mut [CellState],
     ) {
-        let half = (street.width as i64).saturating_sub(1) / 2;
+        let (lo, hi) = street_half_extents(street.width);
         for window in street.polyline.windows(2) {
             let aw = (window[0].0 + anchor.0, window[0].1 + anchor.1);
             let bw = (window[1].0 + anchor.0, window[1].1 + anchor.1);
             for (wx, wy) in line_cells(aw, bw) {
-                // Square neighborhood of side `width` centered on the
+                // Square neighborhood of side `width` covering the
                 // line cell — cheap and visually reads as "wider".
-                for dy in -half..=half {
-                    for dx in -half..=half {
+                for dy in lo..=hi {
+                    for dx in lo..=hi {
                         let cx = wx + dx;
                         let cy = wy + dy;
                         if cx < chunk_origin_x
@@ -787,29 +941,35 @@ impl City {
 }
 
 /// House-slot grid pitch (anchor-relative cells). One slot holds a
-/// single house with its perimeter alleys. Pitch 8 + houses 5..=7
-/// yields 1..=3 cell alleys between buildings — medieval-dense.
-const HOUSE_PITCH: i64 = 8;
-const HOUSE_MIN: i64 = 5;
-const HOUSE_MAX: i64 = 7;
+/// single building with its perimeter alleys. Pitch 8 fits the largest
+/// prefab (7×7 armurer) with a one-cell alley on the far edge.
+pub const HOUSE_PITCH: i64 = 8;
 /// Fraction (out of 256) of slots that stay empty plots (gardens,
 /// churchyards we haven't authored yet, ruins).
 const EMPTY_SLOT_THRESHOLD: u64 = 50;
 const CITY_SEED_SALT: u64 = 0xE7_E7_E7_E7_E7_E7_E7_E7;
+/// Salt for the tag-pick hash. Distinct from variant + slot-decision
+/// salts so tag, variant, and empty-plot rolls vary independently.
+const TAG_SEED_SALT: u64 = 0xCAFE_BABE_DEAD_BEEF;
+/// Salt for the variant-pick hash within a `(tag, tier)` pool.
+const VARIANT_SEED_SALT: u64 = 0xF00D_F00D_F00D_F00D;
 
-fn stamp_one_house_slot(
+/// Decide what (if anything) a slot should stamp, before any
+/// street-overlap or chunk-clip considerations. Pure: same inputs
+/// always yield the same `Some(prefab, footprint)`. Returns `None`
+/// when the slot is outside the wall polygon, rolled an empty plot,
+/// or the picker found no matching prefab. Tests reuse this to
+/// verify properties about every slot's footprint without
+/// duplicating the picker logic.
+pub(crate) fn slot_prefab_footprint(
     slot_x: i64,
     slot_y: i64,
     anchor: (i64, i64),
     world_seed: u64,
+    tier: CityTier,
     wall_world_polygon: &[(i64, i64)],
-    chunk_origin_x: i64,
-    chunk_origin_y: i64,
-    chunk_max_x: i64,
-    chunk_max_y: i64,
-    cells: &mut [CellState],
-) {
-    // Slot origin in world coords (top-left of the slot).
+    slot_tags: &HashMap<(i64, i64), Vec<(String, u32)>>,
+) -> Option<(&'static Prefab, (i64, i64, i64, i64))> {
     let slot_origin_x = slot_x * HOUSE_PITCH + anchor.0;
     let slot_origin_y = slot_y * HOUSE_PITCH + anchor.1;
     let slot_inner_min_x = slot_origin_x + 1;
@@ -817,9 +977,7 @@ fn stamp_one_house_slot(
     let slot_inner_max_x = slot_origin_x + HOUSE_PITCH - 1;
     let slot_inner_max_y = slot_origin_y + HOUSE_PITCH - 1;
 
-    // Containment: all 4 corners of the slot's usable interior must
-    // be inside the wall polygon. Cheaper than testing the house
-    // rectangle and avoids houses jutting through walls.
+    // 1. Wall containment.
     let corners = [
         (slot_inner_min_x, slot_inner_min_y),
         (slot_inner_max_x, slot_inner_min_y),
@@ -830,58 +988,135 @@ fn stamp_one_house_slot(
         .iter()
         .all(|&c| point_in_polygon(c, wall_world_polygon))
     {
-        return;
+        return None;
     }
 
-    // Slot decision hash.
-    let h = hash3(slot_x as u64, slot_y as u64, world_seed ^ CITY_SEED_SALT);
-    if (h & 0xFF) < EMPTY_SLOT_THRESHOLD {
-        return;
+    // 2. Empty-plot dice (same channel + threshold as legacy block-fill).
+    let slot_hash = hash3(slot_x as u64, slot_y as u64, world_seed ^ CITY_SEED_SALT);
+    if (slot_hash & 0xFF) < EMPTY_SLOT_THRESHOLD {
+        return None;
     }
 
-    let span = (HOUSE_MAX - HOUSE_MIN + 1) as u64;
-    let house_w = HOUSE_MIN + ((h >> 8) % span) as i64;
-    let house_h = HOUSE_MIN + ((h >> 16) % span) as i64;
-    let slack_x = (HOUSE_PITCH - 1 - house_w).max(0) as u64;
-    let slack_y = (HOUSE_PITCH - 1 - house_h).max(0) as u64;
-    let off_x = if slack_x > 0 { ((h >> 24) % slack_x) as i64 } else { 0 };
-    let off_y = if slack_y > 0 { ((h >> 32) % slack_y) as i64 } else { 0 };
+    // 3. Tag pick. Slots not touched by any tagged street fall back to
+    //    the universal `("house", 1)`. Sorted pool is host-stable.
+    let fallback: [(String, u32); 1] = [(String::from("house"), 1)];
+    let tag_pool: &[(String, u32)] = slot_tags
+        .get(&(slot_x, slot_y))
+        .map(|v| v.as_slice())
+        .unwrap_or(&fallback);
+    let tag_hash = hash3(slot_x as u64, slot_y as u64, world_seed ^ TAG_SEED_SALT);
+    let tag = roulette_pick(tag_pool, tag_hash)?;
 
-    let house_min_x = slot_inner_min_x + off_x;
-    let house_min_y = slot_inner_min_y + off_y;
-    let house_max_x = house_min_x + house_w - 1;
-    let house_max_y = house_min_y + house_h - 1;
+    // 4. Variant pick — fall back to the tier's `house` pool if the
+    //    chosen tag has no prefabs (e.g. Village rolling `smithy` when
+    //    only `farrier` is bundled).
+    let cat = catalog();
+    let variant_hash = hash3(slot_x as u64, slot_y as u64, world_seed ^ VARIANT_SEED_SALT);
+    let prefab = cat
+        .pick_variant(tag, tier, variant_hash)
+        .or_else(|| cat.pick_variant("house", tier, variant_hash))?;
 
-    // Stamp cells of this house that fall inside the current chunk.
-    // Only overwrite Grass — streets / landmarks / walls already
-    // stamped and must keep precedence.
-    let clip_min_x = house_min_x.max(chunk_origin_x);
-    let clip_min_y = house_min_y.max(chunk_origin_y);
-    let clip_max_x = house_max_x.min(chunk_max_x);
-    let clip_max_y = house_max_y.min(chunk_max_y);
+    // 5. Slack offset — jitter smaller prefabs within the slot so a
+    //    row of cottages doesn't read as one long block.
+    let pw = prefab.width() as i64;
+    let ph = prefab.height() as i64;
+    let slack_x = (HOUSE_PITCH - 1 - pw).max(0) as u64;
+    let slack_y = (HOUSE_PITCH - 1 - ph).max(0) as u64;
+    let off_x = if slack_x > 0 {
+        ((slot_hash >> 24) % slack_x) as i64
+    } else {
+        0
+    };
+    let off_y = if slack_y > 0 {
+        ((slot_hash >> 32) % slack_y) as i64
+    } else {
+        0
+    };
+    let pre_min_x = slot_inner_min_x + off_x;
+    let pre_min_y = slot_inner_min_y + off_y;
+    let pre_max_x = pre_min_x + pw - 1;
+    let pre_max_y = pre_min_y + ph - 1;
+    Some((prefab, (pre_min_x, pre_min_y, pre_max_x, pre_max_y)))
+}
+
+fn stamp_one_prefab_slot(
+    slot_x: i64,
+    slot_y: i64,
+    anchor: (i64, i64),
+    world_seed: u64,
+    tier: CityTier,
+    wall_world_polygon: &[(i64, i64)],
+    street_cells: &HashSet<(i64, i64)>,
+    slot_tags: &HashMap<(i64, i64), Vec<(String, u32)>>,
+    chunk_origin_x: i64,
+    chunk_origin_y: i64,
+    chunk_max_x: i64,
+    chunk_max_y: i64,
+    cells: &mut [CellState],
+) {
+    let Some((prefab, (pre_min_x, pre_min_y, pre_max_x, pre_max_y))) =
+        slot_prefab_footprint(slot_x, slot_y, anchor, world_seed, tier, wall_world_polygon, slot_tags)
+    else {
+        return;
+    };
+
+    // Street overlap — done *after* the offset is chosen, since the
+    // prefab's smaller-than-slot footprint can fit in places the old
+    // procedural box couldn't.
+    for wy in pre_min_y..=pre_max_y {
+        for wx in pre_min_x..=pre_max_x {
+            if street_cells.contains(&(wx, wy)) {
+                return;
+            }
+        }
+    }
+
+    // Stamp the prefab grid. Only overwrite `Grass` — streets /
+    // landmarks / walls already laid down and keep precedence; space
+    // chars in the grid yield `None` and are skipped.
+    let clip_min_x = pre_min_x.max(chunk_origin_x);
+    let clip_min_y = pre_min_y.max(chunk_origin_y);
+    let clip_max_x = pre_max_x.min(chunk_max_x);
+    let clip_max_y = pre_max_y.min(chunk_max_y);
     if clip_min_x > clip_max_x || clip_min_y > clip_max_y {
         return;
     }
     for wy in clip_min_y..=clip_max_y {
         for wx in clip_min_x..=clip_max_x {
+            let px = (wx - pre_min_x) as u16;
+            let py = (wy - pre_min_y) as u16;
+            let Some(t) = prefab.cell_at(px, py) else { continue };
             let lx = (wx - chunk_origin_x) as usize;
             let ly = (wy - chunk_origin_y) as usize;
             let idx = ly * (CHUNK_W as usize) + lx;
             if cells[idx].terrain != TerrainKind::Grass {
                 continue;
             }
-            let is_perim = wx == house_min_x
-                || wx == house_max_x
-                || wy == house_min_y
-                || wy == house_max_y;
-            set_terrain(
-                cells,
-                lx,
-                ly,
-                if is_perim { TerrainKind::WoodWall } else { TerrainKind::Floor },
-            );
+            set_terrain(cells, lx, ly, t);
         }
     }
+}
+
+/// Weighted-roulette pick over `(label, weight)` pairs. Returns `None`
+/// if the pool is empty or sums to 0. The non-test path also lives at
+/// `BuildingCatalog::pick_variant`; both stay deterministic given the
+/// same input pool order + hash.
+fn roulette_pick<'a>(pool: &'a [(String, u32)], hash: u64) -> Option<&'a str> {
+    if pool.is_empty() {
+        return None;
+    }
+    let total: u32 = pool.iter().map(|(_, w)| *w).sum();
+    if total == 0 {
+        return None;
+    }
+    let mut roll = (hash % total as u64) as u32;
+    for (label, w) in pool {
+        if roll < *w {
+            return Some(label);
+        }
+        roll -= *w;
+    }
+    pool.first().map(|(s, _)| s.as_str())
 }
 
 /// Cheap 3-input SplitMix-style hash. Stable for slot determinism.
@@ -1369,6 +1604,134 @@ mod tests {
             "High Street chunk {:?} should be Street/Gate/WallEdge, got {:?}",
             cc,
             feat
+        );
+    }
+
+    #[test]
+    fn width_two_street_stamps_two_cells_wide() {
+        // Regression: pre-fix, `half = (w - 1) / 2` gave half=0 for
+        // width=2, collapsing a "wide" street to a single cell.
+        // Mirror the math from `street_half_extents` instead.
+        let grid = build_full_city_grid();
+        // High Street is width 3 in the live RON, but the equivalent
+        // bug shows up at any even width. Verify on Smythen Street
+        // (width 1) that the centre line is stamped and the neighbour
+        // is NOT — that's the negative anchor — then verify on a wide
+        // street that *both* the centre and an off-centre cell stamp.
+        // Smythen midpoint approx (-5, 45):
+        let centre = grid.get(&(-5i64, 45i64)).copied().unwrap_or(TerrainKind::Grass);
+        assert_eq!(centre, TerrainKind::CobbleRoad, "Smythen centre should stamp");
+        // High Street polyline cell (-40, -78), width 3, offsets {-1,0,1}.
+        // Both (-40, -78) and (-40, -79) (offset -1 in y) should be cobble.
+        let on  = grid.get(&(-40i64, -78i64)).copied().unwrap_or(TerrainKind::Grass);
+        let off = grid.get(&(-40i64, -79i64)).copied().unwrap_or(TerrainKind::Grass);
+        assert_eq!(on,  TerrainKind::CobbleRoad, "High Street centre should stamp");
+        assert_eq!(off, TerrainKind::CobbleRoad, "High Street width-3 neighbour should stamp");
+    }
+
+    #[test]
+    fn block_fill_does_not_straddle_streets() {
+        // Property: if the picker chose a prefab whose footprint
+        // overlaps any street cell, the stamper must have suppressed
+        // it — no prefab terrain may have landed inside that
+        // footprint. (A prefab fronting a street is fine; what we
+        // forbid is a footprint straddling the street.)
+        let loaded = cities().get("Exeter").unwrap();
+        let grid = build_full_city_grid();
+        let (wmin_x, wmin_y, wmax_x, wmax_y) = loaded.wall_bbox;
+        let slot_min_x = (wmin_x - loaded.anchor.0).div_euclid(HOUSE_PITCH) - 1;
+        let slot_min_y = (wmin_y - loaded.anchor.1).div_euclid(HOUSE_PITCH) - 1;
+        let slot_max_x = (wmax_x - loaded.anchor.0).div_euclid(HOUSE_PITCH) + 1;
+        let slot_max_y = (wmax_y - loaded.anchor.1).div_euclid(HOUSE_PITCH) + 1;
+        let mut leaks: Vec<(i64, i64)> = Vec::new();
+        for sy in slot_min_y..=slot_max_y {
+            for sx in slot_min_x..=slot_max_x {
+                let Some((_, (min_x, min_y, max_x, max_y))) = slot_prefab_footprint(
+                    sx,
+                    sy,
+                    loaded.anchor,
+                    0,
+                    loaded.city.tier,
+                    &loaded.wall_world_polygon,
+                    &loaded.slot_tags,
+                ) else {
+                    continue;
+                };
+                // Footprint vs street_cells.
+                let overlaps_street = (min_y..=max_y).any(|y| {
+                    (min_x..=max_x).any(|x| loaded.street_cells.contains(&(x, y)))
+                });
+                if !overlaps_street {
+                    continue;
+                }
+                // Stamper must have suppressed this slot — no prefab
+                // terrain should appear inside the footprint.
+                // Look only at Floor — it's the unambiguous prefab
+                // signature. (StoneWall is also used by the cathedral
+                // / Rougemont / Guildhall / city walls, so a slot
+                // overlapping those would false-positive.)
+                for fy in min_y..=max_y {
+                    for fx in min_x..=max_x {
+                        if grid.get(&(fx, fy)) == Some(&TerrainKind::Floor) {
+                            leaks.push((sx, sy));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            leaks.is_empty(),
+            "{} slots leaked prefab terrain despite footprint overlapping a street: {:?}",
+            leaks.len(),
+            &leaks[..leaks.len().min(5)],
+        );
+    }
+
+    #[test]
+    fn smythen_street_seeds_smithy_tag_into_nearby_slots() {
+        // Smythen Street's `tag_weights: [("smithy", 5), ("house", 5)]`
+        // should propagate into the per-slot tag map for slots whose
+        // centre sits within Chebyshev-12 of any Smythen polyline cell.
+        // The midpoint of Smythen ((-5, 45)) places the closest slot
+        // centre at world (-4, 44) — slot (-1, 5) at anchor (0, 0).
+        let loaded = cities().get("Exeter").unwrap();
+        let tags = loaded
+            .slot_tags
+            .get(&(-1, 5))
+            .expect("slot (-1, 5) is within Chebyshev-12 of Smythen Street");
+        assert!(
+            tags.iter().any(|(t, w)| t == "smithy" && *w > 0),
+            "slot (-1, 5) should carry a positive smithy tag from Smythen Street, got {tags:?}"
+        );
+    }
+
+    #[test]
+    fn exeter_grid_contains_smithy_prefab_near_smythen() {
+        // The smithy_urban_armorer prefab uses StoneWall — the only
+        // prefab in the bundled Urban pools that does. So if any
+        // StoneWall cell appears in the strip alongside Smythen
+        // Street (away from the cathedral / wall / Rougemont, which
+        // are also StoneWall), it must have come from a smithy
+        // prefab. Smythen runs roughly (-55, -55) → (50, 160); test
+        // a tight box that excludes cathedral (x ∈ [-42, 42], y ∈
+        // [-12, 12]) and the south wall (y > 175).
+        let grid = build_full_city_grid();
+        let stone_in_smythen_strip = grid
+            .iter()
+            .filter(|(_, t)| **t == TerrainKind::StoneWall)
+            .filter(|((x, y), _)| {
+                // Strip alongside Smythen, generous on x:
+                *x > -60 && *x < 60 && *y > -50 && *y < 170
+            })
+            .filter(|((x, y), _)| {
+                // Exclude the cathedral rect (-42,-12)..(42,12).
+                !(*x >= -42 && *x <= 42 && *y >= -12 && *y <= 12)
+            })
+            .count();
+        assert!(
+            stone_in_smythen_strip > 0,
+            "no smithy StoneWall cells landed in the Smythen Street strip — \
+             expected at least one armurer prefab to roll"
         );
     }
 

@@ -1,5 +1,6 @@
 mod action;
 mod atlases;
+mod buildings;
 mod calendar;
 mod chunkgen;
 mod city;

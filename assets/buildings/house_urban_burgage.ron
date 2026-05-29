@@ -1,0 +1,27 @@
+// Exeter urban burgage — narrow street-front, long yard.
+// Source: NHLE Listed-Building reports for the surviving Exeter
+// burgage plots on Fore St / High St; Maryanne Kowaleski, "Local
+// Markets and Regional Trade in Medieval Exeter" (1995) §2 on
+// burgage tenure. Typical plot is ~7m wide × ~15m deep at the
+// front; we abstract to a 7×5 cell footprint (≈35 ft × 25 ft).
+// Walls are stone-fronted on the gable end facing the street —
+// Exeter's higher-status burgages were stone-faced by 1300.
+Prefab(
+    tag: "house",
+    tier: Urban,
+    variant: "burgage",
+    weight: 5,
+    size: (7, 5),
+    palette: {
+        '#': StoneWall,
+        '.': Floor,
+        'o': CobbleRoad,
+    },
+    grid: [
+        "#######",
+        "#.....#",
+        "#.....o",
+        "#.....#",
+        "#######",
+    ],
+)
