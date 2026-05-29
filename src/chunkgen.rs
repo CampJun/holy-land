@@ -192,9 +192,13 @@ pub fn generate_chunk(coord: ChunkCoord, world_seed: u64, info: OvermapInfo) -> 
         herb_placed += 1;
     }
 
-    // Step 5: LeafLitter on every Grass cell within 1 cell of a
-    // TreeTrunk. Deterministic per seed.
-    apply_leaf_litter(&mut cells);
+    // Step 5: LeafLitter under ~60% of Grass cells within 1 cell of
+    // a TreeTrunk. Deterministic per seed — gates qualifying cells
+    // through a (coord, world_seed, idx) hash so the same seed
+    // always paints the same cells. Trimmed from "every qualifying
+    // cell" so the new Mini-Medieval grass art reads through the
+    // forest floor.
+    apply_leaf_litter(&mut cells, coord, world_seed);
 
     // Step 6: noise-driven decoration placement. Per-cell probability
     // scales with canopy noise (shaded cells get more undergrowth);
@@ -747,12 +751,13 @@ fn roll_debris(out: &mut Vec<ItemInstance>, rng: &mut Rng, near_water: bool) {
     }
 }
 
-/// Set `ground_cover = LeafLitter` on every Grass cell within 1 cell
-/// (8-neighborhood) of a TreeTrunk. Runs after skeleton + extra-tree
-/// passes so every tree placed by this chunk's chunkgen contributes
-/// litter. No RNG — placement is purely positional, so the result is
-/// deterministic per seed.
-fn apply_leaf_litter(cells: &mut [CellState]) {
+/// Set `ground_cover = LeafLitter` on ~60% of Grass cells within 1
+/// cell (8-neighborhood) of a TreeTrunk. Runs after skeleton +
+/// extra-tree passes. Gate is a deterministic hash of (world_seed,
+/// chunk_coord, cell_idx) so the same seed always paints the same
+/// cells without consuming the chunk RNG (preserves the chunk_rng
+/// stream for subsequent passes).
+fn apply_leaf_litter(cells: &mut [CellState], coord: ChunkCoord, world_seed: u64) {
     let cw = CHUNK_W as i32;
     let ch = CHUNK_H as i32;
     let mut targets = Vec::new();
@@ -787,8 +792,27 @@ fn apply_leaf_litter(cells: &mut [CellState]) {
         }
     }
     for idx in targets {
-        cells[idx].ground_cover = GroundCover::LeafLitter;
+        if litter_hash(world_seed, coord, idx) % 100 < 60 {
+            cells[idx].ground_cover = GroundCover::LeafLitter;
+        }
     }
+}
+
+/// SplitMix64-style mixer for the leaf-litter coverage gate. Same
+/// constants as `chunk_rng` plus a per-cell idx mix so neighboring
+/// cells get independent rolls. Output is a u64; caller takes
+/// `% 100` for the percentage gate.
+fn litter_hash(world_seed: u64, coord: ChunkCoord, idx: usize) -> u64 {
+    let cx = coord.cx as u64;
+    let cy = coord.cy as u64;
+    let mut h = world_seed
+        .wrapping_add(cx.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        .wrapping_add(cy.wrapping_mul(0xBF58_476D_1CE4_E5B9))
+        .wrapping_add((idx as u64).wrapping_mul(0x94D0_49BB_1331_11EB));
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    h ^= h >> 33;
+    h
 }
 
 /// Phase-E noise-driven decoration placement. Per-cell probability
@@ -818,9 +842,11 @@ fn apply_undergrowth(
             if !cells[idx].items.is_empty() {
                 continue;
             }
-            // Probability: 0..=30% based on canopy. Shaded cells get
-            // ~30% density; open cells get ~5-10%. Tunable per playtest.
-            let cell_p = (canopy[idx] as u32 * 30) / 255;
+            // Probability: 0..=18% based on canopy. Shaded cells get
+            // ~18% density; open cells get ~3-6%. Trimmed from 30 so
+            // the new Mini-Medieval grass art reads through the forest
+            // floor. Tunable per playtest.
+            let cell_p = (canopy[idx] as u32 * 18) / 255;
             if (rng.next_u32() % 100) >= cell_p {
                 continue;
             }

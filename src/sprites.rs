@@ -36,6 +36,7 @@ pub const SRC: u32 = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Sheet {
+    // Outdoor pack (Mini-Medieval-8x8/) — unprefixed; wired phase 1.
     Overworld,
     Items,
     Walls,
@@ -47,10 +48,32 @@ pub enum Sheet {
     Misc,
     Ships,
     Interface,
+    // Kingdom Interior pack (Mini-Medieval-Kingdom-Interior-8x8/) —
+    // prefixed `Interior` because Animals/Items/Misc/Interface/Units
+    // filenames clash with the outdoor pack.
+    InteriorAnimals,
+    InteriorDecorations,
+    InteriorFixtures,
+    InteriorFurniture,
+    InteriorInterface,
+    Interior,
+    InteriorItems,
+    InteriorMisc,
+    InteriorUnits,
+    // User Interface pack (Mini-Medieval-User-Interface-8x8/) —
+    // prefixed `Ui`.
+    UiBanners,
+    UiBars,
+    UiEmotes,
+    UiFrames,
+    UiIcons,
+    UiInputs,
+    UiOther,
+    UiPortraits,
 }
 
 impl Sheet {
-    pub const COUNT: usize = 11;
+    pub const COUNT: usize = 28;
 
     /// Every sheet, in display order. Backs the picker's sheet cycling.
     pub const ALL: [Sheet; Self::COUNT] = [
@@ -65,6 +88,23 @@ impl Sheet {
         Sheet::Misc,
         Sheet::Ships,
         Sheet::Interface,
+        Sheet::InteriorAnimals,
+        Sheet::InteriorDecorations,
+        Sheet::InteriorFixtures,
+        Sheet::InteriorFurniture,
+        Sheet::InteriorInterface,
+        Sheet::Interior,
+        Sheet::InteriorItems,
+        Sheet::InteriorMisc,
+        Sheet::InteriorUnits,
+        Sheet::UiBanners,
+        Sheet::UiBars,
+        Sheet::UiEmotes,
+        Sheet::UiFrames,
+        Sheet::UiIcons,
+        Sheet::UiInputs,
+        Sheet::UiOther,
+        Sheet::UiPortraits,
     ];
 
     /// Stable lowercase key (save round-trip + picker header).
@@ -81,6 +121,23 @@ impl Sheet {
             Sheet::Misc => "misc",
             Sheet::Ships => "ships",
             Sheet::Interface => "interface",
+            Sheet::InteriorAnimals => "interior_animals",
+            Sheet::InteriorDecorations => "interior_decorations",
+            Sheet::InteriorFixtures => "interior_fixtures",
+            Sheet::InteriorFurniture => "interior_furniture",
+            Sheet::InteriorInterface => "interior_interface",
+            Sheet::Interior => "interior",
+            Sheet::InteriorItems => "interior_items",
+            Sheet::InteriorMisc => "interior_misc",
+            Sheet::InteriorUnits => "interior_units",
+            Sheet::UiBanners => "ui_banners",
+            Sheet::UiBars => "ui_bars",
+            Sheet::UiEmotes => "ui_emotes",
+            Sheet::UiFrames => "ui_frames",
+            Sheet::UiIcons => "ui_icons",
+            Sheet::UiInputs => "ui_inputs",
+            Sheet::UiOther => "ui_other",
+            Sheet::UiPortraits => "ui_portraits",
         }
     }
 
@@ -104,6 +161,23 @@ impl Sheet {
             Sheet::Misc => (55, 49),
             Sheet::Ships => (17, 29),
             Sheet::Interface => (9, 20),
+            Sheet::InteriorAnimals => (40, 26),
+            Sheet::InteriorDecorations => (38, 62),
+            Sheet::InteriorFixtures => (30, 16),
+            Sheet::InteriorFurniture => (115, 141),
+            Sheet::InteriorInterface => (14, 1),
+            Sheet::Interior => (39, 55),
+            Sheet::InteriorItems => (19, 21),
+            Sheet::InteriorMisc => (16, 38),
+            Sheet::InteriorUnits => (17, 8),
+            Sheet::UiBanners => (101, 77),
+            Sheet::UiBars => (80, 42),
+            Sheet::UiEmotes => (14, 26),
+            Sheet::UiFrames => (112, 59),
+            Sheet::UiIcons => (36, 48),
+            Sheet::UiInputs => (30, 46),
+            Sheet::UiOther => (18, 21),
+            Sheet::UiPortraits => (73, 58),
         }
     }
 
@@ -121,6 +195,57 @@ impl Sheet {
             Sheet::Misc => include_bytes!("../assets/Mini-Medieval-8x8/Misc.png"),
             Sheet::Ships => include_bytes!("../assets/Mini-Medieval-8x8/Ships.png"),
             Sheet::Interface => include_bytes!("../assets/Mini-Medieval-8x8/Interface.png"),
+            Sheet::InteriorAnimals => {
+                include_bytes!("../assets/Mini-Medieval-Kingdom-Interior-8x8/Animals.png")
+            }
+            Sheet::InteriorDecorations => {
+                include_bytes!("../assets/Mini-Medieval-Kingdom-Interior-8x8/Decorations.png")
+            }
+            Sheet::InteriorFixtures => {
+                include_bytes!("../assets/Mini-Medieval-Kingdom-Interior-8x8/Fixtures.png")
+            }
+            Sheet::InteriorFurniture => {
+                include_bytes!("../assets/Mini-Medieval-Kingdom-Interior-8x8/Furniture.png")
+            }
+            Sheet::InteriorInterface => {
+                include_bytes!("../assets/Mini-Medieval-Kingdom-Interior-8x8/Interface.png")
+            }
+            Sheet::Interior => {
+                include_bytes!("../assets/Mini-Medieval-Kingdom-Interior-8x8/Interior.png")
+            }
+            Sheet::InteriorItems => {
+                include_bytes!("../assets/Mini-Medieval-Kingdom-Interior-8x8/Items.png")
+            }
+            Sheet::InteriorMisc => {
+                include_bytes!("../assets/Mini-Medieval-Kingdom-Interior-8x8/Misc.png")
+            }
+            Sheet::InteriorUnits => {
+                include_bytes!("../assets/Mini-Medieval-Kingdom-Interior-8x8/Units.png")
+            }
+            Sheet::UiBanners => {
+                include_bytes!("../assets/Mini-Medieval-User-Interface-8x8/Banners.png")
+            }
+            Sheet::UiBars => include_bytes!(
+                "../assets/Mini-Medieval-User-Interface-8x8/Bars-Sliders-Scrollbars.png"
+            ),
+            Sheet::UiEmotes => {
+                include_bytes!("../assets/Mini-Medieval-User-Interface-8x8/Emotes.png")
+            }
+            Sheet::UiFrames => {
+                include_bytes!("../assets/Mini-Medieval-User-Interface-8x8/Frames.png")
+            }
+            Sheet::UiIcons => {
+                include_bytes!("../assets/Mini-Medieval-User-Interface-8x8/Icons.png")
+            }
+            Sheet::UiInputs => {
+                include_bytes!("../assets/Mini-Medieval-User-Interface-8x8/Inputs.png")
+            }
+            Sheet::UiOther => {
+                include_bytes!("../assets/Mini-Medieval-User-Interface-8x8/Other.png")
+            }
+            Sheet::UiPortraits => {
+                include_bytes!("../assets/Mini-Medieval-User-Interface-8x8/Portraits.png")
+            }
         }
     }
 }
@@ -173,6 +298,43 @@ impl SpriteSheets {
             self.surfaces[i] = Some(load_atlas(s.bytes())?);
         }
         Ok(self.surfaces[i].as_mut().unwrap())
+    }
+
+    /// Decoded surfaces for `a` and `b`, suitable for handing to a
+    /// layered blit. Returns `(a, None)` when both name the same sheet
+    /// (the caller should reuse `a` for the second blit). Returns
+    /// `(a, Some(b))` when the sheets differ — `split_at_mut` carves
+    /// two non-aliasing `&mut` from the cache array. Decodes either
+    /// sheet on first access, like `get`.
+    pub fn get_two(
+        &mut self,
+        a: Sheet,
+        b: Sheet,
+    ) -> Result<(&mut Surface<'static>, Option<&mut Surface<'static>>), String> {
+        let i = a as usize;
+        let j = b as usize;
+        if self.surfaces[i].is_none() {
+            self.surfaces[i] = Some(load_atlas(a.bytes())?);
+        }
+        if i == j {
+            return Ok((self.surfaces[i].as_mut().unwrap(), None));
+        }
+        if self.surfaces[j].is_none() {
+            self.surfaces[j] = Some(load_atlas(b.bytes())?);
+        }
+        if i < j {
+            let (left, right) = self.surfaces.split_at_mut(j);
+            Ok((
+                left[i].as_mut().unwrap(),
+                Some(right[0].as_mut().unwrap()),
+            ))
+        } else {
+            let (left, right) = self.surfaces.split_at_mut(i);
+            Ok((
+                right[0].as_mut().unwrap(),
+                Some(left[j].as_mut().unwrap()),
+            ))
+        }
     }
 }
 
@@ -360,10 +522,15 @@ pub mod misc {
 }
 
 // --- Future-content sheets: addressable now, named as systems land ---
-// Crops.png (24×29), Ores.png (26×24), Animals.png (41×98),
+// Outdoor pack: Crops.png (24×29), Ores.png (26×24), Animals.png (41×98),
 // Structures.png (60×109), Ships.png (17×29), Interface.png (9×20).
-// Reach any cell via Sprite::at(Sheet::Crops, col, row) etc.; see the
-// documented legend for what each region holds.
+// Kingdom-Interior pack (Sheet::Interior* / Sheet::Interior): Animals,
+// Decorations, Fixtures, Furniture, Interface, Interior, Items, Misc,
+// Units — for room-tile / hearth / loom / market-stall work.
+// User-Interface pack (Sheet::Ui*): Banners, Bars, Emotes, Frames, Icons,
+// Inputs, Other, Portraits — for menu chrome / HUD / NPC portraits.
+// Reach any cell via Sprite::at(Sheet::Furniture, col, row) etc.; see
+// the matching `*-Documented-8x8/` sheet as the legend for each pack.
 
 // ===========================================================================
 // Mapping functions — game content → Sprite. The render path calls these.
