@@ -1,0 +1,38 @@
+GIMP Palette
+Name: Mini Medieval (VEXED)
+Columns: 6
+# Source: assets/Mini-Medieval-Documented-8x8/Palette/Mini-Medieval-Palette-Text-Ref.md
+# Load in Aseprite/LibreSprite/Piskel/GIMP. Use ONLY these colors for style match.
+# Black, Gray, White
+ 18  14  35	120e23
+ 83  70 100	534664
+111 110 114	6f6e72
+174 164 126	aea47e
+218 206 164	dacea4 (UI)
+255 241 169	fff1a9 (snow/highlight)
+# Blue-green
+ 52 156  88	349c58
+109 186 121	6dba79 (ice)
+# Blue
+ 42  41  66	2a2942
+ 36  80  95	24505f
+ 42 125 117	2a7d75
+# Purples
+ 58  27  64	3a1b40
+122  40  73	7a2849
+# Pinks
+194  55  83	c23753
+230 122 132	e67a84
+# Reds / Orange
+183  65  50	b74132
+230 113  70	e67146
+# Browns / Yellows
+ 64  46  43	402e2b
+118  64  50	764032
+161  92  52	a15c34 (dirt)
+199 133  57	c78539
+235 184  91	ebb85b (sand)
+# Greens
+ 86 100  46	56642e
+126 148  50	7e9432 (grass)
+201 192  61	c9c03d

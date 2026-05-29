@@ -1953,9 +1953,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         overlay = Some(sprites::decoration_sprite(&decoration));
                     }
                     if let Some(top) = cell_state.and_then(|c| c.items.last()) {
-                        // Lit fires read as fire rather than their item sprite.
+                        // Lit fires read as fire rather than their item sprite,
+                        // and route through the picker like any other target.
                         overlay = Some(match top.metadata {
-                            items::ItemMetadata::Lit { .. } => sprites::misc::FIRE,
+                            items::ItemMetadata::Lit { .. } => {
+                                sprite_overrides.resolve(sprites::RemapTarget::Fire)
+                            }
                             _ => sprite_overrides.item(top.kind),
                         });
                     }

@@ -70,10 +70,14 @@ pub enum Sheet {
     UiInputs,
     UiOther,
     UiPortraits,
+    // Project-original art (assets/HolyLand-Custom-8x8/) — hand-pixeled to
+    // the VEXED palette for items the packs don't cover (campfire today;
+    // backpack/bedroll slots reserved).
+    HolyLandItems,
 }
 
 impl Sheet {
-    pub const COUNT: usize = 28;
+    pub const COUNT: usize = 29;
 
     /// Every sheet, in display order. Backs the picker's sheet cycling.
     pub const ALL: [Sheet; Self::COUNT] = [
@@ -105,6 +109,7 @@ impl Sheet {
         Sheet::UiInputs,
         Sheet::UiOther,
         Sheet::UiPortraits,
+        Sheet::HolyLandItems,
     ];
 
     /// Stable lowercase key (save round-trip + picker header).
@@ -138,6 +143,7 @@ impl Sheet {
             Sheet::UiInputs => "ui_inputs",
             Sheet::UiOther => "ui_other",
             Sheet::UiPortraits => "ui_portraits",
+            Sheet::HolyLandItems => "holyland_items",
         }
     }
 
@@ -178,6 +184,7 @@ impl Sheet {
             Sheet::UiInputs => (30, 46),
             Sheet::UiOther => (18, 21),
             Sheet::UiPortraits => (73, 58),
+            Sheet::HolyLandItems => (8, 4),
         }
     }
 
@@ -246,6 +253,7 @@ impl Sheet {
             Sheet::UiPortraits => {
                 include_bytes!("../assets/Mini-Medieval-User-Interface-8x8/Portraits.png")
             }
+            Sheet::HolyLandItems => include_bytes!("../assets/HolyLand-Custom-8x8/Items.png"),
         }
     }
 }
@@ -521,6 +529,18 @@ pub mod misc {
     pub const FIRE: Sprite = Sprite::at(S, 0, 0);
 }
 
+/// Project-original art (assets/HolyLand-Custom-8x8/Items.png, 8×4 grid).
+/// Hand-pixeled to the VEXED palette for content the packs don't cover.
+/// `BACKPACK`/`BEDROLL` slots are reserved (still blank) until drawn —
+/// `item_sprite` keeps them on the basket placeholder for now.
+pub mod holyland {
+    use super::{Sheet, Sprite};
+    const S: Sheet = Sheet::HolyLandItems;
+    pub const BACKPACK: Sprite = Sprite::at(S, 0, 0);
+    pub const BEDROLL: Sprite = Sprite::at(S, 1, 0);
+    pub const CAMPFIRE: Sprite = Sprite::at(S, 2, 0);
+}
+
 // --- Future-content sheets: addressable now, named as systems land ---
 // Outdoor pack: Crops.png (24×29), Ores.png (26×24), Animals.png (41×98),
 // Structures.png (60×109), Ships.png (17×29), Interface.png (9×20).
@@ -673,6 +693,9 @@ pub enum RemapTarget {
     Terrain(TerrainKind),
     Tree(TreeSpecies),
     Item(ItemKind),
+    /// The lit-fire sprite (lit firewood / campfire). Not tied to an
+    /// `ItemKind` — the burning state is metadata, not a distinct item.
+    Fire,
 }
 
 impl RemapTarget {
@@ -682,10 +705,14 @@ impl RemapTarget {
             RemapTarget::Terrain(k) => format!("terrain:{}", k.save_key()),
             RemapTarget::Tree(s) => format!("tree:{}", s.save_key()),
             RemapTarget::Item(k) => format!("item:{}", k.save_key()),
+            RemapTarget::Fire => "fire".to_string(),
         }
     }
 
     pub fn from_key(s: &str) -> Option<RemapTarget> {
+        if s == "fire" {
+            return Some(RemapTarget::Fire);
+        }
         let (kind, key) = s.split_once(':')?;
         match kind {
             "terrain" => TerrainKind::from_save_key(key).map(RemapTarget::Terrain),
@@ -701,6 +728,7 @@ impl RemapTarget {
             RemapTarget::Terrain(k) => k.def().name,
             RemapTarget::Tree(s) => s.save_key(),
             RemapTarget::Item(k) => k.def().name,
+            RemapTarget::Fire => "Fire",
         }
     }
 
@@ -710,6 +738,7 @@ impl RemapTarget {
             RemapTarget::Terrain(k) => terrain_sprite(k),
             RemapTarget::Tree(s) => tree_sprite(s),
             RemapTarget::Item(k) => item_sprite(k),
+            RemapTarget::Fire => holyland::CAMPFIRE,
         }
     }
 
@@ -722,9 +751,14 @@ impl RemapTarget {
             .collect()
     }
 
-    /// Targets for the picker's "Items" tab.
+    /// Targets for the picker's "Items" tab. Fire trails the item list
+    /// (it's the lit-firewood sprite, conceptually a survival item).
     pub fn item_tab() -> Vec<RemapTarget> {
-        ItemKind::all().iter().map(|&k| RemapTarget::Item(k)).collect()
+        ItemKind::all()
+            .iter()
+            .map(|&k| RemapTarget::Item(k))
+            .chain(std::iter::once(RemapTarget::Fire))
+            .collect()
     }
 }
 
