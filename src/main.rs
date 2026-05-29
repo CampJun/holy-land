@@ -36,7 +36,7 @@ use atlases::AtlasEntry;
 use input::{Action, Input};
 use items::{ItemInstance, Pack};
 use needs::Needs;
-use render::{draw_glyph, draw_sprite, CELL_SIZE};
+use render::{draw_glyph, draw_sprite, draw_sprite_layered, CELL_SIZE};
 use save::{
     ActionStepSave, ActiveActionSave, CellItemsSave, DecorationMutationSave, MetaSave, NeedsSave,
     RenderSettings, RunSave, SaveHeader, SkillSave, SkillsSave, StaminaSave, TerrainMutationSave,
@@ -66,10 +66,15 @@ const TIMING_LOG_INTERVAL: Duration = Duration::from_secs(1);
 /// What a rendered cell shows. The world layer draws Mini-Medieval
 /// sprites; UI text/menus/HUD keep the CP437 font (the sprite pack has
 /// no typeface). One unified `Cell` so both share the per-cell diff.
+///
+/// `SpriteLayered` lets an overlay (item / decoration / character)
+/// alpha-blend over a terrain base — transparent pixels of the overlay
+/// reveal the base sprite, not the flat bg color.
 #[derive(Clone, Copy, PartialEq)]
 enum CellArt {
     Glyph(u8),
     Sprite(sprites::Sprite),
+    SpriteLayered { base: sprites::Sprite, overlay: sprites::Sprite },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -88,6 +93,15 @@ impl Cell {
     /// day/night light); `bg` shows under transparent sprite pixels.
     fn sprite(sprite: sprites::Sprite, fg: Color, bg: Color) -> Self {
         Self { art: CellArt::Sprite(sprite), fg, bg }
+    }
+    /// Terrain base + transparent overlay (item / decoration / unit).
+    fn sprite_layered(
+        base: sprites::Sprite,
+        overlay: sprites::Sprite,
+        fg: Color,
+        bg: Color,
+    ) -> Self {
+        Self { art: CellArt::SpriteLayered { base, overlay }, fg, bg }
     }
 }
 
@@ -1925,31 +1939,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Items + player only render when the cell is currently
                 // visible. Memory of explored-but-unseen cells shows
-                // terrain only. Decoration overlay sits BETWEEN
-                // terrain and items: priority is `item > decoration >
-                // terrain`. A fern with a stone dropped on it still
-                // reads as a stone.
+                // terrain only. Decoration / item / entity / player
+                // ride as an alpha overlay over the terrain `sprite`
+                // (so a stick on grass shows grass through the empty
+                // pixels). Priority is `player > entity > item >
+                // decoration` — only the topmost becomes the overlay.
+                let mut overlay: Option<sprites::Sprite> = None;
                 if visible {
                     let decoration = cell_state
                         .map(|c| c.decoration)
                         .unwrap_or(flora::Decoration::None);
                     if !matches!(decoration, flora::Decoration::None) {
-                        sprite = sprites::decoration_sprite(&decoration);
+                        overlay = Some(sprites::decoration_sprite(&decoration));
                     }
                     if let Some(top) = cell_state.and_then(|c| c.items.last()) {
                         // Lit fires read as fire rather than their item sprite.
-                        sprite = match top.metadata {
+                        overlay = Some(match top.metadata {
                             items::ItemMetadata::Lit { .. } => sprites::misc::FIRE,
                             _ => sprite_overrides.item(top.kind),
-                        };
+                        });
                     }
                     // Non-player entities (bandits etc.) render above ground
                     // items but below the player — overlap resolves to @.
                     if world::entity_glyph_at(&world, wx as i32, wy as i32).is_some() {
-                        sprite = sprites::units::BANDIT_YEOMAN;
+                        overlay = Some(sprites::units::BANDIT_YEOMAN);
                     }
                     if wx == pwx && wy == pwy {
-                        sprite = sprites::units::PLAYER;
+                        overlay = Some(sprites::units::PLAYER);
                     }
                 }
 
@@ -1996,7 +2012,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     bg = blend_to_terrain(LIGHT_TINT, [bg.r, bg.g, bg.b], mix);
                 }
-                let mut cell = Cell::sprite(sprite, sprite_tint, bg);
+                let mut cell = match overlay {
+                    Some(o) => Cell::sprite_layered(sprite, o, sprite_tint, bg),
+                    None => Cell::sprite(sprite, sprite_tint, bg),
+                };
                 let i = (vy as u32 * WORLD_W + vx as u32) as usize;
                 if let Some(ui_cell) = ui_cells[i] {
                     cell = ui_cell;
@@ -2014,6 +2033,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     vx,
                                     vy,
                                     s.src_rect(),
+                                    cell.fg,
+                                    cell.bg,
+                                );
+                            }
+                        }
+                        CellArt::SpriteLayered { base, overlay } => {
+                            if let Ok((base_sheet, overlay_sheet)) =
+                                sheets.get_two(base.sheet, overlay.sheet)
+                            {
+                                draw_sprite_layered(
+                                    &mut framebuf,
+                                    base_sheet,
+                                    base.src_rect(),
+                                    overlay_sheet,
+                                    overlay.src_rect(),
+                                    vx,
+                                    vy,
                                     cell.fg,
                                     cell.bg,
                                 );

@@ -91,3 +91,48 @@ pub fn draw_sprite(
     sheet.set_alpha_mod(tint.a);
     let _ = sheet.blit_scaled(src, framebuf, dst);
 }
+
+/// Draw a base sprite + a transparent overlay sprite into one cell.
+/// `fill_rect(bg)` → `blit(base)` → `blit(overlay)`, so the overlay's
+/// alpha=0 pixels reveal the base, and the base's alpha=0 pixels reveal
+/// `bg`. Same tint mod is applied to both layers so brightness / FOV
+/// dim / fire light tint ride uniformly.
+///
+/// `overlay_sheet = None` means base and overlay live on the same
+/// sheet — the function reuses `base_sheet` for both blits. (Borrow
+/// rules forbid handing two `&mut Surface` to one underlying buffer,
+/// so the caller signals shared-sheet by passing None.)
+pub fn draw_sprite_layered(
+    framebuf: &mut Surface,
+    base_sheet: &mut Surface,
+    base_src: Rect,
+    overlay_sheet: Option<&mut Surface>,
+    overlay_src: Rect,
+    cx: i32,
+    cy: i32,
+    tint: Color,
+    bg: Color,
+) {
+    let px = cx * CELL_SIZE as i32;
+    let py = cy * CELL_SIZE as i32;
+    let dst = Rect::new(px, py, CELL_SIZE, CELL_SIZE);
+
+    let _ = framebuf.fill_rect(dst, bg);
+
+    base_sheet.set_color_mod(Color::RGB(tint.r, tint.g, tint.b));
+    base_sheet.set_alpha_mod(tint.a);
+    let _ = base_sheet.blit_scaled(base_src, framebuf, dst);
+
+    match overlay_sheet {
+        Some(s) => {
+            s.set_color_mod(Color::RGB(tint.r, tint.g, tint.b));
+            s.set_alpha_mod(tint.a);
+            let _ = s.blit_scaled(overlay_src, framebuf, dst);
+        }
+        None => {
+            // Same sheet — color/alpha mod already set above; just
+            // blit the overlay rect from the same surface.
+            let _ = base_sheet.blit_scaled(overlay_src, framebuf, dst);
+        }
+    }
+}
