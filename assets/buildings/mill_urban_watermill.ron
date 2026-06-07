@@ -1,0 +1,22 @@
+// Mill — water-powered, by the Mill Leat (peripheral). Stone-built to
+// carry the gearing. Starter; edit in the prefab editor.
+Prefab(
+    tag: "mill",
+    tier: Urban,
+    variant: "watermill",
+    weight: 5,
+    size: (6, 6),
+    palette: {
+        '#': StoneWall,
+        '.': Floor,
+        'o': CobbleRoad,
+    },
+    grid: [
+        "######",
+        "#....#",
+        "#....#",
+        "#....#",
+        "o....#",
+        "######",
+    ],
+)

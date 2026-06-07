@@ -996,12 +996,17 @@ mod tests {
 
     #[test]
     fn leaf_litter_placed_near_trees() {
-        let chunk = gen(ChunkCoord { cx: 0, cy: 0 }, 0xC0FFEE);
+        // Use a wilderness chunk clear of Exeter's bbox: after the city
+        // was scaled down, chunk (0,0) straddles the wall edge, where
+        // city-cleared grass borders uncleared canopy and the litter
+        // invariant legitimately breaks. (4,4) is pure forest procgen.
+        let chunk = gen(ChunkCoord { cx: 4, cy: 4 }, 0xC0FFEE);
         // Every OPEN Grass cell (no canopy) with at least one tree-
         // footprint cell among its 8 neighbors must carry LeafLitter.
         // Cells under a canopy and non-adjacent open grass must NOT.
         let cw = CHUNK_W as i32;
         let ch = CHUNK_H as i32;
+        let mut litter_count = 0u32;
         for y in 0..ch {
             for x in 0..cw {
                 let idx = cell_idx(x as u32, y as u32);
@@ -1029,13 +1034,20 @@ mod tests {
                 }
                 let cover = chunk.cells[idx].ground_cover;
                 if near_tree {
-                    assert_eq!(
-                        cover,
-                        GroundCover::LeafLitter,
+                    // Litter is gated to ~60% of near-tree grass cells
+                    // (apply_leaf_litter's litter_hash % 100 < 60), so a
+                    // near-tree cell is either littered or bare.
+                    assert!(
+                        matches!(cover, GroundCover::LeafLitter | GroundCover::None),
                         "({}, {}) is grass next to a tree but has cover={:?}",
                         x, y, cover
                     );
+                    if cover == GroundCover::LeafLitter {
+                        litter_count += 1;
+                    }
                 } else {
+                    // The load-bearing invariant: litter appears ONLY
+                    // adjacent to trees.
                     assert_eq!(
                         cover,
                         GroundCover::None,
@@ -1045,6 +1057,10 @@ mod tests {
                 }
             }
         }
+        assert!(
+            litter_count > 0,
+            "forest chunk (4,4) should have placed some leaf litter near trees"
+        );
     }
 
     #[test]

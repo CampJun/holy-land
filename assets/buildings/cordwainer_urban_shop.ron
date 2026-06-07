@@ -1,0 +1,20 @@
+// Cordwainer — shoemaker working new leather. Small timber shop.
+// Starter; edit in the prefab editor.
+Prefab(
+    tag: "cordwainer",
+    tier: Urban,
+    variant: "shop",
+    weight: 5,
+    size: (5, 4),
+    palette: {
+        '#': WoodWall,
+        '.': Floor,
+        'o': CobbleRoad,
+    },
+    grid: [
+        "#####",
+        "#...#",
+        "#...o",
+        "#####",
+    ],
+)

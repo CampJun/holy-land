@@ -1,0 +1,21 @@
+// Tanner — nuisance trade pushed to the river's edge (peripheral).
+// Timber sheds around tanning pits. Starter; edit in the prefab editor.
+Prefab(
+    tag: "tanner",
+    tier: Urban,
+    variant: "yard",
+    weight: 5,
+    size: (5, 5),
+    palette: {
+        '#': WoodWall,
+        '.': Floor,
+        'o': CobbleRoad,
+    },
+    grid: [
+        "#####",
+        "#...#",
+        "#...#",
+        "o...#",
+        "#####",
+    ],
+)

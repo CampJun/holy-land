@@ -1,0 +1,23 @@
+// Merchant's house — the wealthiest burgages fronting High/North/South
+// St near the Carfax. Stone-faced, deep hall. Starter footprint; refine
+// in the prefab editor (cargo run --bin prefab_editor --features editor).
+Prefab(
+    tag: "merchant_house",
+    tier: Urban,
+    variant: "hall",
+    weight: 5,
+    size: (7, 6),
+    palette: {
+        '#': StoneWall,
+        '.': Floor,
+        'o': CobbleRoad,
+    },
+    grid: [
+        "#######",
+        "#.....#",
+        "#.....#",
+        "#.....o",
+        "#.....#",
+        "#######",
+    ],
+)

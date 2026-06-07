@@ -1,0 +1,20 @@
+// Tailor — cutting and sewing cloth. Small timber shop. Starter; edit
+// in the prefab editor.
+Prefab(
+    tag: "tailor",
+    tier: Urban,
+    variant: "shop",
+    weight: 5,
+    size: (5, 4),
+    palette: {
+        '#': WoodWall,
+        '.': Floor,
+        'o': CobbleRoad,
+    },
+    grid: [
+        "#####",
+        "o...#",
+        "#...#",
+        "#####",
+    ],
+)

@@ -30,6 +30,17 @@ pub struct City {
     #[serde(default)]
     #[allow(dead_code)] // populated later
     pub landmarks: Vec<Landmark>,
+    /// Exact building manifest: `(tag, count)` pairs. When non-empty the
+    /// block-fill allocator places *exactly* these counts (centre-weighted,
+    /// district-aware) instead of the legacy per-slot roulette. `house`
+    /// is the commoner-dwelling filler. Empty (default) → legacy roulette,
+    /// so manifest-less RONs keep their old behaviour.
+    #[serde(default)]
+    pub buildings: Vec<(String, u32)>,
+    /// Anchor-relative "city centre" (the Carfax) that trades gravitate
+    /// toward. `None` → the wall-polygon vertex centroid.
+    #[serde(default)]
+    pub center: Option<(i64, i64)>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,6 +162,12 @@ pub struct LoadedCity {
     /// street's widened polyline. Missing slots fall back to the
     /// generic `[("house", 1)]` at pick time.
     pub slot_tags: HashMap<(i64, i64), Vec<(String, u32)>>,
+    /// Precomputed slot → prefab assignment from the `buildings`
+    /// manifest (anchor-relative slot coords). Empty when the city has
+    /// no manifest (legacy roulette path). Built once at load by
+    /// `allocate_buildings`; the stamper looks each slot up here rather
+    /// than rolling a tag, so exact counts are guaranteed.
+    pub slot_assignments: HashMap<(i64, i64), &'static Prefab>,
     /// Per-chunk feature classification for the overmap renderer.
     /// Chunks not touching the city are absent from the map.
     chunk_features: HashMap<ChunkCoord, CityChunkFeature>,
@@ -195,6 +212,7 @@ impl LoadedCity {
             self.wall_bbox,
             &self.street_cells,
             &self.slot_tags,
+            &self.slot_assignments,
         );
     }
 }
@@ -349,6 +367,13 @@ pub fn cities() -> &'static HashMap<&'static str, LoadedCity> {
             let wall_bbox = compute_bbox(&wall_world_polygon);
             let street_cells = compute_street_cells(&city, anchor);
             let slot_tags = compute_slot_tags(&city, anchor);
+            let slot_assignments = allocate_buildings(
+                &city,
+                anchor,
+                &wall_world_polygon,
+                wall_bbox,
+                &slot_tags,
+            );
             let chunk_features =
                 classify_chunks(&city, anchor, &wall_world_polygon, wall_bbox);
             map.insert(
@@ -361,6 +386,7 @@ pub fn cities() -> &'static HashMap<&'static str, LoadedCity> {
                     wall_bbox,
                     street_cells,
                     slot_tags,
+                    slot_assignments,
                     chunk_features,
                 },
             );
@@ -598,6 +624,7 @@ impl City {
         wall_bbox: (i64, i64, i64, i64),
         street_cells: &HashSet<(i64, i64)>,
         slot_tags: &HashMap<(i64, i64), Vec<(String, u32)>>,
+        slot_assignments: &HashMap<(i64, i64), &'static Prefab>,
     ) {
         let chunk_origin_x = coord.cx as i64 * CHUNK_W as i64;
         let chunk_origin_y = coord.cy as i64 * CHUNK_H as i64;
@@ -722,6 +749,7 @@ impl City {
                 wall_world_polygon,
                 street_cells,
                 slot_tags,
+                slot_assignments,
                 chunk_origin_x,
                 chunk_origin_y,
                 chunk_max_x,
@@ -782,6 +810,7 @@ impl City {
         wall_world_polygon: &[(i64, i64)],
         street_cells: &HashSet<(i64, i64)>,
         slot_tags: &HashMap<(i64, i64), Vec<(String, u32)>>,
+        slot_assignments: &HashMap<(i64, i64), &'static Prefab>,
         chunk_origin_x: i64,
         chunk_origin_y: i64,
         chunk_max_x: i64,
@@ -805,6 +834,7 @@ impl City {
                     wall_world_polygon,
                     street_cells,
                     slot_tags,
+                    slot_assignments,
                     chunk_origin_x,
                     chunk_origin_y,
                     chunk_max_x,
@@ -956,6 +986,239 @@ const TAG_SEED_SALT: u64 = 0xCAFE_BABE_DEAD_BEEF;
 /// Salt for the variant-pick hash within a `(tag, tier)` pool.
 const VARIANT_SEED_SALT: u64 = 0xF00D_F00D_F00D_F00D;
 
+/// Per-slot info for the manifest allocator: anchor-relative slot coords
+/// and squared distance from the city centre (drives centre-gravity).
+struct SlotInfo {
+    sx: i64,
+    sy: i64,
+    dist2: u64,
+}
+
+/// Trades that sit out toward the walls / river — nuisance (tanner) and
+/// water-powered (fuller, mill) crafts that historically clustered at the
+/// periphery rather than the market core. These rank by *farthest* from
+/// the centre in Pass A.
+fn is_peripheral_tag(tag: &str) -> bool {
+    matches!(tag, "tanner" | "fuller" | "mill")
+}
+
+/// Average of a polygon's vertices (anchor-relative). Cheap stand-in for
+/// the true centroid; the wall circuits are roughly convex so the vertex
+/// mean lands near the visual centre — good enough to seed centre-gravity
+/// when a city omits an explicit `center`.
+fn polygon_centroid_rel(poly: &[(i64, i64)]) -> (i64, i64) {
+    let n = poly.len().max(1) as i64;
+    let sx: i64 = poly.iter().map(|p| p.0).sum();
+    let sy: i64 = poly.iter().map(|p| p.1).sum();
+    (sx / n, sy / n)
+}
+
+/// True if a house slot's inner footprint sits wholly inside the wall
+/// polygon (all four inner corners contained). Mirrors the containment
+/// gate in `slot_prefab_footprint` so the allocator and stamper agree on
+/// which slots are buildable.
+fn slot_inside_wall(
+    sx: i64,
+    sy: i64,
+    anchor: (i64, i64),
+    wall_world_polygon: &[(i64, i64)],
+) -> bool {
+    let ox = sx * HOUSE_PITCH + anchor.0;
+    let oy = sy * HOUSE_PITCH + anchor.1;
+    let corners = [
+        (ox + 1, oy + 1),
+        (ox + HOUSE_PITCH - 1, oy + 1),
+        (ox + 1, oy + HOUSE_PITCH - 1),
+        (ox + HOUSE_PITCH - 1, oy + HOUSE_PITCH - 1),
+    ];
+    corners
+        .iter()
+        .all(|&c| point_in_polygon(c, wall_world_polygon))
+}
+
+/// Resolve a manifest `tag` to a concrete prefab. Falls back to the
+/// tier's `house` pool when no prefab carries the tag yet, so a manifest
+/// can name trades before their art exists. Deterministic per slot.
+fn pick_prefab_for_tag(
+    tag: &str,
+    tier: CityTier,
+    sx: i64,
+    sy: i64,
+) -> Option<&'static Prefab> {
+    let cat = catalog();
+    let h = hash3(sx as u64, sy as u64, VARIANT_SEED_SALT);
+    cat.pick_variant(tag, tier, h)
+        .or_else(|| cat.pick_variant("house", tier, h))
+}
+
+/// True if any already-assigned slot sits within Chebyshev radius `r` of
+/// `(sx, sy)`. Used to space overflow houses apart toward the walls.
+fn has_neighbor_within(assigned: &HashSet<(i64, i64)>, sx: i64, sy: i64, r: i64) -> bool {
+    for dy in -r..=r {
+        for dx in -r..=r {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            if assigned.contains(&(sx + dx, sy + dy)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Resolve the `buildings` manifest into a fixed slot → prefab map.
+/// Deterministic and world-seed-independent: a hand-authored capital
+/// looks the same in every world.
+///
+/// Pass A — specialised trades: for each `(tag, count)` other than
+///   `house`, restrict to free slots whose district tags include the tag
+///   (if any street tags it), else all free slots; rank by distance to
+///   the centre — nearest for market trades, farthest for peripheral
+///   (nuisance / water) trades — and take `count` of them.
+/// Pass B — houses: fill the `house` count into the remaining slots
+///   centre-first, with a distance-graded minimum spacing so density is
+///   solid at the core and thins to garden-fringe near the walls.
+///
+/// Returns an empty map for manifest-less cities (caller then uses the
+/// legacy per-slot roulette).
+fn allocate_buildings(
+    city: &City,
+    anchor: (i64, i64),
+    wall_world_polygon: &[(i64, i64)],
+    wall_bbox: (i64, i64, i64, i64),
+    slot_tags: &HashMap<(i64, i64), Vec<(String, u32)>>,
+) -> HashMap<(i64, i64), &'static Prefab> {
+    let mut out: HashMap<(i64, i64), &'static Prefab> = HashMap::new();
+    if city.buildings.is_empty() {
+        return out;
+    }
+
+    let center = city
+        .center
+        .unwrap_or_else(|| polygon_centroid_rel(&city.wall.polygon));
+
+    // Enumerate buildable slots, nearest-to-centre first.
+    let sx_min = (wall_bbox.0 - anchor.0).div_euclid(HOUSE_PITCH) - 1;
+    let sy_min = (wall_bbox.1 - anchor.1).div_euclid(HOUSE_PITCH) - 1;
+    let sx_max = (wall_bbox.2 - anchor.0).div_euclid(HOUSE_PITCH) + 1;
+    let sy_max = (wall_bbox.3 - anchor.1).div_euclid(HOUSE_PITCH) + 1;
+    let mut slots: Vec<SlotInfo> = Vec::new();
+    for sy in sy_min..=sy_max {
+        for sx in sx_min..=sx_max {
+            if !slot_inside_wall(sx, sy, anchor, wall_world_polygon) {
+                continue;
+            }
+            let cxr = sx * HOUSE_PITCH + HOUSE_PITCH / 2;
+            let cyr = sy * HOUSE_PITCH + HOUSE_PITCH / 2;
+            let ddx = cxr - center.0;
+            let ddy = cyr - center.1;
+            slots.push(SlotInfo {
+                sx,
+                sy,
+                dist2: (ddx * ddx + ddy * ddy) as u64,
+            });
+        }
+    }
+    // Nearest-first, ties broken by coords for host-stable determinism.
+    slots.sort_by(|a, b| {
+        a.dist2
+            .cmp(&b.dist2)
+            .then(a.sx.cmp(&b.sx))
+            .then(a.sy.cmp(&b.sy))
+    });
+
+    let tier = city.tier;
+    let mut assigned: HashSet<(i64, i64)> = HashSet::new();
+
+    // Pass A — specialised trades.
+    for (tag, count) in &city.buildings {
+        if tag == "house" {
+            continue;
+        }
+        let peripheral = is_peripheral_tag(tag);
+        for _ in 0..*count {
+            // Does any free slot carry this trade's district tag?
+            let has_district = slots.iter().any(|s| {
+                !assigned.contains(&(s.sx, s.sy))
+                    && slot_tags
+                        .get(&(s.sx, s.sy))
+                        .is_some_and(|v| v.iter().any(|(t, _)| t == tag))
+            });
+            // Eligible free slots, restricted to the district if one exists.
+            let mut eligible = slots.iter().filter(|s| {
+                if assigned.contains(&(s.sx, s.sy)) {
+                    return false;
+                }
+                if has_district {
+                    slot_tags
+                        .get(&(s.sx, s.sy))
+                        .is_some_and(|v| v.iter().any(|(t, _)| t == tag))
+                } else {
+                    true
+                }
+            });
+            // `slots` is nearest-first: market trades take the nearest
+            // eligible slot, peripheral trades the farthest.
+            let chosen = if peripheral {
+                eligible.last()
+            } else {
+                eligible.next()
+            };
+            let Some(s) = chosen else {
+                crate::logging::info(format_args!(
+                    "city {}: ran out of slots placing `{tag}` ({count} requested)",
+                    city.name
+                ));
+                break;
+            };
+            if let Some(prefab) = pick_prefab_for_tag(tag, tier, s.sx, s.sy) {
+                out.insert((s.sx, s.sy), prefab);
+                assigned.insert((s.sx, s.sy));
+            }
+        }
+    }
+
+    // Pass B — overflow houses, centre-first with distance-graded spacing.
+    let house_count = city
+        .buildings
+        .iter()
+        .find(|(t, _)| t == "house")
+        .map(|(_, c)| *c)
+        .unwrap_or(0);
+    let max_dist2 = slots.last().map(|s| s.dist2).unwrap_or(1).max(1);
+    let mut placed = 0u32;
+    for s in &slots {
+        if placed >= house_count {
+            break;
+        }
+        if assigned.contains(&(s.sx, s.sy)) {
+            continue;
+        }
+        // Spacing grows 0 → 2 from centre to walls: solid core, sparse
+        // garden-fringe. `frac` is this slot's distance as a fraction of
+        // the farthest slot.
+        let frac = s.dist2 as f64 / max_dist2 as f64;
+        let spacing = (frac * 2.0).round() as i64;
+        if spacing > 0 && has_neighbor_within(&assigned, s.sx, s.sy, spacing) {
+            continue;
+        }
+        if let Some(prefab) = pick_prefab_for_tag("house", tier, s.sx, s.sy) {
+            out.insert((s.sx, s.sy), prefab);
+            assigned.insert((s.sx, s.sy));
+            placed += 1;
+        }
+    }
+    if placed < house_count {
+        crate::logging::info(format_args!(
+            "city {}: placed {placed}/{house_count} houses — wall too small for the manifest",
+            city.name
+        ));
+    }
+
+    out
+}
+
 /// Decide what (if anything) a slot should stamp, before any
 /// street-overlap or chunk-clip considerations. Pure: same inputs
 /// always yield the same `Some(prefab, footprint)`. Returns `None`
@@ -971,6 +1234,7 @@ pub(crate) fn slot_prefab_footprint(
     tier: CityTier,
     wall_world_polygon: &[(i64, i64)],
     slot_tags: &HashMap<(i64, i64), Vec<(String, u32)>>,
+    slot_assignments: &HashMap<(i64, i64), &'static Prefab>,
 ) -> Option<(&'static Prefab, (i64, i64, i64, i64))> {
     let slot_origin_x = slot_x * HOUSE_PITCH + anchor.0;
     let slot_origin_y = slot_y * HOUSE_PITCH + anchor.1;
@@ -993,30 +1257,36 @@ pub(crate) fn slot_prefab_footprint(
         return None;
     }
 
-    // 2. Empty-plot dice (same channel + threshold as legacy block-fill).
     let slot_hash = hash3(slot_x as u64, slot_y as u64, world_seed ^ CITY_SEED_SALT);
-    if (slot_hash & 0xFF) < EMPTY_SLOT_THRESHOLD {
-        return None;
-    }
 
-    // 3. Tag pick. Slots not touched by any tagged street fall back to
-    //    the universal `("house", 1)`. Sorted pool is host-stable.
-    let fallback: [(String, u32); 1] = [(String::from("house"), 1)];
-    let tag_pool: &[(String, u32)] = slot_tags
-        .get(&(slot_x, slot_y))
-        .map(|v| v.as_slice())
-        .unwrap_or(&fallback);
-    let tag_hash = hash3(slot_x as u64, slot_y as u64, world_seed ^ TAG_SEED_SALT);
-    let tag = roulette_pick(tag_pool, tag_hash)?;
-
-    // 4. Variant pick — fall back to the tier's `house` pool if the
-    //    chosen tag has no prefabs (e.g. Village rolling `smithy` when
-    //    only `farrier` is bundled).
-    let cat = catalog();
-    let variant_hash = hash3(slot_x as u64, slot_y as u64, world_seed ^ VARIANT_SEED_SALT);
-    let prefab = cat
-        .pick_variant(tag, tier, variant_hash)
-        .or_else(|| cat.pick_variant("house", tier, variant_hash))?;
+    // 2. Pick the prefab. Two paths:
+    //    - Manifest mode (`slot_assignments` non-empty): the allocator
+    //      already decided this slot at load — empty-plot spacing,
+    //      district rules, and exact counts all live there. An
+    //      unassigned slot is an intentional gap (garden / spacing).
+    //    - Legacy roulette (manifest-less cities): empty-plot dice →
+    //      district tag pick → variant pick, all seeded per slot.
+    let prefab: &'static Prefab = if !slot_assignments.is_empty() {
+        *slot_assignments.get(&(slot_x, slot_y))?
+    } else {
+        if (slot_hash & 0xFF) < EMPTY_SLOT_THRESHOLD {
+            return None;
+        }
+        let fallback: [(String, u32); 1] = [(String::from("house"), 1)];
+        let tag_pool: &[(String, u32)] = slot_tags
+            .get(&(slot_x, slot_y))
+            .map(|v| v.as_slice())
+            .unwrap_or(&fallback);
+        let tag_hash = hash3(slot_x as u64, slot_y as u64, world_seed ^ TAG_SEED_SALT);
+        let tag = roulette_pick(tag_pool, tag_hash)?;
+        // Variant pick — fall back to the tier's `house` pool if the
+        // chosen tag has no prefabs (e.g. Village rolling `smithy` when
+        // only `farrier` is bundled).
+        let cat = catalog();
+        let variant_hash = hash3(slot_x as u64, slot_y as u64, world_seed ^ VARIANT_SEED_SALT);
+        cat.pick_variant(tag, tier, variant_hash)
+            .or_else(|| cat.pick_variant("house", tier, variant_hash))?
+    };
 
     // 5. Slack offset — jitter smaller prefabs within the slot so a
     //    row of cottages doesn't read as one long block.
@@ -1050,15 +1320,23 @@ fn stamp_one_prefab_slot(
     wall_world_polygon: &[(i64, i64)],
     street_cells: &HashSet<(i64, i64)>,
     slot_tags: &HashMap<(i64, i64), Vec<(String, u32)>>,
+    slot_assignments: &HashMap<(i64, i64), &'static Prefab>,
     chunk_origin_x: i64,
     chunk_origin_y: i64,
     chunk_max_x: i64,
     chunk_max_y: i64,
     cells: &mut [CellState],
 ) {
-    let Some((prefab, (pre_min_x, pre_min_y, pre_max_x, pre_max_y))) =
-        slot_prefab_footprint(slot_x, slot_y, anchor, world_seed, tier, wall_world_polygon, slot_tags)
-    else {
+    let Some((prefab, (pre_min_x, pre_min_y, pre_max_x, pre_max_y))) = slot_prefab_footprint(
+        slot_x,
+        slot_y,
+        anchor,
+        world_seed,
+        tier,
+        wall_world_polygon,
+        slot_tags,
+        slot_assignments,
+    ) else {
         return;
     };
 
@@ -1262,32 +1540,32 @@ mod tests {
     fn exeter_bbox_covers_known_features() {
         let loaded = cities().get("Exeter").unwrap();
         let (min_x, min_y, max_x, max_y) = loaded.bbox;
-        // Wall E edge ~+118, Exe Bridge SW corner ~-398, Rougemont N
-        // ~-548, Quay/leat S edge ~+290. Anchor is (0, 0).
-        assert!(min_x <= -398, "min_x = {min_x}, expected ≤ -398 (Exe Bridge)");
-        assert!(min_y <= -548, "min_y = {min_y}, expected ≤ -548 (Rougemont)");
-        assert!(max_x >= 118, "max_x = {max_x}, expected ≥ 118 (wall E)");
-        assert!(max_y >= 290, "max_y = {max_y}, expected ≥ 290 (quay)");
+        // Scaled (1/3) extremes: wall E edge ~+39, Exe Bridge SW corner
+        // ~-133, Rougemont N ~-183, Exe Bridge S edge ~+103. Anchor (0, 0).
+        assert!(min_x <= -133, "min_x = {min_x}, expected ≤ -133 (Exe Bridge)");
+        assert!(min_y <= -183, "min_y = {min_y}, expected ≤ -183 (Rougemont)");
+        assert!(max_x >= 39, "max_x = {max_x}, expected ≥ 39 (wall E)");
+        assert!(max_y >= 103, "max_y = {max_y}, expected ≥ 103 (Exe Bridge)");
     }
 
     #[test]
     fn wall_stamps_into_chunks_along_the_circuit() {
         let loaded = cities().get("Exeter").unwrap();
         let cell_count = (CHUNK_W as usize) * (CHUNK_H as usize);
-        // Chunk (2, -3) covers world cells [80..120)×[-90..-60). The
-        // East-gate vertex (112, -126) is just NE of this chunk, and
-        // the segment from (118, -20) to (98, 85) crosses it.
+        // Chunk (0, -2) covers world cells [0..40)×[-60..-30). The
+        // scaled East-gate vertex (37, -42) sits inside it, and the
+        // wall segments around it cross the chunk.
         let mut cells: Vec<CellState> = (0..cell_count)
             .map(|_| CellState::with_terrain(TerrainKind::Grass))
             .collect();
-        loaded.stamp_into_chunk(ChunkCoord { cx: 2, cy: -3 }, &mut cells, 0);
+        loaded.stamp_into_chunk(ChunkCoord { cx: 0, cy: -2 }, &mut cells, 0);
         let wall_count = cells
             .iter()
             .filter(|c| c.terrain == TerrainKind::StoneWall)
             .count();
         assert!(
             wall_count > 0,
-            "Exeter wall should stamp some StoneWall cells into chunk (2, -3)"
+            "Exeter wall should stamp some StoneWall cells into chunk (0, -2)"
         );
     }
 
@@ -1364,10 +1642,10 @@ mod tests {
     #[test]
     fn streets_stamp_cobble_at_polyline_centers() {
         let grid = build_full_city_grid();
-        // Sample two cells from High Street's polyline. They should
-        // come out as CobbleRoad (or covered by a wider terrain like a
-        // gate or landmark — accept that, but never Grass).
-        for &(wx, wy) in &[(-120i64, -25i64), (20i64, -90i64), (-40i64, -78i64)] {
+        // Sample cells from High Street's polyline. They should come out
+        // as CobbleRoad (or covered by a wider terrain like a gate or
+        // landmark — accept that, but never Grass).
+        for &(wx, wy) in &[(-32i64, -22i64), (7i64, -30i64), (23i64, -36i64)] {
             let t = grid.get(&(wx, wy)).copied().unwrap_or(TerrainKind::Grass);
             assert_ne!(
                 t, TerrainKind::Grass,
@@ -1379,26 +1657,27 @@ mod tests {
     #[test]
     fn cathedral_footprint_is_stone() {
         let grid = build_full_city_grid();
-        // Cathedral rect is (-42,-12) to (42,12). Anchor (0,0). The
-        // centroid (0, 0) is the spawn cell — assert it's StoneWall
-        // (and yes, this means the player currently spawns on stone;
-        // gameplay fix is to relocate the spawn cell or carve a door).
+        // Cathedral rect is (-14,-4) to (14,4) after the 1/3 scale.
+        // Anchor (0,0). The centroid (0, 0) is the spawn cell — assert
+        // it's StoneWall (and yes, this means the player currently spawns
+        // on stone; gameplay fix is to relocate the spawn cell or carve
+        // a door).
         let t = grid.get(&(0i64, 0i64)).copied().unwrap_or(TerrainKind::Grass);
         assert_eq!(t, TerrainKind::StoneWall, "Cathedral centroid should be StoneWall");
-        // A corner inside the rect:
-        let t2 = grid.get(&(40i64, 10i64)).copied().unwrap_or(TerrainKind::Grass);
+        // A cell inside the rect:
+        let t2 = grid.get(&(12i64, 3i64)).copied().unwrap_or(TerrainKind::Grass);
         assert_eq!(t2, TerrainKind::StoneWall, "Cathedral corner should be StoneWall");
     }
 
     #[test]
     fn cathedral_close_is_paved_outside_cathedral() {
         let grid = build_full_city_grid();
-        // (40, 30) is inside the Close polygon but outside the Cathedral
-        // rect (which ends at y=12). Should be CobbleRoad.
-        let t = grid.get(&(40i64, 30i64)).copied().unwrap_or(TerrainKind::Grass);
+        // (0, 15) is inside the Close polygon but outside the Cathedral
+        // rect (which ends at y=4). Should be CobbleRoad.
+        let t = grid.get(&(0i64, 15i64)).copied().unwrap_or(TerrainKind::Grass);
         assert_eq!(
             t, TerrainKind::CobbleRoad,
-            "Close cell (40, 30) outside Cathedral rect should be CobbleRoad"
+            "Close cell (0, 15) outside Cathedral rect should be CobbleRoad"
         );
     }
 
@@ -1478,10 +1757,10 @@ mod tests {
     #[test]
     fn block_fill_does_not_clobber_streets() {
         let grid = build_full_city_grid();
-        // Pick three High Street cells (between west end and east gate).
-        // They should remain CobbleRoad after block-fill — houses only
-        // overwrite Grass cells.
-        for &(wx, wy) in &[(-95i64, -66i64), (20i64, -90i64), (70i64, -108i64)] {
+        // Pick three High Street polyline cells (between Carfax and east
+        // gate). They should remain CobbleRoad after block-fill — houses
+        // only overwrite Grass cells.
+        for &(wx, wy) in &[(-32i64, -22i64), (7i64, -30i64), (23i64, -36i64)] {
             let t = grid.get(&(wx, wy)).copied().unwrap_or(TerrainKind::Grass);
             assert_eq!(
                 t, TerrainKind::CobbleRoad,
@@ -1557,10 +1836,10 @@ mod tests {
                 cc
             );
         }
-        // Rougemont chunks classify as Castle. Motte centroid ~ (-87, -488).
+        // Rougemont chunks classify as Castle. Motte centroid ~ (-28, -162).
         let rougemont_cc = ChunkCoord {
-            cx: (-87i64).div_euclid(CHUNK_W as i64) as i32,
-            cy: (-488i64).div_euclid(CHUNK_H as i64) as i32,
+            cx: (-28i64).div_euclid(CHUNK_W as i64) as i32,
+            cy: (-162i64).div_euclid(CHUNK_H as i64) as i32,
         };
         assert_eq!(
             loaded.chunk_feature(rougemont_cc),
@@ -1641,13 +1920,13 @@ mod tests {
         // (width 1) that the centre line is stamped and the neighbour
         // is NOT — that's the negative anchor — then verify on a wide
         // street that *both* the centre and an off-centre cell stamp.
-        // Smythen midpoint approx (-5, 45):
-        let centre = grid.get(&(-5i64, 45i64)).copied().unwrap_or(TerrainKind::Grass);
+        // Smythen mid vertex (-2, 15):
+        let centre = grid.get(&(-2i64, 15i64)).copied().unwrap_or(TerrainKind::Grass);
         assert_eq!(centre, TerrainKind::CobbleRoad, "Smythen centre should stamp");
-        // High Street polyline cell (-40, -78), width 3, offsets {-1,0,1}.
-        // Both (-40, -78) and (-40, -79) (offset -1 in y) should be cobble.
-        let on  = grid.get(&(-40i64, -78i64)).copied().unwrap_or(TerrainKind::Grass);
-        let off = grid.get(&(-40i64, -79i64)).copied().unwrap_or(TerrainKind::Grass);
+        // High Street polyline cell (7, -30), width 3, offsets {-1,0,1}.
+        // Both (7, -30) and (7, -31) (offset -1 in y) should be cobble.
+        let on  = grid.get(&(7i64, -30i64)).copied().unwrap_or(TerrainKind::Grass);
+        let off = grid.get(&(7i64, -31i64)).copied().unwrap_or(TerrainKind::Grass);
         assert_eq!(on,  TerrainKind::CobbleRoad, "High Street centre should stamp");
         assert_eq!(off, TerrainKind::CobbleRoad, "High Street width-3 neighbour should stamp");
     }
@@ -1677,6 +1956,7 @@ mod tests {
                     loaded.city.tier,
                     &loaded.wall_world_polygon,
                     &loaded.slot_tags,
+                    &loaded.slot_assignments,
                 ) else {
                     continue;
                 };
@@ -1821,6 +2101,130 @@ mod tests {
         assert_ne!(
             gate_t, TerrainKind::StoneWall,
             "Gate cell should not be a wall"
+        );
+    }
+
+    // ---- manifest allocator (allocate_buildings) ----
+
+    /// Slot-centre squared distance to the Carfax, in anchor-relative
+    /// space — mirrors the metric the allocator ranks on.
+    fn slot_dist2_to_center(sx: i64, sy: i64, center: (i64, i64)) -> f64 {
+        let cxr = sx * HOUSE_PITCH + HOUSE_PITCH / 2;
+        let cyr = sy * HOUSE_PITCH + HOUSE_PITCH / 2;
+        let dx = (cxr - center.0) as f64;
+        let dy = (cyr - center.1) as f64;
+        dx * dx + dy * dy
+    }
+
+    /// Eyeball the stamped city at cell resolution: walls/streets/
+    /// buildings around the Carfax. Run via:
+    /// `cargo test --release city_cell_dump -- --nocapture`
+    #[test]
+    fn city_cell_dump() {
+        let grid = build_full_city_grid();
+        let (x0, y0, x1, y1) = (-105i64, -90i64, 45i64, 90i64);
+        println!("Exeter cells x {x0}..={x1}, y {y0}..={y1}");
+        println!("legend: # stone · w wood · . floor · , cobble · space grass");
+        for wy in y0..=y1 {
+            let mut row = String::new();
+            for wx in x0..=x1 {
+                row.push(match grid.get(&(wx, wy)).copied() {
+                    Some(TerrainKind::StoneWall) => '#',
+                    Some(TerrainKind::WoodWall) => 'w',
+                    Some(TerrainKind::Floor) => '.',
+                    Some(TerrainKind::CobbleRoad) => ',',
+                    _ => ' ',
+                });
+            }
+            println!("{row}");
+        }
+    }
+
+    #[test]
+    fn manifest_places_exact_counts() {
+        let loaded = cities().get("Exeter").unwrap();
+        assert!(
+            !loaded.city.buildings.is_empty(),
+            "Exeter should carry a building manifest"
+        );
+        let mut counts: HashMap<&str, u32> = HashMap::new();
+        for prefab in loaded.slot_assignments.values() {
+            *counts.entry(prefab.tag.as_str()).or_insert(0) += 1;
+        }
+        // Every tag has a real prefab now, so the assigned prefab's tag
+        // matches the request exactly (no house fallback).
+        for (tag, want) in &loaded.city.buildings {
+            let got = counts.get(tag.as_str()).copied().unwrap_or(0);
+            assert_eq!(
+                got, *want,
+                "tag `{tag}`: allocated {got}, manifest wants {want}"
+            );
+        }
+        let total: u32 = loaded.city.buildings.iter().map(|(_, c)| *c).sum();
+        assert_eq!(
+            loaded.slot_assignments.len() as u32,
+            total,
+            "total assigned slots ({}) should equal the manifest sum ({total})",
+            loaded.slot_assignments.len()
+        );
+    }
+
+    #[test]
+    fn manifest_allocation_is_deterministic() {
+        let loaded = cities().get("Exeter").unwrap();
+        let run = || {
+            let m = allocate_buildings(
+                &loaded.city,
+                loaded.anchor,
+                &loaded.wall_world_polygon,
+                loaded.wall_bbox,
+                &loaded.slot_tags,
+            );
+            let mut v: Vec<(i64, i64, String)> = m
+                .into_iter()
+                .map(|((x, y), p)| (x, y, p.variant.clone()))
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(run(), run(), "allocation must be deterministic");
+    }
+
+    #[test]
+    fn manifest_center_gravity() {
+        // Market trades cluster at the Carfax; commoner houses spread out
+        // toward the walls; nuisance/water trades sit at the periphery.
+        let loaded = cities().get("Exeter").unwrap();
+        let center = loaded
+            .city
+            .center
+            .unwrap_or_else(|| polygon_centroid_rel(&loaded.city.wall.polygon));
+
+        let mut market: Vec<f64> = Vec::new(); // central trades
+        let mut peripheral: Vec<f64> = Vec::new(); // tanner/fuller/mill
+        let mut houses: Vec<f64> = Vec::new();
+        for (&(sx, sy), prefab) in &loaded.slot_assignments {
+            let d = slot_dist2_to_center(sx, sy, center);
+            match prefab.tag.as_str() {
+                "house" => houses.push(d),
+                t if is_peripheral_tag(t) => peripheral.push(d),
+                _ => market.push(d),
+            }
+        }
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
+        let market_mean = mean(&market);
+        let house_mean = mean(&houses);
+        let peripheral_mean = mean(&peripheral);
+
+        assert!(
+            market_mean < house_mean,
+            "market trades (mean d² {market_mean:.0}) should sit nearer the \
+             Carfax than houses (mean d² {house_mean:.0})"
+        );
+        assert!(
+            peripheral_mean > market_mean,
+            "peripheral trades (mean d² {peripheral_mean:.0}) should sit \
+             farther out than market trades (mean d² {market_mean:.0})"
         );
     }
 }

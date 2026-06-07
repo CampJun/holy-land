@@ -1,0 +1,24 @@
+// Parish church — St Petroc's at the Carfax. Stone, with a west door
+// onto the street. Starter silhouette; carve nave/chancel and add an
+// altar Station in the prefab editor.
+Prefab(
+    tag: "church",
+    tier: Urban,
+    variant: "parish",
+    weight: 5,
+    size: (7, 7),
+    palette: {
+        '#': StoneWall,
+        '.': Floor,
+        'o': CobbleRoad,
+    },
+    grid: [
+        "#######",
+        "#.....#",
+        "#.....#",
+        "o.....#",
+        "#.....#",
+        "#.....#",
+        "#######",
+    ],
+)

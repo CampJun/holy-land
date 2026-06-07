@@ -1,0 +1,21 @@
+// Fuller / dyer — cloth-finishing by the leat (peripheral, water-side).
+// Timber workshop with vats. Starter; edit in the prefab editor.
+Prefab(
+    tag: "fuller",
+    tier: Urban,
+    variant: "workshop",
+    weight: 5,
+    size: (6, 5),
+    palette: {
+        '#': WoodWall,
+        '.': Floor,
+        'o': CobbleRoad,
+    },
+    grid: [
+        "######",
+        "#....#",
+        "#....o",
+        "#....#",
+        "######",
+    ],
+)

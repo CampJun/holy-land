@@ -10,14 +10,18 @@
 // every y here is sign-flipped from the source JSON. North gate has
 // negative y, south gate positive y, etc.
 //
-// FOOTPRINT
-// Wall bbox spans x ∈ [-305, 118], y ∈ [-255, 250]. Rougemont sits
-// ~470 cells north of the cathedral (off the wall's NE corner) and
-// Exe Bridge crosses ~310 cells SW. The city's overall bbox reaches
-// roughly 14×31 chunks — much larger than the 9×9 biome-override
-// radius. City stamping is bbox-driven (see `city.rs::LoadedCity`)
-// so the wall stamps correctly across all those chunks regardless of
-// `named_site` radius.
+// FOOTPRINT — scaled to 1/3 linear (≈1:9 area) from the real Exeter
+// outline so a ~57-building, ~250-resident town fills the walls instead
+// of rattling around an empty circuit. Population scales 1:20 but area
+// only ~1:9 on purpose: that headroom keeps the burgage gardens and the
+// dense-core → sparse-wall gradient that read as a medieval city. Every
+// coord below is the research geometry × 1/3 (rounded); gate/wall/street
+// junctions stay coincident because identical inputs round identically.
+// Wall bbox now spans x ∈ [-102, 39], y ∈ [-83, 85] (~141×168 cells);
+// Rougemont sits ~160 cells north, the Exe Bridge ~100 cells SW. Overall
+// bbox is ~5×10 chunks. City stamping is bbox-driven (see
+// `city.rs::LoadedCity`) so the wall stamps across all those chunks
+// regardless of `named_site` radius.
 //
 // CAVEATS (from research's open-questions section)
 // The wall circuit, Cathedral Close wall-line, castle earthwork,
@@ -34,85 +38,115 @@
 City(
     name: "Exeter",
     tier: Urban,
+
+    // The Carfax (Quatrefoix) — the central crossroads where High /
+    // Fore / North / South Streets meet. Trades gravitate toward this
+    // point; houses thin out from here toward the walls.
+    center: Some((-40, -8)),
+
+    // Exact building manifest for a 1:20-scaled Exeter (~250 residents
+    // at ~4.5/household → ~57 occupied plots). Counts from Kowaleski's
+    // occupational study + medieval service ratios; districts honour the
+    // real street geography (smiths on Smythen, etc.). `house` is the
+    // commoner-dwelling filler. The allocator (city.rs::allocate_buildings)
+    // places these exact counts centre-weighted within their districts.
+    buildings: [
+        ("merchant_house", 4),  // High/North/South St frontage, the wealthy core
+        ("mercer",         2),  // drapers / general traders, central
+        ("tavern",         2),  // ~1 per 125 souls
+        ("bakehouse",      1),  // bread monopoly
+        ("butcher",        1),  // the Shambles (Smythen/Milk)
+        ("goldsmith",      1),  // Goldsmith Street
+        ("smithy",         2),  // Smythen Street (district-tagged)
+        ("cordwainer",     1),  // shoemaker
+        ("tailor",         1),
+        ("weaver",         2),  // Exeter's cloth trade
+        ("fuller",         1),  // peripheral — cloth-finishing by the leat
+        ("tanner",         1),  // peripheral — nuisance trade by the river
+        ("mill",           1),  // peripheral — water-powered
+        ("church",         1),  // St Petroc's parish church
+        ("house",          36), // commoner dwellings, fill remainder
+    ],
+
     wall: Wall(
         // Irregular ~21-vertex circuit (closed; last vertex omitted —
         // the stamper closes the loop). Clockwise in our coords
         // (north is up = negative y).
         polygon: [
-            (-305,  155),
-            (-270,   70),
-            (-235,   10),
-            (-188,  -70),
-            (-140, -150),
-            ( -70, -220),
-            ( -10, -250),
-            (  35, -245),
-            ( 105, -170),
-            ( 112, -126),
-            ( 118,  -20),
-            (  98,   85),
-            (  62,  150),
-            (  38,  182),
-            (  18,  210),
-            ( -55,  245),
-            (-120,  255),
-            (-200,  235),
-            (-236,  199),
-            (-270,  195),
+            (-102, 52),
+            (-90, 23),
+            (-78, 3),
+            (-63, -23),
+            (-47, -50),
+            (-23, -73),
+            (-3, -83),
+            (12, -82),
+            (35, -57),
+            (37, -42),
+            (39, -7),
+            (33, 28),
+            (21, 50),
+            (13, 61),
+            (6, 70),
+            (-18, 82),
+            (-40, 85),
+            (-67, 78),
+            (-79, 66),
+            (-90, 65),
         ],
         gates: [
             // Widths from recorded gate-passage archaeology
             // (3.35–3.96 m N gate; ~17 m S gatehouse with foot-passage;
             // W single-arch). E gate kept at 4 by parity with Hooker.
-            Gate(name: "North Gate", cell: (-188,  -70), width: 3),
-            Gate(name: "East Gate",  cell: ( 112, -126), width: 4),
-            Gate(name: "South Gate", cell: (  38,  182), width: 4),
-            Gate(name: "West Gate",  cell: (-236,  199), width: 3),
+            Gate(name: "North Gate", cell: (-63, -23), width: 3),
+            Gate(name: "East Gate",  cell: (37, -42), width: 4),
+            Gate(name: "South Gate", cell: (13, 61), width: 4),
+            Gate(name: "West Gate",  cell: (-79, 66), width: 3),
         ],
     ),
 
     // Parsed but not yet stamped (task: streets+landmarks card).
     streets: [
         Street(name: "High Street",    width: 3, polyline: [
-            (-120,  -25),
-            ( -95,  -66),
-            ( -40,  -78),
-            (  20,  -90),
-            (  70, -108),
-            ( 112, -126),
+            (-40, -8),
+            (-32, -22),
+            (-13, -26),
+            (7, -30),
+            (23, -36),
+            (37, -42),
         ]),
         Street(name: "Fore Street",    width: 3, polyline: [
-            (-236,  199),
-            (-210,  160),
-            (-182,  118),
-            (-154,   74),
-            (-135,   35),
-            (-120,  -25),
+            (-79, 66),
+            (-70, 53),
+            (-61, 39),
+            (-51, 25),
+            (-45, 12),
+            (-40, -8),
         ]),
         Street(name: "North Street",   width: 3, polyline: [
-            (-120,  -25),
-            (-140,  -45),
-            (-160,  -60),
-            (-176,  -68),
-            (-188,  -70),
+            (-40, -8),
+            (-47, -15),
+            (-53, -20),
+            (-59, -23),
+            (-63, -23),
         ]),
         Street(name: "South Street",   width: 3, polyline: [
-            (-120,  -25),
-            ( -95,   15),
-            ( -60,   70),
-            ( -10,  135),
-            (  38,  182),
+            (-40, -8),
+            (-32, 5),
+            (-20, 23),
+            (-3, 45),
+            (13, 61),
         ]),
         // Smythen St. ("smiths' lane") — historically clustered with
         // armurers / cutlers / bladesmiths per Exeter Mayor's Court
         // Rolls 1300-1310. Tag a 50/50 smithy/house mix so fronting
         // slots roll a smithy prefab roughly half the time.
         Street(name: "Smythen Street", width: 1, tag_weights: [("smithy", 5), ("house", 5)], polyline: [
-            ( -55,  -55),
-            ( -32,  -10),
-            (  -5,   45),
-            (  22,  100),
-            (  50,  160),
+            (-18, -18),
+            (-11, -3),
+            (-2, 15),
+            (7, 33),
+            (17, 53),
         ]),
     ],
 
@@ -124,17 +158,17 @@ City(
             name: "Cathedral Close",
             kind: PavedArea,
             footprint: Polygon([
-                ( -72,  -48),
-                ( -20,  -56),
-                (  32,  -54),
-                (  52,  -36),
-                (  58,   -8),
-                (  46,   34),
-                (  28,   66),
-                (   1,   80),
-                ( -24,   80),
-                ( -50,   55),
-                ( -66,   18),
+                (-24, -16),
+                (-7, -19),
+                (11, -18),
+                (17, -12),
+                (19, -3),
+                (15, 11),
+                (9, 22),
+                (0, 27),
+                (-8, 27),
+                (-17, 18),
+                (-22, 6),
             ]),
         ),
         // StoneMass: solid StoneWall fill (v1 silhouette — interiors
@@ -142,31 +176,31 @@ City(
         Landmark(
             name: "Cathedral",
             kind: StoneMass,
-            footprint: Rect((-42, -12), (42, 12)),
+            footprint: Rect((-14, -4), (14, 4)),
         ),
         Landmark(
             name: "Rougemont Motte",
             kind: StoneMass,
             footprint: Polygon([
-                (-145, -470),
-                (-130, -525),
-                ( -88, -548),
-                ( -40, -532),
-                ( -20, -490),
-                ( -38, -448),
-                ( -85, -435),
-                (-130, -448),
+                (-48, -157),
+                (-43, -175),
+                (-29, -183),
+                (-13, -177),
+                (-7, -163),
+                (-13, -149),
+                (-28, -145),
+                (-43, -149),
             ]),
         ),
         Landmark(
             name: "Rougemont Keep",
             kind: StoneMass,
-            footprint: Rect((-95, -506), (-62, -480)),
+            footprint: Rect((-32, -169), (-21, -160)),
         ),
         Landmark(
             name: "Guildhall",
             kind: StoneMass,
-            footprint: Rect((-96, 65), (-94, 67)),
+            footprint: Rect((-32, 22), (-31, 22)),
         ),
         // Bridge / WaterChannel: parsed for bbox but NOT stamped in v1
         // — they need river context (cells the bridge sits over should
@@ -177,35 +211,35 @@ City(
             name: "Exe Bridge",
             kind: Bridge,
             footprint: Polygon([
-                (-245,  205),
-                (-282,  232),
-                (-320,  258),
-                (-360,  285),
-                (-398,  310),
+                (-82, 68),
+                (-94, 77),
+                (-107, 86),
+                (-120, 95),
+                (-133, 103),
             ]),
         ),
         Landmark(
             name: "Riverside Quay",
             kind: PavedArea,
             footprint: Polygon([
-                (-182,  244),
-                ( -88,  248),
-                ( -60,  268),
-                ( -86,  286),
-                (-158,  290),
-                (-202,  276),
+                (-61, 81),
+                (-29, 83),
+                (-20, 89),
+                (-29, 95),
+                (-53, 97),
+                (-67, 92),
             ]),
         ),
         Landmark(
             name: "Mill Leat",
             kind: WaterChannel,
             footprint: Polygon([
-                (-214,  238),
-                (-150,  228),
-                ( -84,  227),
-                ( -22,  223),
-                (  40,  216),
-                (  72,  210),
+                (-71, 79),
+                (-50, 76),
+                (-28, 76),
+                (-7, 74),
+                (13, 72),
+                (24, 70),
             ]),
         ),
     ],

@@ -1,0 +1,21 @@
+// Weaver — Exeter's cloth trade. Timber workshop with room for a loom.
+// Starter; add the loom as a Station object in the prefab editor.
+Prefab(
+    tag: "weaver",
+    tier: Urban,
+    variant: "loom",
+    weight: 5,
+    size: (6, 5),
+    palette: {
+        '#': WoodWall,
+        '.': Floor,
+        'o': CobbleRoad,
+    },
+    grid: [
+        "######",
+        "#....#",
+        "o....#",
+        "#....#",
+        "######",
+    ],
+)

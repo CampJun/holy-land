@@ -1,0 +1,20 @@
+// Butcher — the Shambles, clustered at Smythen/Milk St. Small timber
+// shop with a street-facing block. Starter; edit in the prefab editor.
+Prefab(
+    tag: "butcher",
+    tier: Urban,
+    variant: "shambles",
+    weight: 5,
+    size: (5, 4),
+    palette: {
+        '#': WoodWall,
+        '.': Floor,
+        'o': CobbleRoad,
+    },
+    grid: [
+        "#####",
+        "#...o",
+        "#...#",
+        "#####",
+    ],
+)

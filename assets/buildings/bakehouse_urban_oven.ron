@@ -1,0 +1,22 @@
+// Bakehouse — held the bread-baking monopoly. Stone walls around the
+// oven. Starter; add the oven as a Light/Station object in the prefab
+// editor.
+Prefab(
+    tag: "bakehouse",
+    tier: Urban,
+    variant: "oven",
+    weight: 5,
+    size: (5, 5),
+    palette: {
+        '#': StoneWall,
+        '.': Floor,
+        'o': CobbleRoad,
+    },
+    grid: [
+        "#####",
+        "#...#",
+        "#...o",
+        "#...#",
+        "#####",
+    ],
+)

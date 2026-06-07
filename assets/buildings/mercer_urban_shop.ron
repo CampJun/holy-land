@@ -1,0 +1,22 @@
+// Mercer / draper — cloth & general-goods trader, central High St.
+// Timber shopfront over a ground-floor stall. Starter; edit in the
+// prefab editor.
+Prefab(
+    tag: "mercer",
+    tier: Urban,
+    variant: "shop",
+    weight: 5,
+    size: (6, 5),
+    palette: {
+        '#': WoodWall,
+        '.': Floor,
+        'o': CobbleRoad,
+    },
+    grid: [
+        "######",
+        "#....#",
+        "#....o",
+        "#....#",
+        "######",
+    ],
+)

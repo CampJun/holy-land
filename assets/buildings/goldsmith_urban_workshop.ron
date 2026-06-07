@@ -1,0 +1,21 @@
+// Goldsmith — Goldsmith Street, one of Exeter's assay towns. Stone for
+// security. Starter; edit in the prefab editor.
+Prefab(
+    tag: "goldsmith",
+    tier: Urban,
+    variant: "workshop",
+    weight: 5,
+    size: (5, 5),
+    palette: {
+        '#': StoneWall,
+        '.': Floor,
+        'o': CobbleRoad,
+    },
+    grid: [
+        "#####",
+        "#...#",
+        "o...#",
+        "#...#",
+        "#####",
+    ],
+)

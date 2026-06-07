@@ -1,0 +1,22 @@
+// Tavern / inn — ~1 per 125 souls. Large timber hall with a wide
+// street door. Starter; edit in the prefab editor.
+Prefab(
+    tag: "tavern",
+    tier: Urban,
+    variant: "inn",
+    weight: 5,
+    size: (7, 6),
+    palette: {
+        '#': WoodWall,
+        '.': Floor,
+        'o': CobbleRoad,
+    },
+    grid: [
+        "#######",
+        "#.....#",
+        "#.....#",
+        "o.....#",
+        "#.....#",
+        "#######",
+    ],
+)
