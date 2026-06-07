@@ -6,6 +6,14 @@
 // Uppacott). 5×5 single-room footprint represents the human end
 // of a longhouse; the byre end is omitted at this scale. Timber-
 // framed with cob infill, modelled as WoodWall.
+// The 2.5D facade reads as a front-on house: a tiled roof up top, a
+// timber wall band below, windows set into the walls and a door at
+// front-centre. The door faces south (the `.` gap in the bottom wall)
+// so the player walks up into it; stepping onto any interior cell
+// suppresses this building's roof and the single room shows through
+// (roof-reveal, see flora::Roof). Roof char -> Sheet::Structures (col, row):
+//   l/m/r  roof overhang (top edge)   L/M/R  roof body (full tiles)
+//   W      timber wall   O  window    D  door
 Prefab(
     tag: "house",
     tier: Village,
@@ -15,13 +23,26 @@ Prefab(
     palette: {
         '#': WoodWall,
         '.': Floor,
-        'o': BareDirt,
     },
     grid: [
         "#####",
         "#...#",
-        "#...o",
         "#...#",
-        "#####",
+        "#...#",
+        "##.##",
+    ],
+    roof_palette: {
+        'l': (5, 1), 'm': (6, 1), 'r': (7, 1),
+        'L': (5, 2), 'M': (6, 2), 'R': (7, 2),
+        'W': (8, 30),
+        'O': (4, 38),
+        'D': (0, 42),
+    },
+    roof: [
+        "lmmmr",
+        "LMMMR",
+        "WOWOW",
+        "WWWWW",
+        "WWDWW",
     ],
 )

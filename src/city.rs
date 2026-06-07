@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use crate::buildings::{catalog, CityTier, Prefab};
+use crate::flora::Roof;
 use crate::world::{CellState, GroundCover, TerrainKind, CHUNK_H, CHUNK_W, ChunkCoord};
 
 #[derive(Debug, Deserialize)]
@@ -1086,7 +1087,7 @@ fn stamp_one_prefab_slot(
         for wx in clip_min_x..=clip_max_x {
             let px = (wx - pre_min_x) as u16;
             let py = (wy - pre_min_y) as u16;
-            let Some(t) = prefab.cell_at(px, py) else { continue };
+            let Some((t, tag_sprite)) = prefab.resolve_cell(px, py) else { continue };
             let lx = (wx - chunk_origin_x) as usize;
             let ly = (wy - chunk_origin_y) as usize;
             let idx = ly * (CHUNK_W as usize) + lx;
@@ -1094,6 +1095,23 @@ fn stamp_one_prefab_slot(
                 continue;
             }
             set_terrain(cells, lx, ly, t);
+            // Per-cell base sprite from the sprite-tag catalog (tag palette
+            // cells); legacy TerrainKind cells leave it None (default look).
+            cells[idx].terrain_sprite = tag_sprite;
+            // 2.5D roof overlay: paint this cell's Structures facade slice
+            // (if the prefab has a roof layer). All cells of one building
+            // share the footprint's top-left as `anchor`; walkable cells
+            // (floor / door gap) reveal the roof when stood on.
+            if let Some((col, row)) = prefab.roof_at(px, py) {
+                cells[idx].roof = Some(Roof {
+                    anchor: (pre_min_x as i32, pre_min_y as i32),
+                    col,
+                    row,
+                    is_interior: t.def().walkable,
+                });
+            }
+            // Interior object layer (furniture / station / container / light).
+            cells[idx].object = prefab.object_at(px, py);
         }
     }
 }
@@ -1143,6 +1161,9 @@ fn set_terrain(cells: &mut [CellState], lx: usize, ly: usize, terrain: TerrainKi
     cells[idx].tree_species = None;
     cells[idx].canopy = None;
     cells[idx].decoration = crate::flora::Decoration::None;
+    cells[idx].roof = None;
+    cells[idx].terrain_sprite = None;
+    cells[idx].object = None;
 }
 
 /// Even-odd ray-cast point-in-polygon test. f64 internally to keep the
@@ -1735,6 +1756,50 @@ mod tests {
             "no smithy StoneWall cells landed in the Smythen Street strip — \
              expected at least one armurer prefab to roll"
         );
+    }
+
+    #[test]
+    fn roofed_workshops_stamp_with_consistent_anchor_and_interior() {
+        // Stamp the whole city and collect every roofed cell with the
+        // terrain beneath it. The timber workshop carries a roof layer
+        // (weight 3 in a large house pool), so at least one must land.
+        let loaded = cities().get("Exeter").unwrap();
+        let (min_x, min_y, max_x, max_y) = loaded.bbox;
+        let cx_min = min_x.div_euclid(CHUNK_W as i64) as i32;
+        let cy_min = min_y.div_euclid(CHUNK_H as i64) as i32;
+        let cx_max = max_x.div_euclid(CHUNK_W as i64) as i32;
+        let cy_max = max_y.div_euclid(CHUNK_H as i64) as i32;
+        let cell_count = (CHUNK_W as usize) * (CHUNK_H as usize);
+        let mut roofed: Vec<(crate::flora::Roof, TerrainKind)> = Vec::new();
+        for cy in cy_min..=cy_max {
+            for cx in cx_min..=cx_max {
+                let mut cells: Vec<CellState> = (0..cell_count)
+                    .map(|_| CellState::with_terrain(TerrainKind::Grass))
+                    .collect();
+                loaded.stamp_into_chunk(ChunkCoord { cx, cy }, &mut cells, 0);
+                for c in &cells {
+                    if let Some(r) = c.roof {
+                        roofed.push((r, c.terrain));
+                    }
+                }
+            }
+        }
+        assert!(
+            !roofed.is_empty(),
+            "expected at least one roofed building to stamp in Exeter"
+        );
+        // The core invariant (robust to however the roofed prefab is authored
+        // in the editor): is_interior must track the terrain under each roof
+        // cell exactly — walkable floor / shopfront reveals; solid wall does
+        // not. Cells of one building also share a single anchor.
+        for (r, terrain) in &roofed {
+            assert_eq!(
+                r.is_interior,
+                terrain.def().walkable,
+                "roof is_interior must match terrain walkability at {:?}",
+                r.anchor
+            );
+        }
     }
 
     #[test]

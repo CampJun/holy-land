@@ -602,6 +602,9 @@ pub fn terrain_sprite(kind: TerrainKind) -> Sprite {
         TerrainKind::WoodWall => walls::WOOD,
         TerrainKind::Floor => overworld::COBBLE,
         TerrainKind::CobbleRoad => overworld::COBBLE,
+        // Default look only; sprite-driven Solid cells carry a per-cell
+        // `terrain_sprite` override that the compose loop prefers.
+        TerrainKind::Solid => walls::STONE,
     }
 }
 
@@ -636,6 +639,7 @@ pub fn item_sprite(kind: ItemKind) -> Sprite {
         ItemKind::Firewood => I::WOOD_LOG,
         ItemKind::GrassBlade => I::LEAF_GREEN,
         ItemKind::Stone => I::STONE,
+        ItemKind::IronNail => I::ORE,
         ItemKind::MossPatch => I::LEAF_GREEN,
         ItemKind::Mud => I::STONE,
         ItemKind::Log => I::WOOD_LOG,

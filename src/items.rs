@@ -126,6 +126,9 @@ pub enum ItemKind {
     /// Stackable crossbow ammo. Consumed per shot; same 70/30 recovery
     /// shape as `Arrow`.
     CrossbowBolt,
+    /// Phase 3 — forged at an anvil (metallurgy station). A simple proof
+    /// product; a building/repair material once those systems land.
+    IronNail,
 }
 
 /// All per-kind metadata in one place. Adding a new `ItemKind` variant is
@@ -233,6 +236,7 @@ const ALL_KINDS: &[ItemKind] = &[
     ItemKind::CrossbowBolt,
     ItemKind::Cudgel,
     ItemKind::Quarterstaff,
+    ItemKind::IronNail,
 ];
 
 impl ItemKind {
@@ -409,6 +413,18 @@ impl ItemKind {
                 color: [80, 160, 70],
                 default_weight_g: 2,
                 blends_with_terrain: true,
+                weapon: None,
+                armor: None,
+                ranged: None,
+            },
+            ItemKind::IronNail => ItemDef {
+                save_key: "iron_nail",
+                name: "iron nail",
+                is_fungible: true,
+                glyph: b'+',
+                color: [180, 180, 190],
+                default_weight_g: 15,
+                blends_with_terrain: false,
                 weapon: None,
                 armor: None,
                 ranged: None,

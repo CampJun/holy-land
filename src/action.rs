@@ -123,6 +123,9 @@ pub enum ActionId {
     /// The Aim verb refuses to commit a shot while the crossbow is
     /// unloaded.
     Reload,
+    /// Phase 3 — forge an iron nail at an anvil (metallurgy station).
+    /// Station-gated: only available standing on/next to an anvil object.
+    ForgeNail,
 }
 
 impl ActionId {
@@ -192,6 +195,7 @@ impl ActionId {
             // per the Reach and ranged card. Real spend happens inside
             // `perform_crossbow_reload`; this is just the menu readout.
             ActionId::Reload => 300,
+            ActionId::ForgeNail => 6_000,
         }
     }
 
@@ -235,6 +239,7 @@ impl ActionId {
             ActionId::DragEnd => "drag_end",
             ActionId::ChopLog => "chop_log",
             ActionId::Reload => "reload",
+            ActionId::ForgeNail => "forge_nail",
         }
     }
 
@@ -275,6 +280,7 @@ impl ActionId {
             "drag_end" => ActionId::DragEnd,
             "chop_log" => ActionId::ChopLog,
             "reload" => ActionId::Reload,
+            "forge_nail" => ActionId::ForgeNail,
             _ => return None,
         })
     }
@@ -558,6 +564,11 @@ pub fn evaluate(world: &World, id: ActionId) -> Availability {
         }
         ActionId::ChopLog => eval_chop_log(world, cost),
         ActionId::Reload => eval_reload(world),
+        ActionId::ForgeNail => Availability::from_has(
+            world.player_near_station("metallurgy"),
+            cost,
+            "need an anvil (metallurgy station)",
+        ),
     }
 }
 
@@ -926,7 +937,33 @@ pub fn execute(world: &mut World, id: ActionId) -> ExecuteOutcome {
         }
         ActionId::ChopLog => execute_chop_log(world),
         ActionId::Reload => execute_reload(world),
+        ActionId::ForgeNail => execute_forge_nail(world),
     }
+}
+
+/// Phase 3 station recipe: forge iron nails at an anvil + train Metallurgy.
+fn execute_forge_nail(world: &mut World) -> ExecuteOutcome {
+    if !world.player_near_station("metallurgy") {
+        return ExecuteOutcome::Done("you need an anvil".to_string());
+    }
+    world.spend_moves(ActionId::ForgeNail.move_cost());
+    let nails = ItemInstance::stack(
+        ItemKind::IronNail,
+        4,
+        ItemKind::IronNail.def().default_weight_g,
+        None,
+        ItemMetadata::None,
+    );
+    let _ = world.player_pack_mut().try_add(nails);
+    let mut skills = world.player_skills();
+    let leveled = crate::skill::award_xp(skills.get_mut(crate::skill::SkillKind::Metallurgy), true);
+    world.set_player_skills(skills);
+    let msg = if leveled {
+        "you forge 4 iron nails (Metallurgy up!)"
+    } else {
+        "you forge 4 iron nails (+metallurgy)"
+    };
+    ExecuteOutcome::Done(msg.to_string())
 }
 
 fn execute_reload(world: &mut World) -> ExecuteOutcome {
@@ -3066,6 +3103,39 @@ mod tests {
         assert!(matches!(pan.metadata, ItemMetadata::None));
         let cooked = cell.items.iter().find(|i| i.kind == ItemKind::Cooked);
         assert!(cooked.is_some(), "fish should spill onto cell as cooked");
+    }
+
+    #[test]
+    fn forge_nail_is_gated_by_an_adjacent_anvil_station() {
+        use crate::objects::{Object, ObjectKind};
+        use crate::sprites::{Sheet, Sprite};
+        let mut world = World::new(CHUNK_W, CHUNK_H);
+        // No station nearby -> unavailable with the anvil reason.
+        match evaluate(&world, ActionId::ForgeNail) {
+            Availability::Unavailable { reason } => assert!(reason.contains("anvil")),
+            other => panic!("expected unavailable, got {other:?}"),
+        }
+        // Drop an anvil station on the cell beside the player.
+        let p = world.player_pos();
+        let anvil = Object {
+            sprite: Sprite::at(Sheet::InteriorFixtures, 0, 0),
+            kind: ObjectKind::Station("metallurgy".into()),
+        };
+        world
+            .cell_at_mut((p.x + 1) as i64, p.y as i64)
+            .expect("neighbour cell loaded")
+            .object = Some(anvil);
+        // Now forging is available.
+        assert!(matches!(
+            evaluate(&world, ActionId::ForgeNail),
+            Availability::Available { .. }
+        ));
+        // And it actually forges nails + trains Metallurgy.
+        let before = world.player_skills().metallurgy;
+        let _ = execute(&mut world, ActionId::ForgeNail);
+        assert!(world.player_pack().has_stack(ItemKind::IronNail));
+        let after = world.player_skills().metallurgy;
+        assert!(after.value > before.value || after.daily_xp > before.daily_xp);
     }
 
     #[test]

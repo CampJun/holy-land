@@ -5,8 +5,11 @@ edition = "2021"
 description = "Low-fantasy biblical Holy Land sim/roguelike, CP437 rendering."
 
 [features]
-default = ["gilrs"]
+default = ["gilrs", "editor"]
 gilrs = ["dep:gilrs"]
+# Desktop-only prefab stamp editor binary. Off for the Miyoo cross build
+# (which builds with --no-default-features), so it's never compiled for ARM.
+editor = []
 
 [dependencies]
 sdl2 = "0.37"
@@ -30,3 +33,11 @@ lto = true
 codegen-units = 1
 panic = "abort"
 opt-level = 3
+
+# Mouse-driven desktop tool for designing building prefabs (terrain + roof
+# layers), reusing the game's render pipeline for pixel-identical previews.
+# Gated behind the `editor` feature so the ARM cross build skips it.
+[[bin]]
+name = "prefab-editor"
+path = "src/bin/prefab_editor.rs"
+required-features = ["editor"]

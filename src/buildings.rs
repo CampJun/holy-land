@@ -13,6 +13,9 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+use crate::objects::Object;
+use crate::sprite_tags::{catalog as tag_catalog, Role};
+use crate::sprites::Sprite;
 use crate::world::TerrainKind;
 
 /// Settlement size. Drives which prefab pool a tag draws from — an
@@ -39,7 +42,31 @@ pub struct Prefab {
     pub weight: u32,
     pub size: (u16, u16),
     pub palette: HashMap<char, TerrainKind>,
+    /// Tag-based terrain palette: char -> sprite-tag name (see `sprite_tags`).
+    /// Resolved to a passability carrier (`Floor`/`Solid`) + a per-cell sprite.
+    /// Takes precedence over `palette` for the same char; lets a prefab paint
+    /// any sheet cell as wall/floor. Additive — legacy `palette` still works.
+    #[serde(default)]
+    pub tag_palette: HashMap<char, String>,
     pub grid: Vec<String>,
+    /// Optional 2.5D roof facade layer, same dimensions as `grid`. Each
+    /// non-space char maps via `roof_palette` to a `Sheet::Structures`
+    /// `(col, row)` cell — roof slope on the upper rows, wall + window +
+    /// door facade on the bottom row. Empty = no roof (renders as flat
+    /// walls, like every prefab before roofs existed).
+    #[serde(default)]
+    pub roof: Vec<String>,
+    /// Char → `Sheet::Structures` `(col, row)` for the `roof` layer.
+    #[serde(default)]
+    pub roof_palette: HashMap<char, (u8, u8)>,
+    /// Optional interior-object layer, same dimensions as `grid`. Each
+    /// non-space char maps via `objects_palette` to a sprite-tag name whose
+    /// (non-terrain) role becomes the cell's `objects::Object`.
+    #[serde(default)]
+    pub objects: Vec<String>,
+    /// Char → sprite-tag name for the `objects` layer.
+    #[serde(default)]
+    pub objects_palette: HashMap<char, String>,
 }
 
 impl Prefab {
@@ -55,12 +82,72 @@ impl Prefab {
     /// cell, let whatever was here before show through" (useful for
     /// non-rectangular footprints).
     pub fn cell_at(&self, x: u16, y: u16) -> Option<TerrainKind> {
+        self.resolve_cell(x, y).map(|(kind, _)| kind)
+    }
+
+    /// The sprite-tag name a cell references (tag_palette), if any. Used by the
+    /// editor to round-trip the terrain layer as tags.
+    pub fn tag_palette_name(&self, x: u16, y: u16) -> Option<&str> {
+        let row = self.grid.get(y as usize)?;
+        let ch = row.chars().nth(x as usize)?;
+        self.tag_palette.get(&ch).map(|s| s.as_str())
+    }
+
+    /// The object-tag name a cell references (objects layer), if any. Editor
+    /// round-trip for the object layer.
+    pub fn objects_palette_name(&self, x: u16, y: u16) -> Option<&str> {
+        let row = self.objects.get(y as usize)?;
+        let ch = row.chars().nth(x as usize)?;
+        self.objects_palette.get(&ch).map(|s| s.as_str())
+    }
+
+    /// Resolve a grid cell to its passability carrier `TerrainKind` plus an
+    /// optional per-cell sprite. A `tag_palette` char looks up the sprite-tag
+    /// catalog: a `Terrain` tag maps to `Floor` (passable) or `Solid` (blocked)
+    /// and carries the tag's sprite; a non-terrain tag falls back to `Solid`.
+    /// Otherwise the legacy `palette` char gives a `TerrainKind` with no sprite.
+    /// `None` = space or an unknown tag (don't stamp).
+    pub fn resolve_cell(&self, x: u16, y: u16) -> Option<(TerrainKind, Option<Sprite>)> {
         let row = self.grid.get(y as usize)?;
         let ch = row.chars().nth(x as usize)?;
         if ch == ' ' {
             return None;
         }
-        self.palette.get(&ch).copied()
+        if let Some(tag_name) = self.tag_palette.get(&ch) {
+            let tag = tag_catalog().by_name(tag_name)?; // unknown tag -> don't stamp
+            let kind = match tag.role {
+                Role::Terrain { passable: true, .. } => TerrainKind::Floor,
+                _ => TerrainKind::Solid,
+            };
+            return Some((kind, tag.sprite()));
+        }
+        self.palette.get(&ch).map(|t| (*t, None))
+    }
+
+    /// Resolve the roof facade cell at `(x, y)` to a `Sheet::Structures`
+    /// `(col, row)`. Returns `None` for the space char or when the prefab
+    /// has no roof layer — meaning "draw nothing on top, this cell shows
+    /// its terrain as before".
+    pub fn roof_at(&self, x: u16, y: u16) -> Option<(u8, u8)> {
+        let row = self.roof.get(y as usize)?;
+        let ch = row.chars().nth(x as usize)?;
+        if ch == ' ' {
+            return None;
+        }
+        self.roof_palette.get(&ch).copied()
+    }
+
+    /// Resolve the interior object at `(x, y)` from the `objects` layer: the
+    /// grid char -> tag name -> `Object` (from the tag's non-terrain role).
+    /// `None` for space, no objects layer, an unknown tag, or a terrain tag.
+    pub fn object_at(&self, x: u16, y: u16) -> Option<Object> {
+        let row = self.objects.get(y as usize)?;
+        let ch = row.chars().nth(x as usize)?;
+        if ch == ' ' {
+            return None;
+        }
+        let name = self.objects_palette.get(&ch)?;
+        Object::from_tag(tag_catalog().by_name(name)?)
     }
 }
 
@@ -71,32 +158,11 @@ pub struct BuildingCatalog {
     pools: HashMap<(String, CityTier), Vec<Prefab>>,
 }
 
-const PREFAB_SOURCES: &[(&str, &str)] = &[
-    (
-        "house_urban_burgage",
-        include_str!("../assets/buildings/house_urban_burgage.ron"),
-    ),
-    (
-        "house_urban_workshop",
-        include_str!("../assets/buildings/house_urban_workshop.ron"),
-    ),
-    (
-        "smithy_urban_armorer",
-        include_str!("../assets/buildings/smithy_urban_armorer.ron"),
-    ),
-    (
-        "smithy_urban_weaponsmith",
-        include_str!("../assets/buildings/smithy_urban_weaponsmith.ron"),
-    ),
-    (
-        "house_village_cottage",
-        include_str!("../assets/buildings/house_village_cottage.ron"),
-    ),
-    (
-        "smithy_village_farrier",
-        include_str!("../assets/buildings/smithy_village_farrier.ron"),
-    ),
-];
+// `PREFAB_SOURCES: &[(stem, ron_text)]` is generated by `build.rs`, which globs
+// every `assets/buildings/*.ron` (sorted) and embeds it via `include_str!`. Drop
+// a new prefab file there (e.g. from the prefab-editor) and it loads on the next
+// build — no hand-kept list. Still a single embedded binary for the Miyoo.
+include!(concat!(env!("OUT_DIR"), "/prefab_sources.rs"));
 
 static CATALOG: OnceLock<BuildingCatalog> = OnceLock::new();
 
@@ -178,9 +244,66 @@ fn validate_prefab(name: &str, p: &Prefab) {
                 continue;
             }
             assert!(
-                p.palette.contains_key(&ch),
-                "prefab {name} cell ({col_j}, {row_i}): char {ch:?} missing from palette",
+                p.palette.contains_key(&ch) || p.tag_palette.contains_key(&ch),
+                "prefab {name} cell ({col_j}, {row_i}): char {ch:?} missing from palette/tag_palette",
             );
+        }
+    }
+    // Roof layer is optional, but when present must match the footprint
+    // dimensions and have every non-space char covered by roof_palette.
+    if !p.roof.is_empty() {
+        assert_eq!(
+            p.roof.len(),
+            p.size.1 as usize,
+            "prefab {name}: roof has {} rows but size.1 is {}",
+            p.roof.len(),
+            p.size.1,
+        );
+        for (row_i, row) in p.roof.iter().enumerate() {
+            assert_eq!(
+                row.chars().count(),
+                p.size.0 as usize,
+                "prefab {name} roof row {row_i}: width {} != size.0 {}",
+                row.chars().count(),
+                p.size.0,
+            );
+            for (col_j, ch) in row.chars().enumerate() {
+                if ch == ' ' {
+                    continue;
+                }
+                assert!(
+                    p.roof_palette.contains_key(&ch),
+                    "prefab {name} roof cell ({col_j}, {row_i}): char {ch:?} missing from roof_palette",
+                );
+            }
+        }
+    }
+    // Object layer: same shape rules; every non-space char in objects_palette.
+    if !p.objects.is_empty() {
+        assert_eq!(
+            p.objects.len(),
+            p.size.1 as usize,
+            "prefab {name}: objects has {} rows but size.1 is {}",
+            p.objects.len(),
+            p.size.1,
+        );
+        for (row_i, row) in p.objects.iter().enumerate() {
+            assert_eq!(
+                row.chars().count(),
+                p.size.0 as usize,
+                "prefab {name} objects row {row_i}: width {} != size.0 {}",
+                row.chars().count(),
+                p.size.0,
+            );
+            for (col_j, ch) in row.chars().enumerate() {
+                if ch == ' ' {
+                    continue;
+                }
+                assert!(
+                    p.objects_palette.contains_key(&ch),
+                    "prefab {name} objects cell ({col_j}, {row_i}): char {ch:?} missing from objects_palette",
+                );
+            }
         }
     }
 }
@@ -201,6 +324,80 @@ mod tests {
             PREFAB_SOURCES.len(),
             total,
         );
+    }
+
+    #[test]
+    fn roof_layer_parses_validates_and_resolves() {
+        // Tests the roof MECHANISM on a synthetic prefab (not a bundled file,
+        // which is now editable via the prefab-editor): a roof grid + palette
+        // must parse, pass validation, and resolve chars through roof_palette
+        // to Sheet::Structures (col, row); space = no roof.
+        let src = r####"Prefab(
+            tag: "house", tier: Urban, variant: "t", weight: 1, size: (3, 2),
+            palette: { '#': WoodWall, '.': Floor },
+            grid: [ "#.#", "###" ],
+            roof_palette: { 'A': (5, 1), 'D': (0, 42) },
+            roof: [ "A A", "ADA" ],
+        )"####;
+        let p: Prefab = ron::from_str(src).expect("synthetic roofed prefab parses");
+        validate_prefab("synthetic", &p); // panics if the roof layer is malformed
+        assert_eq!(p.roof_at(0, 0), Some((5, 1)));
+        assert_eq!(p.roof_at(1, 0), None, "space char = no roof");
+        assert_eq!(p.roof_at(1, 1), Some((0, 42)));
+    }
+
+    #[test]
+    fn tag_palette_resolves_sprite_and_passability() {
+        // A tag_palette prefab resolves each cell to a passability carrier
+        // (Solid for a wall tag, Floor for a floor tag) PLUS the tag's sprite.
+        let src = r####"Prefab(
+            tag: "house", tier: Urban, variant: "t", weight: 1, size: (2, 1),
+            palette: {},
+            tag_palette: { '#': "stone_wall", '.': "cobble_floor" },
+            grid: [ "#." ],
+        )"####;
+        let p: Prefab = ron::from_str(src).expect("tag_palette prefab parses");
+        validate_prefab("synthetic", &p);
+        let (wk, ws) = p.resolve_cell(0, 0).expect("wall cell");
+        assert_eq!(wk, TerrainKind::Solid);
+        assert!(!wk.def().walkable, "wall tag stamps a blocked cell");
+        assert!(ws.is_some(), "tag carries a per-cell sprite");
+        let (fk, fs) = p.resolve_cell(1, 0).expect("floor cell");
+        assert_eq!(fk, TerrainKind::Floor);
+        assert!(fk.def().walkable, "floor tag stamps a walkable cell");
+        assert!(fs.is_some());
+    }
+
+    #[test]
+    fn objects_layer_resolves_to_objects() {
+        // The objects layer resolves grid chars -> tag names -> Objects with
+        // the tag's role kind (Light emits light; Decoration does not).
+        let src = r####"Prefab(
+            tag: "house", tier: Urban, variant: "t", weight: 1, size: (2, 1),
+            palette: {}, tag_palette: { '.': "cobble_floor" }, grid: [ ".." ],
+            objects_palette: { 'B': "brazier", 'R': "rug" }, objects: [ "BR" ],
+        )"####;
+        let p: Prefab = ron::from_str(src).expect("prefab with objects parses");
+        validate_prefab("synthetic", &p);
+        let b = p.object_at(0, 0).expect("brazier object");
+        assert_eq!(b.kind, crate::objects::ObjectKind::Light);
+        assert!(b.emits_light());
+        let r = p.object_at(1, 0).expect("rug object");
+        assert_eq!(r.kind, crate::objects::ObjectKind::Decoration);
+        assert!(!r.emits_light());
+    }
+
+    #[test]
+    fn roofless_prefab_has_no_roof_cells() {
+        // A prefab without a roof layer (additive feature) resolves to None
+        // everywhere so it renders as flat walls, as before.
+        let src = r####"Prefab(
+            tag: "house", tier: Urban, variant: "t", weight: 1, size: (2, 2),
+            palette: { '#': WoodWall }, grid: [ "##", "##" ],
+        )"####;
+        let p: Prefab = ron::from_str(src).expect("roofless prefab parses");
+        assert!(p.roof.is_empty());
+        assert_eq!(p.roof_at(0, 0), None);
     }
 
     #[test]

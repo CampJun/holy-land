@@ -45,6 +45,9 @@ pub enum SkillKind {
     MediumArmor,
     /// PR A card 2 — plate / coat-of-plates armor skill.
     HeavyArmor,
+    /// Phase 3 (tagged-tile content) — metalworking. Trained at a forge /
+    /// anvil crafting station; gates metallurgy recipes.
+    Metallurgy,
 }
 
 impl SkillKind {
@@ -64,6 +67,7 @@ impl SkillKind {
             SkillKind::LightArmor => "light_armor",
             SkillKind::MediumArmor => "medium_armor",
             SkillKind::HeavyArmor => "heavy_armor",
+            SkillKind::Metallurgy => "metallurgy",
         }
     }
 
@@ -79,6 +83,7 @@ impl SkillKind {
             "light_armor" => SkillKind::LightArmor,
             "medium_armor" => SkillKind::MediumArmor,
             "heavy_armor" => SkillKind::HeavyArmor,
+            "metallurgy" => SkillKind::Metallurgy,
             _ => return None,
         })
     }
@@ -95,6 +100,7 @@ impl SkillKind {
             SkillKind::LightArmor => "Light Armor",
             SkillKind::MediumArmor => "Med Armor",
             SkillKind::HeavyArmor => "Heavy Armor",
+            SkillKind::Metallurgy => "Metallurgy",
         }
     }
 }
@@ -277,6 +283,9 @@ pub struct Skills {
     pub medium_armor: Skill,
     #[serde(default)]
     pub heavy_armor: Skill,
+    // Phase 3 — metalworking at a forge/anvil station.
+    #[serde(default)]
+    pub metallurgy: Skill,
     // PR A card 2 — per-weapon proficiency pools.
     #[serde(default)]
     pub proficiencies: Proficiencies,
@@ -308,6 +317,7 @@ impl Skills {
             light_armor: Skill::default(),
             medium_armor: Skill::default(),
             heavy_armor: Skill::default(),
+            metallurgy: Skill::default(),
             proficiencies: Proficiencies::default(),
         }
     }
@@ -323,6 +333,7 @@ impl Skills {
             SkillKind::LightArmor => &self.light_armor,
             SkillKind::MediumArmor => &self.medium_armor,
             SkillKind::HeavyArmor => &self.heavy_armor,
+            SkillKind::Metallurgy => &self.metallurgy,
         }
     }
 
@@ -337,6 +348,7 @@ impl Skills {
             SkillKind::LightArmor => &mut self.light_armor,
             SkillKind::MediumArmor => &mut self.medium_armor,
             SkillKind::HeavyArmor => &mut self.heavy_armor,
+            SkillKind::Metallurgy => &mut self.metallurgy,
         }
     }
 
@@ -352,6 +364,7 @@ impl Skills {
         self.light_armor.daily_xp = 0;
         self.medium_armor.daily_xp = 0;
         self.heavy_armor.daily_xp = 0;
+        self.metallurgy.daily_xp = 0;
         self.proficiencies.reset_daily_caps();
     }
 }

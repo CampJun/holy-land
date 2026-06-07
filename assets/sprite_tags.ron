@@ -1,0 +1,23 @@
+// Sprite-tag catalog — labels sheet cells with a gameplay role. This is the
+// single source of truth that turns "a cell on a sprite sheet" into "a wall /
+// floor / anvil / chest / hearth". Editable in the prefab-editor's Label mode.
+//
+// `sheet` strings match `sprites::Sheet::name()`. Roles:
+//   Terrain(passable, blocks_sight)  - the cell's passability flag + sight
+//   Station(skill)                   - crafting station (phase 3)
+//   Container(loot)                  - loot container (phase 4)
+//   Light                            - emits light (phase 2)
+//   Decoration                       - visual only (phase 2)
+[
+    ( name: "stone_wall",   sheet: "walls",      col: 0,  row: 0,  role: Terrain(passable: false, blocks_sight: true) ),
+    ( name: "wood_wall",    sheet: "walls",      col: 16, row: 0,  role: Terrain(passable: false, blocks_sight: true) ),
+    ( name: "timber_wall",  sheet: "structures", col: 8,  row: 30, role: Terrain(passable: false, blocks_sight: true) ),
+    ( name: "cobble_floor", sheet: "overworld",  col: 14, row: 40, role: Terrain(passable: true,  blocks_sight: false) ),
+    ( name: "dirt_floor",   sheet: "overworld",  col: 0,  row: 39, role: Terrain(passable: true,  blocks_sight: false) ),
+    ( name: "grass_floor",  sheet: "overworld",  col: 1,  row: 0,  role: Terrain(passable: true,  blocks_sight: false) ),
+    // Interior objects (phase 2). Placeholder cells — relabel in the editor.
+    ( name: "brazier",      sheet: "misc",       col: 0,  row: 0,  role: Light ),
+    ( name: "rug",          sheet: "interior",   col: 1,  row: 1,  role: Decoration ),
+    // Crafting station (phase 3): an anvil gates metallurgy recipes.
+    ( name: "anvil",        sheet: "interior_fixtures", col: 0, row: 0, role: Station(skill: "metallurgy") ),
+]

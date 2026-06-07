@@ -1,27 +1,14 @@
-mod action;
-mod atlases;
-mod buildings;
-mod calendar;
-mod chunkgen;
-mod city;
-mod combat;
-mod cornwall;
-mod crafting;
+// All engine modules now live in the `holyland` library crate (src/lib.rs) so
+// the prefab-editor binary can reuse them. Bring them into scope under their
+// short names so the rest of this file is unchanged.
+use holyland::{
+    action, atlases, calendar, city, cornwall, crafting, fasttravel, flora, input, items, logging,
+    needs, platform, render, save, skill, sprites, world,
+};
 #[cfg(not(target_arch = "arm"))]
-mod debug_console;
-mod fasttravel;
-mod flora;
-mod fov;
-mod input;
-mod items;
-mod logging;
-mod needs;
-mod platform;
-mod render;
-mod save;
-mod skill;
-mod sprites;
-mod world;
+use holyland::debug_console;
+// `#[macro_export]` logging macros are exported at the library crate root.
+use holyland::{log_debug, log_info, log_verbose};
 
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -516,6 +503,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 light_armor: conv(run.skills.light_armor),
                 medium_armor: conv(run.skills.medium_armor),
                 heavy_armor: conv(run.skills.heavy_armor),
+                metallurgy: conv(run.skills.metallurgy),
                 proficiencies,
             });
             // Re-sync combat stats from the loaded URW skill values so
@@ -1731,6 +1719,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut dirty_max_x = 0;
         let mut dirty_max_y = 0;
         let season = world.season();
+        // The building (if any) the player is currently standing inside —
+        // its roof is suppressed so the interior shows through. Outdoors
+        // this is `None` and every roof draws.
+        let active_building = world
+            .cell_at(pwx, pwy)
+            .and_then(|c| c.roof)
+            .filter(|r| r.is_interior)
+            .map(|r| r.anchor);
         for vy in 0..WORLD_H as i32 {
             for vx in 0..WORLD_W as i32 {
                 let wx = cam_x + vx as i64;
@@ -1741,7 +1737,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // brightness rides a white tint multiplied onto the sprite.
                 let terrain = world.tile_at(wx, wy);
                 let terrain_def = terrain.def();
-                let mut sprite = sprite_overrides.terrain(terrain);
+                // Per-cell sprite-tag override (prefab-painted wall/floor art)
+                // wins over the TerrainKind default; canopy/roof below still
+                // override it where they apply.
+                let mut sprite = match world.cell_at(wx, wy).and_then(|c| c.terrain_sprite) {
+                    Some(ts) => ts,
+                    None => sprite_overrides.terrain(terrain),
+                };
                 // Per-cell color gradient for walkable terrain: small
                 // hash-driven RGB offset on fg+bg so the floor reads as
                 // organic texture rather than a flat region. Unwalkable
@@ -1786,7 +1788,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     bg_arr
                 };
-                let bg = Color::RGB(bg_arr[0], bg_arr[1], bg_arr[2]);
+                let mut bg = Color::RGB(bg_arr[0], bg_arr[1], bg_arr[2]);
                 // Multi-cell tree footprint: draw this cell's own 8×8
                 // slice of the species' 2×2 / 4×4 tree block. Footprints
                 // never overlap, so this stays a per-cell pick — no
@@ -1821,6 +1823,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if !matches!(decoration, flora::Decoration::None) {
                         overlay = Some(sprites::decoration_sprite(&decoration));
                     }
+                    // Interior object (furniture / station / container / light)
+                    // sits above decoration, below items/entities/player, and
+                    // below the roof (so it stays hidden until you step inside).
+                    if let Some(obj) = cell_state.and_then(|c| c.object.as_ref()) {
+                        overlay = Some(obj.sprite);
+                    }
                     if let Some(top) = cell_state.and_then(|c| c.items.last()) {
                         // Lit fires read as fire rather than their item sprite,
                         // and route through the picker like any other target.
@@ -1841,11 +1849,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
+                // 2.5D building roof: a roofed cell draws its Structures
+                // facade slice on top of everything UNLESS the player is
+                // inside this building (then the roof is hidden and the
+                // interior terrain/overlay picked above shows through).
+                // Visibility/brightness ride the normal explored/visible
+                // path below, so undiscovered roofs stay in fog like any
+                // other cell — same as a tree canopy's far slices.
+                let mut showing_roof = false;
+                if let Some(roof) = cell_state.and_then(|c| c.roof) {
+                    if !roof.hidden(active_building) {
+                        sprite = sprites::Sprite::at(
+                            sprites::Sheet::Structures,
+                            roof.col,
+                            roof.row,
+                        );
+                        overlay = None;
+                        showing_roof = true;
+                        // A roof rises above the footprint: its transparent
+                        // pixels (gable peak / slopes above the wall) must
+                        // reveal the GROUND the building sits on, not the
+                        // wall's own bg — otherwise the roof reads as a solid
+                        // block. Buildings only stamp over Grass, so the
+                        // seasonal grass colour is the correct backdrop.
+                        let g = world::TerrainKind::Grass.def().bg(season);
+                        bg = Color::RGB(g[0], g[1], g[2]);
+                    }
+                }
+
                 // Three visibility levels modulate brightness:
                 //   visible:   full color + day/night tint
                 //   explored:  fixed dim (25%) regardless of clock
                 //   neither:   black
-                let cell_brightness = if visible {
+                // A shown roof is the building's daylit exterior: render it
+                // at full day/night `tint` once discovered (its far rows sit
+                // behind the front wall and would otherwise be FOV-dimmed to
+                // near-black). Everything else keeps the visible/explored
+                // ramp. `reveal_seen_building_roofs` marks the whole footprint
+                // explored from any glimpse, so the roof lights as one piece.
+                let cell_brightness = if showing_roof {
+                    if visible || explored {
+                        tint
+                    } else {
+                        0.0
+                    }
+                } else if visible {
                     tint
                 } else if explored {
                     0.25
@@ -2134,6 +2182,7 @@ fn save_game(
         light_armor: to_save(player_skills.light_armor),
         medium_armor: to_save(player_skills.medium_armor),
         heavy_armor: to_save(player_skills.heavy_armor),
+        metallurgy: to_save(player_skills.metallurgy),
         proficiencies: save::ProficienciesSave {
             knife: to_save(prof.knife),
             sword: to_save(prof.sword),
@@ -4039,7 +4088,7 @@ fn color_dim() -> Color {
 /// queue.cells.len() × per-cell game-sec advance.
 fn draw_fast_travel_banner(
     cells: &mut [Option<Cell>],
-    queue: &crate::fasttravel::FastTravelQueue,
+    queue: &fasttravel::FastTravelQueue,
     palette: &Palette,
 ) {
     let dest_label = cornwall::overmap_info_at(queue.destination)

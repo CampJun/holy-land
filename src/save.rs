@@ -473,6 +473,9 @@ pub struct SkillsSave {
     pub medium_armor: SkillSave,
     #[serde(default)]
     pub heavy_armor: SkillSave,
+    // Phase 3 — metallurgy. Additive; older saves load at 0.
+    #[serde(default)]
+    pub metallurgy: SkillSave,
     #[serde(default)]
     pub proficiencies: ProficienciesSave,
 }
@@ -1067,6 +1070,7 @@ mod tests {
                 light_armor: SkillSave::default(),
                 medium_armor: SkillSave::default(),
                 heavy_armor: SkillSave::default(),
+                metallurgy: SkillSave::default(),
                 proficiencies: ProficienciesSave::default(),
             },
             rng_state: 0xC0FFEE,

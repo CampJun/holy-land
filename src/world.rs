@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::action::ActionId;
 use crate::calendar::{self, Season};
-use crate::flora::{Canopy, Decoration, TreeSpecies};
+use crate::flora::{Canopy, Decoration, Roof, TreeSpecies};
 use crate::items::{starting_pack, ItemInstance, ItemKind, ItemMetadata, Pack};
 use crate::needs::{Needs, NeedsEnv};
 use crate::skill::{Rng, Skills};
@@ -274,6 +274,12 @@ pub enum TerrainKind {
     /// Cobbled city street (High St / Fore St / etc.). Walkable; no
     /// sight blocking. Distinct from BareDirt cart tracks.
     CobbleRoad,
+    /// Generic sprite-driven blocked cell: NOT walkable, blocks sight. The
+    /// passability *flag* for prefab "wall" tiles whose visual comes from a
+    /// per-cell `terrain_sprite` (sprite-tag catalog). `Floor` is the
+    /// passable counterpart; together they carry the editor's wall/floor flag
+    /// while the look is any sheet cell.
+    Solid,
 }
 
 pub struct TerrainDef {
@@ -344,6 +350,7 @@ pub const ALL_TERRAINS: &[TerrainKind] = &[
     TerrainKind::WoodWall,
     TerrainKind::Floor,
     TerrainKind::CobbleRoad,
+    TerrainKind::Solid,
 ];
 
 /// Subset of `ALL_TERRAINS` shown in the tile-remap UI. Walls and the
@@ -564,6 +571,22 @@ impl TerrainKind {
                 walkable: true,
                 blocks_sight: false,
             },
+            // Sprite-driven blocked cell. Seasonal-invariant; the bg shows
+            // only under a transparent terrain_sprite, so keep it a neutral
+            // stone-dark.
+            TerrainKind::Solid => TerrainDef {
+                save_key: "solid",
+                name: "wall",
+                glyph: 0xB2,
+                palette: [
+                    ([150, 145, 138], [55, 52, 48]),
+                    ([150, 145, 138], [55, 52, 48]),
+                    ([150, 145, 138], [55, 52, 48]),
+                    ([150, 145, 138], [55, 52, 48]),
+                ],
+                walkable: false,
+                blocks_sight: true,
+            },
         }
     }
 }
@@ -662,6 +685,20 @@ pub struct CellState {
     /// Undergrowth overlay (Fern/Moss/Bramble/Bracken/Gorse/Sapling/
     /// Mushroom). Gorse blocks pass + LOS; the others pass through.
     pub decoration: Decoration,
+    /// 2.5D building roof slice occupying this cell, if any. Pure render
+    /// overlay (walkability/LOS ignore it); suppressed when the player
+    /// stands inside this building. None = no roof here. See `flora::Roof`.
+    pub roof: Option<Roof>,
+    /// Per-cell base-sprite override (sprite-tag catalog). When set, the
+    /// compose loop draws this instead of the `TerrainKind`'s default sprite,
+    /// so a prefab "wall"/"floor" tile can be any sheet cell while its
+    /// passability rides the `TerrainKind` (`Solid`/`Floor`). None = use the
+    /// terrain default.
+    pub terrain_sprite: Option<crate::sprites::Sprite>,
+    /// Interior object occupying this cell (furniture / station / container /
+    /// light), if any. Rendered as an overlay below the roof; `Light` objects
+    /// also feed the fire-light path. See `objects::Object`.
+    pub object: Option<crate::objects::Object>,
 }
 
 impl CellState {
@@ -676,6 +713,9 @@ impl CellState {
             tree_species: None,
             canopy: None,
             decoration: Decoration::None,
+            roof: None,
+            terrain_sprite: None,
+            object: None,
         }
     }
 }
@@ -2916,7 +2956,9 @@ impl World {
         let mut count = 0;
         for chunk in self.chunks.values() {
             for (idx, cell) in chunk.cells.iter().enumerate() {
-                if !cell.items.iter().any(|i| is_active_fire(&i.metadata)) {
+                let active_fire = cell.items.iter().any(|i| is_active_fire(&i.metadata));
+                let light_object = cell.object.as_ref().map_or(false, |o| o.emits_light());
+                if !active_fire && !light_object {
                     continue;
                 }
                 if count >= MAX_LIGHT_SOURCES {
@@ -2932,6 +2974,26 @@ impl World {
             }
         }
         count
+    }
+
+    /// True when the player stands on or beside an interior crafting station
+    /// for `skill` (e.g. an anvil tagged `Station("metallurgy")`). Gates
+    /// station recipes in `action::evaluate`. Checks the 3×3 around the player.
+    pub fn player_near_station(&self, skill: &str) -> bool {
+        let p = self.player_pos();
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let cell = self.cell_at((p.x + dx) as i64, (p.y + dy) as i64);
+                if let Some(obj) = cell.and_then(|c| c.object.as_ref()) {
+                    if let crate::objects::ObjectKind::Station(s) = &obj.kind {
+                        if s == skill {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Is the player standing on a Pitched item of the given kind?
@@ -3093,6 +3155,41 @@ impl World {
             let n = self.collect_light_sources_into(&mut sources);
             for &src in &sources[..n] {
                 self.cast_from(src, LIGHT_SOURCE_RADIUS, true);
+            }
+        }
+
+        self.reveal_seen_building_roofs();
+    }
+
+    /// 2.5D buildings: a roof is one visual object spread over a footprint,
+    /// but FOV only marks the cells in direct line of sight — the front
+    /// wall hides the rows behind it, so a roof glimpsed from one side
+    /// would render with most of itself unlit. Seeing ANY cell of a
+    /// building marks its whole footprint `explored`, so the roof shows as
+    /// a single piece (the cells in current LOS stay brighter). Cheap: two
+    /// passes over loaded cells, same order as the `visible` reset above,
+    /// and only `explored` (a persisted, side-effect-free flag) is touched.
+    fn reveal_seen_building_roofs(&mut self) {
+        let mut seen: HashSet<(i32, i32)> = HashSet::new();
+        for chunk in self.chunks.values() {
+            for cell in &chunk.cells {
+                if cell.visible {
+                    if let Some(r) = cell.roof {
+                        seen.insert(r.anchor);
+                    }
+                }
+            }
+        }
+        if seen.is_empty() {
+            return;
+        }
+        for chunk in self.chunks.values_mut() {
+            for cell in chunk.cells.iter_mut() {
+                if let Some(r) = cell.roof {
+                    if seen.contains(&r.anchor) {
+                        cell.explored = true;
+                    }
+                }
             }
         }
     }

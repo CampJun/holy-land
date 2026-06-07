@@ -159,32 +159,48 @@ pub fn cook_progress(input: CookableKind, elapsed_secs: u32) -> CookProgress {
 pub struct Recipe {
     pub action: ActionId,
     pub name: &'static str,
+    /// Crafting-station skill this recipe requires (e.g. "metallurgy" for an
+    /// anvil). `None` = craftable anywhere; `Some(skill)` is gated by
+    /// `World::player_near_station` in `action::evaluate`.
+    pub station: Option<&'static str>,
 }
 
 pub const RECIPES: &[Recipe] = &[
     Recipe {
         action: ActionId::PlacePan,
         name: "Place pan on fire",
+        station: None,
     },
     Recipe {
         action: ActionId::PickUpPan,
         name: "Pick up pan",
+        station: None,
     },
     Recipe {
         action: ActionId::CookFish,
         name: "Cook fish",
+        station: None,
     },
     Recipe {
         action: ActionId::SeasonPan,
         name: "Season pan w/ herb",
+        station: None,
     },
     Recipe {
         action: ActionId::TakeFromPan,
         name: "Take from pan",
+        station: None,
     },
     Recipe {
         action: ActionId::EatHerb,
         name: "Eat herb",
+        station: None,
+    },
+    // Phase 3 station recipe — only craftable beside an anvil.
+    Recipe {
+        action: ActionId::ForgeNail,
+        name: "Forge iron nails",
+        station: Some("metallurgy"),
     },
 ];
 
